@@ -337,7 +337,7 @@ usb_control:
     ; ---- SETUP TD ----
     mov ebx, USB_CTRL_TD
     mov dword [ebx + 4], TD_STATUS
-    mov eax, [usb_dev_addr]
+    mov eax, [usb_cur_dev]
     shl eax, 8
     or eax, 0x2D | (7 << 21)        ; SETUP(0x2D),长度 8 → 字段 7
     mov [ebx + 8], eax
@@ -355,12 +355,13 @@ usb_control:
     mov ebp, 1                      ; 数据阶段从 DATA1 开始,每包翻转
 .data_loop:
     mov eax, ecx
-    cmp eax, 8
+    mov edx, [usb_ep0_mps]
+    cmp eax, edx
     jbe .chunk
-    mov eax, 8                      ; EP0 的 bMaxPacketSize0 = 8
+    mov eax, edx
 .chunk:
     mov dword [ebx + 4], TD_STATUS
-    mov edx, [usb_dev_addr]
+    mov edx, [usb_cur_dev]
     shl edx, 8
     or edx, 0x69                    ; IN(0x69),端点 0
     mov edi, ebp
@@ -388,7 +389,7 @@ usb_control:
     jne .status_pid
     mov edx, 0xE1                   ; IN 数据 → 状态阶段是 OUT
 .status_pid:
-    mov eax, [usb_dev_addr]
+    mov eax, [usb_cur_dev]
     shl eax, 8
     or edx, eax
     or edx, (1 << 19)               ; 状态阶段 DATA1
@@ -475,6 +476,11 @@ usb_control:
 ; ===========================================================================
 usb_enumerate:
     pushad
+    mov dword [usb_cur_dev], 0
+    mov dword [usb_msd_ep_in], 0
+    mov dword [usb_msd_ep_out], 0
+    mov dword [usb_msd_mps_in], 0
+    mov dword [usb_msd_mps_out], 0
 
     ; ---- SET_ADDRESS(1) ----
     mov dword [USB_SETUP_BUF], 0x00010500
@@ -487,6 +493,24 @@ usb_enumerate:
     test eax, eax
     jnz .fail
     mov dword [usb_dev_addr], 1
+    mov dword [usb_cur_dev], 1
+
+    ; ---- 先按 8 字节读设备描述符前 8 字节,拿 bMaxPacketSize0 ----
+    mov dword [usb_ep0_mps], 8
+    mov dword [USB_SETUP_BUF], 0x01000680
+    mov dword [USB_SETUP_BUF + 4], 8 << 16
+    mov esi, USB_SETUP_BUF
+    mov edi, USB_DEV_DESC
+    mov ecx, 8
+    mov edx, 1
+    call usb_control
+    test eax, eax
+    jnz .fail
+    movzx eax, byte [USB_DEV_DESC + 7]
+    test eax, eax
+    jz .mps_keep
+    mov [usb_ep0_mps], eax
+.mps_keep:
 
     ; ---- GET_DESCRIPTOR(设备,18 字节)----
     mov dword [USB_SETUP_BUF], 0x01000680
@@ -565,13 +589,15 @@ usb_enumerate:
     movzx eax, byte [USB_CFG_DESC + ebx + 1]
     cmp eax, 5                      ; ENDPOINT
     jne .next
-    movzx eax, byte [USB_CFG_DESC + ebx + 2]
+    movzx eax, byte [USB_CFG_DESC + ebx + 2]   ; bEndpointAddress
+    movzx edx, byte [USB_CFG_DESC + ebx + 3]
+    and edx, 3                      ; 传输类型
+    cmp edx, 2                      ; bulk? → U 盘的数据端点
+    je .walk_bulk
+    cmp edx, 3                      ; 中断传输 → HID 键盘
+    jne .next
     test al, 0x80                   ; 只看 IN
     jz .next
-    movzx edx, byte [USB_CFG_DESC + ebx + 3]
-    and edx, 3
-    cmp edx, 3                      ; 中断传输
-    jne .next
     cmp dword [usb_ep_addr], 0
     jne .next
     mov [usb_ep_addr], eax
@@ -580,6 +606,22 @@ usb_enumerate:
     mov [usb_ep_mps], edx
     movzx edx, byte [USB_CFG_DESC + ebx + 6]
     mov [usb_ep_interval], edx
+    jmp .next
+.walk_bulk:
+    movzx edx, word [USB_CFG_DESC + ebx + 4]
+    and edx, 0x7FF
+    test al, 0x80
+    jz .walk_bulk_out
+    cmp dword [usb_msd_ep_in], 0
+    jne .next
+    mov [usb_msd_ep_in], eax
+    mov [usb_msd_mps_in], edx
+    jmp .next
+.walk_bulk_out:
+    cmp dword [usb_msd_ep_out], 0
+    jne .next
+    mov [usb_msd_ep_out], eax
+    mov [usb_msd_mps_out], edx
 .next:
     add ebx, ecx
     jmp .walk
@@ -638,6 +680,34 @@ usb_enumerate:
     ret
 
 .not_hid:
+    ; ---- 接口类 8/6/50 = Mass Storage,Bulk-Only 协议 → U 盘 ----
+    cmp dword [usb_if_class], 8
+    jne .not_msd
+    cmp dword [usb_if_sub], 6
+    jne .not_msd
+    cmp dword [usb_if_proto], 0x50
+    jne .not_msd
+    cmp dword [usb_msd_ep_in], 0
+    je .not_msd
+    cmp dword [usb_msd_ep_out], 0
+    je .not_msd
+
+    ; SET_CONFIGURATION(1)
+    mov dword [USB_SETUP_BUF], 0x00010900
+    mov dword [USB_SETUP_BUF + 4], 0
+    mov esi, USB_SETUP_BUF
+    xor edi, edi
+    xor ecx, ecx
+    xor edx, edx
+    call usb_control
+    test eax, eax
+    jnz .fail
+
+    mov byte [usb_msd_ok], 1        ; ⚠ 必须是 byte:usb_msd_ok 是 db,写 dword 会零掉后面的 usb_msd_ep_in
+    mov dword [usb_state], 3
+    popad
+    ret
+.not_msd:
     popad
     ret
 .fail:
@@ -996,8 +1066,37 @@ cmd_usb:
     call term_putc
     mov eax, [usb_if_proto]
     call pci_ph2
+    cmp dword [usb_msd_ok], 0
+    je .tag_hid
+    mov esi, msg_usb_msdtag
+    call term_print
+    jmp .ep_check
+.tag_hid:
     mov esi, msg_usb_hidtag
     call term_print
+.ep_check:
+
+    ; usb: mass storage ep 81 IN, 02 OUT
+    cmp dword [usb_msd_ok], 0
+    je .noep
+    mov esi, msg_usb_msd
+    call term_print
+    mov eax, [usb_msd_ep_in]
+    call pci_ph2
+    mov esi, msg_usb_msdin
+    call term_print
+    mov eax, [usb_msd_mps_in]
+    call term_print_dec
+    mov esi, msg_usb_msdout
+    call term_print
+    mov eax, [usb_msd_ep_out]
+    call pci_ph2
+    mov al, ','
+    call term_putc
+    mov eax, [usb_msd_mps_out]
+    call term_print_dec
+    mov al, 10
+    call term_putc
 
     ; usb: ep 81 IN, max 8, interval 10 ms
     cmp dword [usb_ep_addr], 0
@@ -1077,6 +1176,13 @@ usb_if_proto    dd 0
 usb_ep_addr     dd 0
 usb_ep_mps      dd 0
 usb_ep_interval dd 0
+usb_cur_dev     dd 0             ; 当前控制传输要发的设备地址(枚举时 0→新地址)
+usb_ep0_mps     dd 8             ; EP0 的 wMaxPacketSize(默认 8,枚举时从设备描述符读)
+usb_msd_ok      db 0             ; 枚举到的是不是大容量储存设备
+usb_msd_ep_in   dd 0             ; bulk IN 端点地址
+usb_msd_ep_out  dd 0             ; bulk OUT 端点地址
+usb_msd_mps_in  dd 0             ; bulk IN 的 wMaxPacketSize
+usb_msd_mps_out dd 0             ; bulk OUT 的 wMaxPacketSize
 
 usb_deadline    dd 0
 usb_ctrl_last   dd 0
@@ -1107,6 +1213,10 @@ msg_usb_cfg     db ' cfg ', 0
 msg_usb_ifaces  db ' iface ', 0
 msg_usb_iface   db 'usb: iface class ', 0
 msg_usb_hidtag  db ' HID', 10, 0
+msg_usb_msdtag  db ' mass storage', 10, 0
+msg_usb_msd     db 'usb: mass storage ep ', 0
+msg_usb_msdin   db ' IN ', 0
+msg_usb_msdout  db ', OUT ', 0
 msg_usb_ep      db 'usb: ep ', 0
 msg_usb_epin    db ' IN, max ', 0
 msg_usb_epint   db ', interval ', 0

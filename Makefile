@@ -350,7 +350,12 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32
+test: makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb
+
+test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --usbdisk --font font/full-kkf.bin
 
 test-fda: $(IMG)
 	@echo "── 作为软盘启动(BIOS 无 LBA,应走 CHS 退回)──"

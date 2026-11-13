@@ -661,6 +661,21 @@ def report(results) -> int:
     return 0
 
 
+USB_STICK_TEXT = b"USB TEST SECTOR 1 - KKernel usbdisk read-only dogfood"
+
+
+def make_usb_stick_image(path: str, size: int = 4 * 1024 * 1024) -> None:
+    """造一个 4 MiB 的假 U 盘镜像:MBR(一个 type 0x06 分区)+ LBA1 已知文本。"""
+    buf = bytearray(size)
+    entry = (bytes([0x80, 0, 0, 0, 0x06, 0, 0, 0])
+             + (2048).to_bytes(4, "little") + (4096).to_bytes(4, "little"))
+    buf[446:462] = entry
+    buf[510:512] = b"\x55\xAA"
+    buf[512:512 + len(USB_STICK_TEXT)] = USB_STICK_TEXT
+    with open(path, "wb") as f:
+        f.write(buf)
+
+
 def main() -> int:
     argv = sys.argv[1:]
     dump_only = "--dump" in argv            # 只把屏幕打出来,不做断言(调试用)
@@ -671,12 +686,13 @@ def main() -> int:
     shell_mode = "--shell" in argv          # shell 命令测试
     hd_mode = "--fontdisk" in argv          # 硬盘镜像:磁盘字库 + FAT16 + 跑程序
     fat32_mode = "--fat32" in argv          # 同一个内核,但分区是 FAT32(镜像得开大)
+    usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32")]
+                         "--fontdisk", "--fat32", "--usbdisk")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -700,6 +716,14 @@ def main() -> int:
     # 显式写 format=raw:不然 QEMU 会警告"自动探测格式有风险",还可能拒绝对块 0 写入
     drive = ([f"-drive", f"file={img},format=raw,if=ide,index=0", "-boot", "c"] if as_hdd
              else [f"-drive", f"file={img},format=raw,if=floppy", "-boot", "a"])
+    # USB 大容量储存测试:挂一个 usb-storage 设备,里面是已知内容的假 U 盘
+    usb_args: list = []
+    usb_img = None
+    if usb_mode:
+        usb_img = os.path.join(tempfile.gettempdir(), f"kkernel-usbstick-{os.getpid()}.img")
+        make_usb_stick_image(usb_img)
+        usb_args = ["-device", "usb-storage,drive=kkstick",
+                    "-drive", f"if=none,id=kkstick,format=raw,file={usb_img}"]
     # 再开一个 QMP socket:Alt 码位输入要"按住 Alt 敲数字",HMP 的 sendkey 做不到,
     # 得用 QMP 的 input-send-event 分开按/放(tools/text2alt.py --send 就是干这个的)
     qmp_sock = f"{sock}.qmp"
@@ -714,7 +738,7 @@ def main() -> int:
          # `pci 0:1.2` 那组断言就对不上了。
          # ⚠️ 别在这里插 usb-kbd:QEMU 的 sendkey 会改投 USB 键盘,
          #    整套 PS/2 键盘用例(还有 shell 打字)会全部失灵。
-         "-usb",
+         "-usb", *usb_args,
          "-monitor", f"unix:{sock},server,nowait",
          "-qmp", f"unix:{qmp_sock},server,nowait"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -780,6 +804,36 @@ def main() -> int:
                 shot.save("build/screen.png")
                 print(f"(图形模式 {shot.size[0]}×{shot.size[1]},已存 build/screen.png)")
             return 0
+
+        if usb_mode:
+            # ---- USB 大容量储存(只读裸盘):QEMU 挂的假 U 盘 ----
+            results = []
+            time.sleep(1.0)
+
+            def usb_run(line: str, wait: float = 1.6) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            usb_run("usbdisk")
+            results.append(("设备识别/INQUIRY", has("QEMU QEMU HARDDISK"),
+                            "usbdisk: QEMU QEMU HARDDISK rev 2.5+"))
+            results.append(("容量(READ CAPACITY)",
+                            has("8192 sectors") and has("4096 KiB"),
+                            "8192 sectors x 512 B = 4096 KiB"))
+            usb_run("usbdisk read 1")
+            # hexdump 的 ASCII 列每行只有 16 字符,长句子会被折成两行,分开断言
+            results.append(("READ(10) 读 LBA1",
+                            has("USB TEST SECTOR") and has("isk read-only do"),
+                            "LBA1 内容(USB TEST SECTOR... dogfood)出现在 hexdump 里"))
+            usb_run("usbdisk mbr")
+            results.append(("MBR 分区表", has("p1: type=0x06 start=2048 sectors=4096"),
+                            "p1: type=0x06 start=2048 sectors=4096"))
+            usb_run("usbdisk sense")
+            results.append(("REQUEST SENSE", has("sense: rc=0x70"),
+                            "sense: rc=0x70 key=0x00 asc=0x00 ascq=0x00"))
+            return report(results)
 
         if kbd_mode:
             # ---- 键盘:靠 monitor 的 sendkey 真按键,再抓屏看回显 ----
@@ -1922,6 +1976,8 @@ def main() -> int:
             os.unlink(sock)
         if os.path.exists(img_copy):
             os.unlink(img_copy)          # 临时副本用完就删
+        if usb_img and os.path.exists(usb_img):
+            os.unlink(usb_img)           # 假 U 盘镜像也删掉
 
     print()
     if failures:

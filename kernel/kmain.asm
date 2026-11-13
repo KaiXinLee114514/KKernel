@@ -482,6 +482,7 @@ COL_ERR    equ 0x0C                    ; 亮红
 
     ; USB:UHCI 控制器 + 端口枚举(失败只打一行,不停机;没有 USB 控制器时静默)
     call usb_init
+    call usbdisk_init                       ; USB 大容量储存(没插 U 盘就静默)
 
     ; ---- rc.conf(SYS/RC.CONF)+ 事件账本 ----
     ; 为啥是 rc.conf 而不是 systemd 的 unit:玩具 OS 要的是"一行一个 key=value",

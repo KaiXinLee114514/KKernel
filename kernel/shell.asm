@@ -23,7 +23,7 @@
 ;  行编辑只有退格和回车 —— 光标键要先处理 0xE0 前缀,留给你自己加。
 ; ============================================================================
 
-SHELL_LINE_MAX equ 64
+SHELL_LINE_MAX equ 128       ; 多给点地方(63 字符连 TCC 的链接命令行都放不下)
 
 SH_MAX         equ 4                    ; 一共几条 shell(每条 = 一条内核线程,0 号就是主线程)
 SH_BUF_SZ      equ SHELL_LINE_MAX + 4   ; 每条 shell 备份一整个输入缓冲(多留几字节放结尾 0)
@@ -3153,6 +3153,7 @@ n_sleep  db 'sleep', 0
 n_date   db 'date', 0
 n_pci    db 'pci', 0
 n_usb    db 'usb', 0
+n_usbdisk db 'usbdisk', 0
 n_shell  db 'shell', 0
 n_ps     db 'ps', 0
 n_spawn  db 'spawn', 0
@@ -3234,6 +3235,11 @@ cmd_style:
 .ok:
     mov al, COL_OK
     call term_set_color
+    mov esi, msg_style_cur
+    call term_print
+    mov eax, [sh_style]
+    mov esi, [style_names + eax*4]
+    call term_print
     mov esi, msg_style_set
     call term_print
     call shell_print_prompt
@@ -3285,6 +3291,7 @@ cmd_table:
     dd n_style,  cmd_style
     dd n_pci,    cmd_pci
     dd n_usb,    cmd_usb
+    dd n_usbdisk, cmd_usbdisk
     dd n_shell,  cmd_shell
     dd n_ps,     cmd_ps
     dd n_spawn,  cmd_spawn
@@ -3332,7 +3339,7 @@ msg_prompt_kao      db '(・ω・)', 0
 msg_prompt_kao_sad  db '(；ω；)', 0
 msg_style_cur       db 'prompt style: ', 0
 msg_style_list      db '   (style plain|moe|dos|c64|kao 换样式,默认 kao;RC.CONF 里写 style = moe 开机生效)', 10, 0
-msg_style_set       db 'prompt style -> ', 0
+msg_style_set       db ' -> ', 0
 msg_style_usage     db 'style: usage style plain|moe|dos|c64|kao', 10, 0
 key_style           db 'style', 0
 msg_fault       db 'touching an unmapped address on purpose...', 10, 0
@@ -3398,6 +3405,7 @@ msg_help db \
     'style [name]  prompt style: plain / moe / dos / c64 / kao(颜文字,默认) (RC.CONF: style = kao)', 10, \
     'pci [b:s.f]   list the PCI devices on bus 0, or show one in detail', 10, \
     'usb           UHCI controller / ports / USB keyboard status', 10, \
+    'usbdisk       USB mass storage (read-only): info / read <lba> / hexdump <lba> / mbr / sense', 10, \
     'ps            list scheduler threads (id / name / ticks / runs)', 10, \
     'spawn [who]   start a demo kernel thread (no arg = alpha, then beta)', 10, \
     'kill <id>     kill a thread, give its stack back to the page pool', 10, \

@@ -31,6 +31,7 @@
 写它的目的不是"做个能用的系统",而是**把 计算机启动到底发生了什么 一层层摊开给你看**:
 从 BIOS 把 512 字节读进 0x7C00,到 GDT/保护模式/IDT/分页/键盘中断/ATA 读盘/FAT16,
 每一段都在源码注释里讲清楚,包括**踩过的坑**(下面有专门一节)。
+(ps:哪来的精力时间给linux加个带中文的fb然后大改喂给你赤?)
 
 > 你可以随便改。改坏了 `make test` 会告诉你哪一项坏了。
 >
@@ -65,6 +66,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 
 **vi 已经不是主线了**:STEVIE 移植搬去了 `extensions/vi/`,默认镜像里没有它,
 `make ext-img` / `make run-ext` 才构建和启动(规矩见 [extensions/README.md](extensions/README.md))。
+(作者ps:或者系统内run tcc.bin 先生成.o文件 然后是-static -nostdlib写进去)
 
 ## 1. 现在能干什么
 
@@ -90,6 +92,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 | **子目录** | `ls DOCS`、`cat DOCS/NOTE.TXT`、`cd` / `mkdir` / `rmdir` / `rm`、路径里 `/` 和 `\` 都认;子目录里的程序 `run DOCS/HELLO.BIN` 和 `int 0x30` 的读写接口都跟着当前目录走;子目录满了会自动往簇链上接新簇 |
 | **/DEV 设备抽象层** | 「一切皆文件」的最小版:`DEV/` 开头的名字不查磁盘,改查内核设备表 —— `DEV/NULL`(黑洞)/`DEV/ZERO`(零)/`DEV/RANDOM`(伪随机)/`DEV/RTC`(实时时钟)/`DEV/CON`(写屏幕)/`DEV/DEVICES`(列设备);`cat`/`write` 和 `int 0x30` 的读写接口共用同一批 handler,C 程序 `fopen("DEV/RTC")` 直接能读(见 [docs/devices.md](docs/devices.md)) |
 | **管道(pipe)** | `A | B` 把 A 的屏幕输出接给 B 的 stdin(顺序执行,不需要并发):最多 4 段,缓冲从物理页池现借现还(64 KB/16 KB/4 KB 逐级降,页池不够就报错不崩);内建命令和 `run PROG` 都能当管道段;配 `WC` / `UPPER` / `GREP` / `HEAD` 四个 C 小工具,见 [docs/pipes.md](docs/pipes.md) |
+| **USB 大容量储存(只读裸盘)** | 插一个 U 盘(或 QEMU 的 `usb-storage`),`usbdisk` 一条命令就能看它是什么、读任意扇区、解 MBR 分区表:内核里是 UHCI 控制器 + **Bulk-Only Transport**(CBW/CSW)+ **SCSI 最小集**(INQUIRY / TEST UNIT READY / READ CAPACITY / READ(10) / REQUEST SENSE);只读、裸扇区,不接 FAT 也不写盘。`usbdisk` / `usbdisk read <lba>` / `usbdisk hexdump <lba>` / `usbdisk mbr` / `usbdisk sense`(见 [docs/usb-disk.md](docs/usb-disk.md)) |
 | **跑磁盘上的程序** | `run HELLO`:从磁盘读进来 → 给这个程序**建一套自己的页目录**(私有页,见下) → 切 CR3 → 执行(镜像超 384 KB 直接拒绝),程序用 `int 0x30` 调用内核(见 [docs/programs.md](docs/programs.md)) |
 | **程序接口 17 个功能** | 打印/颜色/收键 + 清屏、读写文件、定位光标、读键事件(方向键)、屏幕尺寸、程序参数、定位画字、**蜂鸣器(14 号 `beep`)**、**读 stdin(17 号 `j_pipe_read`,管道右半边用)** —— 够写全屏程序,还够唱一首 |
 | **组件:计算器** | `run CALC`:`+ - * /`、小数点、平方,自己实现定点小数(6 位小数),除零/溢出都会报错 |
@@ -109,7 +112,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 需要 `nasm`、`qemu-system-i386`、`python3`:
 
 ```bash
-# Debian/Ubuntu
+# Debian/Ubuntu 别的发行版管不了 反正总不就是装个nasm qemu和py3
 sudo apt install nasm qemu-system-x86 python3
 
 make                    # 构建两个镜像:build/kkernel.img(软盘)+ build/kkernel-hd.img(硬盘)
@@ -122,7 +125,7 @@ make hd                 # 完整硬盘镜像:字库 + FAT16 + 示例程序(推�
 #   软盘这条线已经停止开发(不再加新功能),只在 `make test-fda` 里当"CHS 退回路径"的回归。
 #   开机那两行算是它的墓碑:一行说"完整功能请用硬盘版",一行是 `Goodbye Floppy disk`。
 #   它没有真的死掉 —— 每次 make test 都还会把这块镜像拉出来跑一遍,守那条最老的 BIOS 退路。
-make test               # 无头自动化测试:7 组,全过会打 ✅
+make test               # 无头自动化测试:8 组,全过会打 ✅
 make clean              # 清掉 build/
 
 ./tools/run.sh          # 启动脚本:自动构建 + 选"怎么挂盘"
@@ -177,7 +180,7 @@ qemu-system-i386 -machine pcspk-audiodev=snd0 -audiodev pa,id=snd0,out.stream-na
 VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issues.md](docs/known-issues.md))。
 谱子怎么写、怎么改自己的歌:[docs/quickstart.md](docs/quickstart.md)。
 
-`make test` 的 7 组(每组都真的启动 QEMU、抓屏、断言屏幕内容):
+`make test` 的 8 组(每组都真的启动 QEMU、抓屏、断言屏幕内容):
 
 | 目标 | 测什么 |
 |---|---|
@@ -188,6 +191,7 @@ VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issue
 | `test-kbd` | 用 QEMU monitor 的 `sendkey` **真按键**,验证回显、Shift、回车、退格 |
 | `test-shell` | 敲 `help`/`info`/`page`/`echo`/`clear`,验证命令、滚屏、清屏、中文、UTF-8 边界 |
 | `test-hd-font` | 硬盘镜像:字库从磁盘读、`ls`/`cat`/`write`/`run`、**计算器的八组算式**、**编辑器的敲字/存盘/退出**,最后**离线解析镜像**证明字节真落盘 |
+| `test-usb` | QEMU 挂一个假 U 盘(`usb-storage`),断言设备识别 / 容量 / READ(10) 读扇区 / MBR 分区表 / REQUEST SENSE |
 
 最后那一项有两套独立的验证手段:一套看屏幕像素(把期望的文字用字库渲染成图案再去截图里找),
 一套在 QEMU 关掉之后**直接解析镜像文件的 FAT 分区**(FAT16/FAT32 都认,不信内核自己打印的"写成功了")。
@@ -224,6 +228,7 @@ kernel/ata.asm         ATA(IDE)PIO 驱动:读扇区 + 写扇区 + FLUSH CACHE
 kernel/fontdisk.asm    启动时把完整字库从磁盘读进 0x200000(读不到就用内建子集)
 kernel/fat.asm         FAT16/FAT32:挂载(BPB 自动判)/找文件/读/写/删(rm/rmdir)/列目录/子目录
 kernel/dev.asm         /DEV 设备抽象层:设备表 + 名字解析 + 六个虚拟设备(devices.md)
+kernel/usbdisk.asm     USB 大容量储存:bulk 传输 + BOT + SCSI 只读裸扇区(usb-disk.md)
 kernel/api.asm         int 0x30 程序接口(打印字符串/数字/码位、设颜色、等按键)
 kernel/speaker.asm     PC 蜂鸣器:14 号 beep(PIT 通道 2 定音高 + 0x61 开关扬声器,毫秒是忙等估的)
 kernel/shell.asm       shell:行编辑、命令解析、各命令实现
@@ -279,6 +284,7 @@ tests/probe_disk.asm   探针:实测"软盘到底支不支持 LBA 读"(见第 6 
  不再固定 0x200000;默认 128 MiB 机器是 0x7A00000 起、1.8 MB)
 0x3B0000 - 0x3BFFFF   PINYIN 拼音表(ime.asm,最多 60 KiB)
 0x3C0000 - 0x3C1FFF   USB 帧列表/QH/TD(usb.asm)
+0x3C1200 - 0x3C2FFF   USB bulk QH/TD + BOT/CBW/CSW/数据缓冲(usbdisk.asm)
 0x3D0000 - 0x3D1FFF   页池位图(8 KiB)          (pmem.asm,PMEM_BITMAP;最多记 64512 页 = 252 MiB)
 0x400000 - ident      物理页池(4 MiB ~ 恒等映射上限;上界按 RAM 自适应,最大 252 MiB)
 0xFD000000            VBE 线性帧缓冲(单独挂一张页表,映射到它所在的 4 MiB 窗口)
@@ -338,7 +344,7 @@ layout: tramp=0x0017F000 args=0x003AE000 stack=0x003AFFFC
 ## 5. 磁盘:字库、FAT16、跑程序
 
 磁盘之上还有一层很薄的「设备」抽象:`/DEV` 下的名字由内核设备表接管(见 [docs/devices.md](docs/devices.md))。
-
+(因为还没更新完)
 这一块单独写了一页:**[docs/filesystem.md](docs/filesystem.md)** —— 镜像的 LBA 地图、
 ATA PIO 的寄存器顺序和两个坑、磁盘字库怎么加载、FAT16 的字段和写文件流程、
 `mkfat.py` 怎么用、测试怎么用两条信道证明"字节真的落盘了"。
@@ -570,7 +576,7 @@ shell 的意义。
 > xiang
 （底行:1.想 2.向 3.像 4.相 5.乡 6.项 7.象 8.香 9.响  ,/. page 1/4  Esc cancel）
 ```
-
+(作者ps:日文韩文目前不会做 毕竟也不是我的母语 繁体中文倒是可以 但是免不了拼音了 仓颉注音我不行)
 数字 1-9 直接选**当前页**对应的候选、空格选当前页第 1 个、`,` / `.` 翻上一页 / 下一页
 (候选只有一页时提示里不显示页码)、Esc 取消;候选按**词频**排(最常用的在最前面)。
 数据在磁盘的 `/SYS/PINYIN.BIN`(6000 常用字、400 个音节,`ji` 这种音有 11 页),由
@@ -607,7 +613,7 @@ LIB  <DIR>
 
 | 样式 | 长什么样 |
 |---|---|
-| `kao`(默认) | 黄色 `(・ω・)>` / `(・ω・)docs>`;命令出错后脸变红 `(；ω；)`,下一次输入就恢复 |
+| `kao`(默认) | 黄色 `(・ω・)>` / `(・ω・)docs>`;命令出错后脸变红 `(；ω；)`,下一次输入就恢复(ps:kawaii~) |
 | `plain` | `>` / `docs>` / `2>` |
 | `moe` | 粉色 `かいかーねる>`,文件找不到、命令不认识也换成吐槽文案 |
 | `dos` | `C:\>` / `C:\docs>` |
@@ -1179,6 +1185,9 @@ A | B         管道(顺序执行,最多 4 段):A 的屏幕输出被内核吃进
               跑完 A 再把缓冲当 B 的 stdin(B 用 int 0x30 功能 17 读,见 docs/pipes.md);
               例:cat DOCS/README.TXT | run WC / ls BIN | run GREP HELLO
               管道工具:WC(行/词/字节)、UPPER(转大写)、GREP <子串>、HEAD [行数]
+usbdisk       只读裸盘 U 盘(USB 大容量储存):裸 usbdisk 看设备信息(INQUIRY/容量);
+              usbdisk read <lba> 读一个扇区打印 64B / hexdump <lba> 看完整 512B /
+              mbr 解分区表 / sense 读 SCSI 感应数据
 date [fmt]    读 CMOS 时钟:裸 date 打日期+时间+星期,加 ymd / mdy / dmy / time 换格式
 style [名字]  换提示符样式:kao(颜文字 (・ω・),报错变 (；ω；),默认)/ plain(朴素 >)/ moe(萌:かいかーねる>,报错带吐槽)/ dos(C:\>)/ c64(READY.);裸 style 看现在用的哪个
 pci [b:s.f]   PCI 总线枚举:裸 pci 列出总线上所有设备,加 0:1.2 这种地址看单台详情
@@ -1493,3 +1502,6 @@ Copyright (c) 2026 kai030226
 `font/` 目录里的字形数据来自 GNU Unifont,按 **GPL-2+** 单独授权(见 [font/LICENSE](font/LICENSE))。
 
 要是这个仓库帮你搞懂了保护模式、分页或者文件系统,那就够了。
+
+
+**ps:并非如此,这个readme是AI帮忙写的 本人很懒 只加了这一句话 README的目的是AI瞎编的 我也懒得管了 凑合着看吧!写的比我好(bushi) 至少真东西不是瞎编的 有bug请提pr和邮箱lkx2025awa@outlook.com(-w-) **
