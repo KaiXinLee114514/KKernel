@@ -1713,6 +1713,280 @@ cmd_write:
     call term_print
     ret
 
+
+; ---------------------------------------------------------------------------
+;  cp <源> <目标> / mv <源> <目标>
+;    cp:把源文件整份读进 FILE_BUF 再写到目标(上限 60 KiB,够放源码/文本/小盘);
+;        目标以 / 收尾、或者本身是个已存在的目录 → 拷进那个目录,名字不变。
+;    mv:cp + 删源(= FAT 上"改名/移动"的 MVP:数据多搬一遍,但长文件名/跨目录都
+;        自动沿用 fat_write_file 的 LFN 逻辑)。源是目录时拒绝(没有递归复制)。
+; ---------------------------------------------------------------------------
+cmd_cp:
+    mov byte [cp_is_mv], 0
+    jmp shell_copy_move
+
+cmd_mv:
+    mov byte [cp_is_mv], 1
+    jmp shell_copy_move
+
+shell_copy_move:
+    cmp byte [fat_ok], 0
+    je cmd_ls.nomount
+
+    ; ---- 第一个词 = 源 ----
+    mov esi, [cmd_arg]
+    call arg_word
+    jc .usage
+    mov esi, eax
+    mov edi, name_buf
+    rep movsb
+    mov byte [edi], 0
+
+    ; ---- 第二个词 = 目标(esi 现在停在第一个词后的空格/结尾) ----
+    call arg_word
+    jc .usage
+    mov esi, eax
+    mov edi, dst_buf
+    rep movsb
+    mov byte [edi], 0
+
+    ; ---- 源和目标字面相同?犯不着拷 ----
+    mov esi, name_buf
+    mov edi, dst_buf
+    call str_same_path
+    test eax, eax
+    jnz .same
+
+    ; ---- 记下用户当前目录(后面解析目标路径要回到这里) ----
+    mov eax, [fat_dir]
+    mov [cp_saved_dir], eax
+
+    ; ---- 读源文件 ----
+    mov esi, name_buf
+    call fat_path
+    jc .fail
+    mov [cp_src_last], eax
+    ; 源是目录?(能 chdir 进去就是目录;失败时 fat_dir 不变)
+    mov esi, eax
+    call fat_chdir
+    jnc .isdir
+    mov esi, [cp_src_last]
+    call fat_stat
+    cmp eax, -1
+    je .fail
+    cmp eax, FILE_MAX
+    ja .toobig
+    mov esi, [cp_src_last]
+    mov edi, FILE_BUF
+    call fat_read_file
+    cmp eax, -1
+    je .fail
+    mov [cp_len], eax
+
+    ; ---- 回用户目录,再解析目标 ----
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov esi, dst_buf
+    call fat_path
+    jc .fail
+    mov ebx, eax
+    cmp byte [ebx], 0
+    je .dst_dir                       ; 目标路径以 / 收尾:已经站在目录里
+    mov esi, ebx
+    call fat_chdir
+    jc .dst_file                      ; 不是目录 → 当普通文件名
+.dst_dir:
+    mov esi, name_buf                 ; 目录内:用源文件的本名
+    call base_name
+    mov [cp_dst_last], eax
+    jmp .dst_go
+.dst_file:
+    mov [cp_dst_last], ebx
+.dst_go:
+    mov esi, [cp_dst_last]
+    mov edi, FILE_BUF
+    mov ecx, [cp_len]
+    call fat_write_file
+    cmp eax, -1
+    je .fail
+
+    ; ---- mv:复制成功后删掉源(跨目录也成立:在 FAT 里就是目录项搬家) ----
+    cmp byte [cp_is_mv], 0
+    je .success
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov esi, name_buf
+    call fat_path
+    jc .mv_copy_only
+    mov esi, eax
+    call fat_unlink
+    cmp eax, 0
+    jne .mv_copy_only
+
+.success:
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov al, COL_OK
+    call term_set_color
+    mov esi, msg_cp_ok
+    cmp byte [cp_is_mv], 0
+    je .p_ok
+    mov esi, msg_mv_ok
+.p_ok:
+    call term_print
+    mov esi, name_buf
+    call term_print
+    mov esi, msg_cp_arrow
+    call term_print
+    mov esi, dst_buf
+    call term_print
+    mov al, 10
+    call term_putc
+    ret
+
+.mv_copy_only:
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_mv_unlink_fail
+    call term_print
+    ret
+
+.usage:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cp_use
+    cmp byte [cp_is_mv], 0
+    je .u_use
+    mov esi, msg_mv_use
+.u_use:
+    call term_print
+    ret
+
+.same:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cp_same
+    call term_print
+    ret
+
+.isdir:
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cp_isdir
+    call term_print
+    ret
+
+.toobig:
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cp_toobig
+    call term_print
+    ret
+
+.fail:
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cp_fail
+    cmp byte [cp_is_mv], 0
+    je .f_msg
+    mov esi, msg_mv_fail
+.f_msg:
+    call term_print
+    ret
+
+; ---------------------------------------------------------------------------
+;  arg_word:esi = 参数串 → CF=1(没词了);否则 eax = 词起点, ecx = 词长,
+;  esi 前进到词后的空格或结尾。cp/mv 用它切两个参数。
+; ---------------------------------------------------------------------------
+arg_word:
+    push edx
+.skip:
+    mov al, [esi]
+    test al, al
+    jz .none
+    cmp al, ' '
+    jne .start
+    inc esi
+    jmp .skip
+.start:
+    mov eax, esi
+    xor ecx, ecx
+.scan:
+    mov dl, [esi]
+    test dl, dl
+    jz .end
+    cmp dl, ' '
+    je .end
+    inc esi
+    inc ecx
+    jmp .scan
+.end:
+    pop edx
+    clc
+    ret
+.none:
+    pop edx
+    stc
+    ret
+
+; ---------------------------------------------------------------------------
+;  base_name:esi = 路径 → eax = 最后一段(文件名)的指针
+; ---------------------------------------------------------------------------
+base_name:
+    push esi
+    mov eax, esi
+.loop:
+    mov dl, [esi]
+    test dl, dl
+    jz .done
+    cmp dl, '/'
+    je .sep
+    cmp dl, 0x5C
+    je .sep
+.cont:
+    inc esi
+    jmp .loop
+.sep:
+    lea eax, [esi + 1]
+    jmp .cont
+.done:
+    pop esi
+    ret
+
+; ---------------------------------------------------------------------------
+;  str_same_path:esi / edi 两条 0 结尾串 → eax = 1 相同 / 0 不同
+; ---------------------------------------------------------------------------
+str_same_path:
+    push esi
+    push edi
+.loop:
+    mov al, [esi]
+    mov ah, [edi]
+    cmp al, ah
+    jne .no
+    test al, al
+    jz .yes
+    inc esi
+    inc edi
+    jmp .loop
+.yes:
+    mov eax, 1
+    jmp .out
+.no:
+    xor eax, eax
+.out:
+    pop edi
+    pop esi
+    ret
+
 ; ---------------------------------------------------------------------------
 ;  run <文件>:把程序读进 PROG_ADDR(暂存区)→ 建一套空的程序地址空间 →
 ;             切 CR3 跑 → 跑完把页全还给页池
@@ -3134,6 +3408,8 @@ n_debug  db 'debug', 0
 n_ls     db 'ls', 0
 n_cat    db 'cat', 0
 n_write  db 'write', 0
+n_cp     db 'cp', 0
+n_mv     db 'mv', 0
 n_run    db 'run', 0
 n_clear  db 'clear', 0
 n_info   db 'info', 0
@@ -3280,6 +3556,8 @@ cmd_table:
     dd n_rm,     cmd_rm
     dd n_cat,    cmd_cat
     dd n_write,  cmd_write
+    dd n_cp,     cmd_cp
+    dd n_mv,     cmd_mv
     dd n_run,    cmd_run
     dd n_clear,  cmd_clear
     dd n_info,   cmd_info
@@ -3418,6 +3696,8 @@ msg_help db \
     'rm <file>     delete a file (directories: use rmdir)', 10, \
     'cat <file>    print a text file (UTF-8; /DEV: cat DEV/RTC)', 10, \
     'write <f> <t> create/overwrite a file (/DEV: write DEV/CON hi)', 10, \
+    'cp <src> <dst> copy a file (dst DIR/ copies into that directory)', 10, \
+    'mv <src> <dst> move a file (copy + delete; long names & subdirs supported)', 10, \
     'run <file>    run a program from disk (.BIN; bare "run" = the ABI)', 10, \
     'pipe: A | B   把 A 的输出接给 B 的 stdin(最多 4 段;顺序执行)', 10, \
     '              例: cat DOCS/README.TXT | run WC / ls BIN | run GREP HELLO', 10, \
@@ -3564,6 +3844,24 @@ run_esp     dd 0                        ; run 用的:进 ring 3 前的内核栈(
 run_status  dd 0                        ; run 用的:0 = 程序正常 ret,1 = 被内核干掉了
 cat_name_ptr dd 0                       ; cat 用的:去掉目录部分之后的文件名
 file_size  dd 0
+
+cp_is_mv   db 0
+cp_saved_dir dd 0
+cp_src_last  dd 0
+cp_dst_last  dd 0
+cp_len       dd 0
+dst_buf      times 128 db 0
+msg_cp_ok       db 'copied ', 0
+msg_mv_ok       db 'moved ', 0
+msg_cp_arrow    db ' -> ', 0
+msg_cp_use      db 'usage: cp <src> <dst>   (dst DIR/ = copy into that directory)', 10, 0
+msg_mv_use      db 'usage: mv <src> <dst>   (dst DIR/ = move into that directory)', 10, 0
+msg_cp_same     db 'cp/mv: source and destination are the same', 10, 0
+msg_cp_isdir    db 'cp/mv: source is a directory (copying directories is not supported)', 10, 0
+msg_cp_toobig   db 'cp/mv: file too big (max 60 KiB, the copy buffer is FILE_BUF)', 10, 0
+msg_cp_fail     db 'cp: failed (not found / disk full / bad name?)', 10, 0
+msg_mv_fail     db 'mv: failed (not found / disk full / bad name?)', 10, 0
+msg_mv_unlink_fail db 'mv: copy done, but could not remove the source', 10, 0
 
 ; ---- 多 shell:每条自己的状态格子 + 两个全局 ----
 ;  全局的 shell_buf / shell_len / cwd_str 永远是"当前活动 shell 的",换手时由

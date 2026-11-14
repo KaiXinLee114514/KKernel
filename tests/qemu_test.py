@@ -1107,6 +1107,42 @@ def main() -> int:
 
             run("cat test.txt")
             results.append(("写进去的读得回来", wait_for("hello-from-fat16"), "hello-from-fat16"))
+            # ---- cp / mv:复制文件、改名移动(含目标目录写法) ----
+            run("cp test.txt copy1.txt")
+            results.append(("cp 复制文件", has("copied") and has("copy1.txt"),
+                            "copied test.txt -> copy1.txt"))
+            run("cat copy1.txt")
+            results.append(("cp 出来的内容一样", wait_for("hello-from-fat16"), "hello-from-fat16"))
+
+            run("mv copy1.txt copy2.txt")
+            results.append(("mv 改名", has("moved") and has("copy2.txt"),
+                            "moved copy1.txt -> copy2.txt"))
+            run("cat copy2.txt")
+            results.append(("mv 之后内容还在", wait_for("hello-from-fat16"), "hello-from-fat16"))
+            run("cat copy1.txt")
+            results.append(("mv 之后旧名字没了", wait_for("file not found"), "file not found"))
+
+            run("cp test.txt DOCS/")
+            results.append(("cp 进目录", has("copied"), "copied test.txt -> DOCS/"))
+            run("cat DOCS/test.txt")
+            results.append(("cp 进目录之后能读", wait_for("hello-from-fat16"), "hello-from-fat16"))
+
+            run("mv DOCS/test.txt DOCS/test2.txt")
+            results.append(("mv 子目录内改名", has("moved"), "moved DOCS/test.txt -> DOCS/test2.txt"))
+            run("cat DOCS/test2.txt")
+            results.append(("mv 子目录之后内容还在", wait_for("hello-from-fat16"), "hello-from-fat16"))
+
+            run("cp nosuch.txt x.txt")
+            results.append(("cp 不存在的源报错", has("cp: failed"), "cp: failed"))
+            run("cp DOCS y.txt")
+            results.append(("cp 源是目录被拒绝", has("source is a directory"),
+                            "cp/mv: source is a directory"))
+            run("cp test.txt")
+            results.append(("cp 缺参数给用法", has("usage: cp <src> <dst>"), "usage: cp ..."))
+            # 收拾现场,别给后面的 ls/子目录用例留下噪声
+            run("rm copy2.txt")
+            run("rm DOCS/test2.txt")
+
 
             run("run", wait=0.8)
             results.append(("裸 run 打印程序接口",
