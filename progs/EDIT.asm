@@ -13,6 +13,8 @@
 ;                                                          提示里预填上次的词,回车 = 找下一个,
 ;                                                          退格删 / Ctrl-U 清空 / Esc 取消)
 ;          Ctrl-Q                                          退出(有改动会再问一次)
+;          Shift                                           切换中/英输入法(中文下 a-z 打拼音,
+;                                                          空格/回车出候选, 1-9 选字, ,/. 翻页, Esc 取消)
 ;
 ;  ── 文本怎么存 ──────────────────────────────────────────────────────────
 ;  一整块缓冲区(TEXT),里面就是一串普通字节,行与行之间用 '\n' 分隔 ——
@@ -46,12 +48,19 @@ CURSOR_CHAR equ '_'                     ; 可见光标画什么字符(想换成 
 CURSOR_ATTR equ 0x0A                    ; 光标颜色:亮绿(正文是 0x07 浅灰,一眼分得清)
 FIND_MAX    equ 32                      ; 查找关键词最长几个字节(超了截断)
 
+; ---- 中文输入法(拼音单字,和 shell 里的 IME 用同一份 /SYS/PINYIN.BIN)----
+PINYIN_ADDR equ 0x190000                ; 堆窗口里(0x180000 起的 TEXT 之后)
+PINYIN_MAX  equ 61440
+IME_PINYIN_MAX equ 12                   ; 一个音节最长 7 个字母,留余量
+
+
 ; ---------------------------------------------------------------------------
 ;  start:读参数 → 读文件 → 循环(取键 → 处理 → 重画)
 ; ---------------------------------------------------------------------------
 start:
     call get_name
     call load_file
+    call ime_load
     call redraw
 .main:
     call api_key                        ; eax = 键事件
@@ -137,8 +146,15 @@ save_file:
 
 ; ---------------------------------------------------------------------------
 ;  handle_key:eax = 键事件 → 改文本 / 存盘 / 退出
+;  (中文输入法先截一道:Shift 切中英;中文态下 a-z 攒拼音,空格/回车出候选)
 ; ---------------------------------------------------------------------------
 handle_key:
+    cmp eax, 0x1F                       ; 单独按一下 Shift = 中英切换(键盘 IRQ 发的事件)
+    je .ime_toggle
+    cmp dword [ime_mode], 0
+    jne .ime_key
+
+.normal:
     cmp eax, 0x100
     jae .special                        ; 0x100 起是扩展键(方向键那一家)
     cmp al, 13                          ; 回车 = 插入换行
@@ -205,8 +221,57 @@ handle_key:
 .out:
     ret
 
-    ; ---- 扩展键:1 上 2 下 3 左 4 右 5 Home 6 End 7 Del 8 PgUp 9 PgDn ----
+; ---- 中文输入法:Shift 切中英 / 中文态的按键处理 ----
+.ime_toggle:
+    cmp dword [ime_ok], 0
+    je .out
+    xor dword [ime_mode], 1
+    cmp dword [ime_mode], 0
+    je .ime_toggle_off
+    mov dword [status], msg_ime_on
+    ret
+.ime_toggle_off:
+    call ime_clear
+    mov dword [status], msg_ime_off
+    ret
+
+.ime_key:
+    cmp al, 'a'
+    jb .ime_key_other
+    cmp al, 'z'
+    ja .ime_key_other
+    call ime_type_letter
+    ret
+.ime_key_other:
+    cmp al, 8
+    je .ime_key_bksp
+    cmp al, 13
+    je .ime_key_commit
+    cmp al, ' '
+    je .ime_key_commit
+    cmp al, 27
+    je .ime_key_esc
+    ; 别的键(数字/标点/方向键/Ctrl-*)先把组合清掉,再走普通逻辑
+    call ime_clear
+    mov dword [status], 0
+    jmp .normal
+.ime_key_bksp:
+    cmp dword [ime_len], 0
+    je .normal                          ; 没在拼拼音 → 普通退格删文本
+    call ime_bksp
+    ret
+.ime_key_commit:
+    cmp dword [ime_len], 0
+    je .normal                          ; 没在拼音状态 → 空格/回车照常
+    call ime_commit
+    ret
+.ime_key_esc:
+    call ime_clear
+    mov dword [status], 0
+    ret
+
 .special:
+    ; ---- 扩展键:1 上 2 下 3 左 4 右 5 Home 6 End 7 Del 8 PgUp 9 PgDn ----
     sub eax, 0x100
     cmp eax, 1
     je .up
@@ -328,23 +393,59 @@ insert_byte:
     ret
 
 ; ---------------------------------------------------------------------------
-;  delete_at_cursor:删掉光标处那个字节(后面那段往前挪一格)
+;  delete_at_cursor:删掉光标处**整个 UTF-8 字符**
+;  (中文 3 字节一起删、emoji 4 字节也一起删,不会留下半个字变成豆腐块)
 ; ---------------------------------------------------------------------------
 delete_at_cursor:
     pushad
     mov ecx, [cursor]
     mov edx, [text_len]
-.shift:
-    inc ecx
     cmp ecx, edx
-    jae .done
+    jae .done                           ; 光标在结尾:没东西可删
     mov al, [TEXT + ecx]
-    mov [TEXT + ecx - 1], al
-    jmp .shift
-.done:
-    dec dword [text_len]
+    mov ebx, 1                          ; 默认 ASCII:一个字节
+    test al, 0x80
+    jz .len_ok
+    mov ebx, 2
+    mov ah, al
+    and ah, 0xE0
+    cmp ah, 0xC0
+    je .len_ok
+    mov ebx, 3
+    mov ah, al
+    and ah, 0xF0
+    cmp ah, 0xE0
+    je .len_ok
+    mov ebx, 4
+    mov ah, al
+    and ah, 0xF8
+    cmp ah, 0xF0
+    je .len_ok
+    mov ebx, 1                          ; 不合法前导字节:当 1 字节删掉
+.len_ok:
+    mov eax, edx
+    sub eax, ecx                        ; 尾巴上剩几个字节
+    cmp ebx, eax
+    jbe .shift
+    mov ebx, eax                        ; 别越界:只剩半个字就删剩下的
+.shift:
+    mov ecx, [cursor]
+    mov edx, ecx
+    add edx, ebx                        ; edx = 往前搬的来源
+    mov edi, [text_len]
+.shift_loop:
+    cmp edx, edi
+    jae .shift_done
+    mov al, [TEXT + edx]
+    mov [TEXT + ecx], al
+    inc ecx
+    inc edx
+    jmp .shift_loop
+.shift_done:
+    sub dword [text_len], ebx
     mov eax, [text_len]
     mov byte [TEXT + eax], 0
+.done:
     popad
     ret
 
@@ -1005,6 +1106,350 @@ str_copy:
     ret
 
 ; ---------------------------------------------------------------------------
+; ===========================================================================
+;  拼音输入法(中文单字)——
+;  数据表和 shell 里的输入法共用 /SYS/PINYIN.BIN(格式见 kernel/ime.asm):
+;    'PIME' + u32 音节数 + u32 字条目数
+;    + 8B × 音节数    每个音节 8 字节 ASCII 串(小写,0 补齐)
+;    + 5B × 字条目数  u16 音节号 + 3B UTF-8 汉字(按词频排序)
+;  EDIT 每次按键都全屏重画,所以这里只要改 [status] 指针,下一帧自然就画出来。
+; ===========================================================================
+
+; ---------------------------------------------------------------------------
+;  ime_load:开机把拼音表读进 PINYIN_ADDR(读不到就悄悄关掉输入法,不影响编辑)
+;  程序运行时 shell 的 cwd 不一定在根目录,所以依次试 ""/../ /../../ 前缀
+; ---------------------------------------------------------------------------
+ime_load:
+    pushad
+    mov dword [ime_ok], 0
+    mov esi, ime_path0
+    mov edi, PINYIN_ADDR
+    mov ecx, PINYIN_MAX
+    mov eax, 7
+    int 0x30
+    cmp eax, 16
+    jg .check
+    mov esi, ime_path1
+    mov edi, PINYIN_ADDR
+    mov ecx, PINYIN_MAX
+    mov eax, 7
+    int 0x30
+    cmp eax, 16
+    jg .check
+    mov esi, ime_path2
+    mov edi, PINYIN_ADDR
+    mov ecx, PINYIN_MAX
+    mov eax, 7
+    int 0x30
+    cmp eax, 16
+    jg .check
+    popad
+    ret
+.check:
+    cmp dword [PINYIN_ADDR], 0x454D4950  ; 'PIME'
+    jne .out
+    mov esi, PINYIN_ADDR
+    mov eax, [esi + 4]
+    mov [ime_nsyll], eax
+    mov eax, [esi + 8]
+    mov [ime_nchar], eax
+    test eax, eax
+    jz .out
+    mov dword [ime_ok], 1
+.out:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_clear:清掉正在拼的拼音
+; ---------------------------------------------------------------------------
+ime_clear:
+    mov dword [ime_len], 0
+    mov byte [ime_buf], 0
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_scopy:esi = 0 结尾串 → 抄到 edi 并让 edi 指到结尾(内部小工具)
+; ---------------------------------------------------------------------------
+ime_scopy:
+.loop:
+    mov al, [esi]
+    test al, al
+    jz .done
+    mov [edi], al
+    inc esi
+    inc edi
+    jmp .loop
+.done:
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_refresh_status:状态行显示 "拼音: xxx"
+; ---------------------------------------------------------------------------
+ime_refresh_status:
+    pushad
+    mov edi, ime_status
+    mov esi, msg_ime_pinyin
+    call ime_scopy
+    mov esi, ime_buf
+    call ime_scopy
+    mov dword [status], ime_status
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_type_letter:al = a-z → 追加到拼音缓冲
+; ---------------------------------------------------------------------------
+ime_type_letter:
+    mov ecx, [ime_len]
+    cmp ecx, IME_PINYIN_MAX - 1
+    jae .full
+    mov [ime_buf + ecx], al
+    inc ecx
+    mov [ime_len], ecx
+.full:
+    mov byte [ime_buf + ecx], 0
+    call ime_refresh_status
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_bksp:退掉拼音最后一个字母
+; ---------------------------------------------------------------------------
+ime_bksp:
+    mov ecx, [ime_len]
+    test ecx, ecx
+    jz .done
+    dec ecx
+    mov [ime_len], ecx
+    mov byte [ime_buf + ecx], 0
+.done:
+    call ime_refresh_status
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_lookup:eax = 音节号(找不到 = -1)
+; ---------------------------------------------------------------------------
+ime_lookup:
+    pushad
+    mov ebx, PINYIN_ADDR + 12
+    xor ecx, ecx
+.syl:
+    cmp ecx, [ime_nsyll]
+    jae .no
+    mov edi, ebx
+    mov esi, ime_buf
+.cmp:
+    mov al, [edi]
+    test al, al
+    jz .tail
+    cmp al, [esi]
+    jne .next
+    inc edi
+    inc esi
+    jmp .cmp
+.tail:
+    cmp byte [esi], 0
+    jne .next
+    mov [esp + 28], ecx                 ; 返回 eax = 音节号
+    jmp .out
+.next:
+    add ebx, 8
+    inc ecx
+    jmp .syl
+.no:
+    mov dword [esp + 28], -1
+.out:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_collect:按 [ime_syll] 收集候选 → ime_cands(当前页 9 个)/ ime_ncand / ime_total
+; ---------------------------------------------------------------------------
+ime_collect:
+    pushad
+    mov ebx, [ime_page]
+    imul ebx, 9
+    mov esi, PINYIN_ADDR + 12
+    mov eax, [ime_nsyll]
+    imul eax, 8
+    add esi, eax                        ; esi = 字条目起点
+    mov ecx, [ime_nchar]
+    xor edx, edx
+    mov dword [ime_ncand], 0
+    mov dword [ime_total], 0
+.loop:
+    test ecx, ecx
+    jz .done
+    mov ax, [esi]
+    and eax, 0xFFFF
+    cmp eax, [ime_syll]
+    jne .next
+    mov eax, edx
+    sub eax, ebx
+    cmp eax, 0
+    jl .skip
+    cmp eax, 9
+    jge .skip
+    imul eax, 3
+    lea edi, [ime_cands]
+    add edi, eax
+    mov al, [esi + 2]
+    mov [edi], al
+    mov al, [esi + 3]
+    mov [edi + 1], al
+    mov al, [esi + 4]
+    mov [edi + 2], al
+    inc dword [ime_ncand]
+.skip:
+    inc edx
+    mov [ime_total], edx
+.next:
+    add esi, 5
+    dec ecx
+    jmp .loop
+.done:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_build_cand_status:把 "拼音: xx 1.字 2.字 ... 空格=首字 ,/.翻页 Esc=取消" 拼到 ime_status
+; ---------------------------------------------------------------------------
+ime_build_cand_status:
+    pushad
+    mov edi, ime_status
+    mov esi, msg_ime_pinyin
+    call ime_scopy
+    mov esi, ime_buf
+    call ime_scopy
+    mov esi, msg_ime_sep
+    call ime_scopy
+    xor ecx, ecx
+.loop:
+    cmp ecx, [ime_ncand]
+    jae .hint
+    mov eax, ecx
+    inc eax
+    add al, '0'
+    mov [edi], al
+    inc edi
+    mov byte [edi], '.'
+    inc edi
+    mov eax, ecx
+    imul eax, 3
+    lea esi, [ime_cands]
+    add esi, eax
+    mov al, [esi]
+    mov [edi], al
+    mov al, [esi + 1]
+    mov [edi + 1], al
+    mov al, [esi + 2]
+    mov [edi + 2], al
+    add edi, 3
+    mov byte [edi], ' '
+    inc edi
+    inc ecx
+    jmp .loop
+.hint:
+    mov esi, msg_ime_hint
+    call ime_scopy
+    mov dword [status], ime_status
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_pick_index:eax = 候选序号 → 把这个字插到文本里
+; ---------------------------------------------------------------------------
+ime_pick_index:
+    cmp eax, [ime_ncand]
+    jae .ret
+    imul eax, 3
+    lea esi, [ime_cands]
+    add esi, eax
+    mov al, [esi]
+    call insert_byte
+    mov al, [esi + 1]
+    call insert_byte
+    mov al, [esi + 2]
+    call insert_byte
+    mov dword [dirty], 1
+    call ime_clear
+    mov dword [status], 0
+.ret:
+    ret
+
+; ---------------------------------------------------------------------------
+;  ime_commit:空格/回车触发 —— 查音节、出候选、等选字
+; ---------------------------------------------------------------------------
+ime_commit:
+    pushad
+    call ime_lookup
+    cmp eax, -1
+    je .nocand
+    mov [ime_syll], eax
+    mov dword [ime_page], 0
+    call ime_collect
+    cmp dword [ime_total], 0
+    je .nocand
+.pick_loop:
+    call ime_build_cand_status
+    call redraw
+    call api_key
+    cmp eax, 0x100
+    jae .pick_ret                       ; 方向键之类:直接收掉
+    cmp al, 27
+    je .cancel
+    cmp al, ' '
+    je .pick_first
+    cmp al, '1'
+    jb .other
+    cmp al, '9'
+    ja .other
+    sub al, '1'
+    movzx eax, al
+    call ime_pick_index
+    jmp .pick_ret
+.pick_first:
+    xor eax, eax
+    call ime_pick_index
+    jmp .pick_ret
+.other:
+    cmp al, ','
+    je .prev_page
+    cmp al, '.'
+    je .next_page
+    cmp al, 8
+    je .back_pinyin
+    ; 别的键:取消组合(拼音清掉),这一键不再处理
+    jmp .cancel
+.prev_page:
+    cmp dword [ime_page], 0
+    je .pick_loop
+    dec dword [ime_page]
+    call ime_collect
+    jmp .pick_loop
+.next_page:
+    mov eax, [ime_page]
+    inc eax
+    imul eax, 9
+    cmp eax, [ime_total]
+    jae .pick_loop
+    inc dword [ime_page]
+    call ime_collect
+    jmp .pick_loop
+.back_pinyin:
+    call ime_bksp
+    jmp .pick_ret
+.cancel:
+    call ime_clear
+    mov dword [status], 0
+    jmp .pick_ret
+.nocand:
+    call ime_clear
+    mov dword [status], msg_ime_nocand
+.pick_ret:
+    popad
+    ret
+
 ;  int 0x30 的包装 —— 见文件头坑 1:它们必须在入口之后(入口 = 第一个字节)
 ; ---------------------------------------------------------------------------
 api_clear:
@@ -1038,7 +1483,7 @@ api_put_at:
 def_name     db 'NOTES.TXT', 0
 msg_title    db 'KKernel editor  ---  ', 0
 msg_mod      db '   [modified]', 0
-msg_help     db 'Ctrl-S save  Ctrl-Q quit  Ctrl-F find  arrows/Home/End/Del  PgUp/PgDn', 0
+msg_help     db 'Ctrl-S save  Ctrl-Q quit  Ctrl-F find  arrows/Home/End/Del  PgUp/PgDn  Shift=中文', 0
 msg_new      db 'new file (Ctrl-S saves it)', 0
 msg_saved    db 'saved to disk', 0
 msg_savefail db 'SAVE FAILED (disk full or no FAT16?)', 0
@@ -1079,3 +1524,26 @@ find_go     dd 0                        ; 1 = 有词可查 / 0 = 取消
 find_same   dd 0                        ; 1 = 和上次同一个词(从光标下一个字节接着找)
 find_start  dd 0                        ; 这一轮从哪个偏移开始找
 row_buf     times 256 db 0
+
+; ---- 拼音输入法数据 ----
+ime_ok      dd 0
+ime_mode    dd 0                        ; 1 = 中文输入状态
+ime_len     dd 0
+ime_nsyll   dd 0
+ime_nchar   dd 0
+ime_total   dd 0
+ime_ncand   dd 0
+ime_page    dd 0
+ime_syll    dd 0
+ime_buf     times IME_PINYIN_MAX + 1 db 0
+ime_cands   times 27 db 0               ; 当前页最多 9 个候选 × 3 字节
+ime_status  times 200 db 0              ; 状态行拼出来的临时串
+ime_path0   db 'SYS/PINYIN.BIN', 0
+ime_path1   db '../SYS/PINYIN.BIN', 0
+ime_path2   db '../../SYS/PINYIN.BIN', 0
+msg_ime_on     db '中文输入: 敲拼音, 空格/回车出候选, Shift 切英文', 0
+msg_ime_off    db '英文输入, Shift 切中文', 0
+msg_ime_nocand db '没有这个音节 / 没有候选', 0
+msg_ime_pinyin db '拼音: ', 0
+msg_ime_sep    db '  ', 0
+msg_ime_hint   db '  空格=首字  ,/. 翻页  Esc 取消', 0
