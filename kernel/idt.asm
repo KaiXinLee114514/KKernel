@@ -191,7 +191,8 @@ isr_common:
     and eax, 3
     cmp eax, 3
     jne .not_user
-    cmp dword [space_live], 0
+    mov edx, [space_cur]                ; 正在跑程序的是哪条线程,就看它的 TCB
+    cmp dword [edx + TCB_SP_LIVE], 0
     je .not_user                        ; 没有程序在跑(理论上到不了)→ 老实 panic
     mov ebx, ebp                        ; 异常现场的帧指针交给它
     call prog_kill_from_fault           ; 不返回:干掉程序、回到 shell

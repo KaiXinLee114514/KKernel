@@ -667,7 +667,8 @@ rc_run_service:
     mov [cmd_arg], eax
     ; 收尾事件:正常回来了 / 被杀
     mov eax, EV_SVC_OK
-    cmp dword [run_status], 0
+    mov edx, [space_cur]                ; 这条服务线程自己的退出码
+    cmp dword [edx + TCB_SP_RUNSTAT], 0
     je .log
     mov eax, EV_SVC_FAIL
 .log:

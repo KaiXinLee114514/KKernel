@@ -21,10 +21,11 @@
 ;  I/O 位图**故意不给**(iomap_base = 104 = 表大小):ring 3 里 in/out 一律 #GP,
 ;  连 hlt 这种特权指令也不行。想做"特权违规"的演示很方便(见 progs/FAULT.asm)。
 ;
-;  ring 3 期间的中断栈:RING3_STACK_TOP(0x60000,8 KiB 往下长)。为什么不用
-;  shell 自己那条栈:进 ring 3 时 shell 的调用栈还挂在上面(cmd_run 下面还有
-;  shell_execute/shell_main 的活帧),中断往栈顶一压就踩上了。单独一条最干净。
-;  只有**一个**程序能跑(见 shell.asm 的 prog_owner 守卫),所以这条栈不会被抢。
+;  ring 3 期间的中断栈:TSS.esp0 现在**每条线程各用各的** —— cmd_run 进 ring 3
+;  之前把本线程的内核栈顶 TCB_SP_RUNESP 写进 TSS.esp0,之后每次线程切换
+;  (sched_pick)也按新线程的 TCB_SP_RUNESP 重设。RING3_STACK_TOP 只剩一个
+;  开机占位的意义:4 条 shell 可以各跑各的程序,谁被打断都压回自己的栈,
+;  不会再互相踩现场。
 ; ============================================================================
 
 TSS_SIZE         equ 104                ; 32 位 TSS 就固定这么大

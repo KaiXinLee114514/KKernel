@@ -1578,14 +1578,13 @@ def main() -> int:
 
             # ---- 卡住的 shell 不拖累别的 shell ----
             # ★ 这一段所有断言都跟「时序」有关,写测试时踩过两次坑:
-            #   1) 切到 shell 2 后不能先做别的用例(echo 等)再测「run 被拒」——
-            #      HANG 是有限圈数,等 echo 回来它可能已经转完退出,于是不会被拒。
-            #      所以「被拒」必须是切过去后的第一件事(见下面代码顺序)。
+            #   1) 切到 shell 2 后要赶快验证「另一个 shell 能跑程序」:HANG 是
+            #      有限圈数(约 40~60 秒),晚了它就自己转完了 —— 虽然断言照样
+            #      过得去,但测不到「同时」。
             #   2) 屏幕文字是异步往 MMIO 帧缓冲上画的,固定 sleep 之后 has()
             #      经常抓到「还没画完」的半屏 —— 一律用 wait_for,别用固定 sleep。
-            #      演示程序 HANG.BIN 转 24 圈(约 40~60 秒)后自己 ret。真死循环会永远
-            #      占住线程 0,而 shell 线程不可 kill,后面的用例就没法再用这条
-            #      shell —— 所以演示用有限圈数(见 progs/HANG.asm 的说明)。
+            #   演示程序 HANG.BIN 转 24 圈后自己 ret;真死循环现在也能用
+            #   `kill <线程号>` 杀掉它跑的程序(线程本身照旧不杀)。
             #      ★ 必须排在"编辑器能存进子目录"那个已知失败用例之前:它失败时
             #        会把编辑器留在屏幕上,之后敲什么都会被编辑器吃掉。
             run("clear")
@@ -1605,12 +1604,14 @@ def main() -> int:
                 mon.sendkey("ctrl-right")
                 time.sleep(1.5)
             run("clear")
-            # ★ 顺序要紧:先测“被拒”。切到 shell 2 后如果先跑 echo 等别的用例,
-            #   HANG 可能已经转完退出(慢/快机都见过),再 run HELLO 就不会被拒了。
+            # ★ 现在地址空间是每线程一份:shell 1 还在跑 HANG,shell 2 照样能
+            #   装自己的程序、跑完再回自己的提示符(以前会报 "another shell is
+            #   running a program" 被拒)。
             run("run HELLO.BIN", wait=1.5)
-            results.append(("一次只让一个程序跑",
-                            wait_for("another shell is running a program", 20.0),
-                            "被拒并提示另一条 shell 在跑程序"))
+            results.append(("两个 shell 各跑各的程序",
+                            wait_for("Hello from HELLO.BIN", 20.0) and
+                            wait_for("program returned to the shell", 20.0),
+                            "shell 1 卡在 HANG 时,shell 2 把 HELLO.BIN 跑完"))
             run("echo alive-while-hung", wait=1.5)
             results.append(("另一个 shell 照样能用", wait_for("alive-while-hung", 20.0),
                             "shell 1 卡死时 shell 2 还能执行命令"))

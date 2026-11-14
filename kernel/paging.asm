@@ -287,17 +287,22 @@ paging_translate:
     ret
 
 ; ===========================================================================
-;  ── 程序地址空间:每个程序一套页目录 + 按需分页 ──────────────────────────
-;  第一步(全分页)已经做完:每个程序跑之前先给它建一套**自己的页目录**:
+;  ── 程序地址空间:每条线程一套页目录 + 按需分页 ──────────────────────────
+;  第一步(全分页)已经做完:每条 shell 线程跑程序前都给它建一套**自己的页目录**:
 ;
 ;        页目录   = 内核页目录的副本(内核、VGA、IDT、栈、帧缓冲都还在)
 ;        页表[0]  = PT_LOW 的副本,但两个窗口的项被清成"不存在"
 ;
+;  ★ 状态在哪:以前 space_pd / space_pt / space_live … 是全局变量,所以全系统
+;    同时只能跑一个程序;现在它们都在**当前线程的 TCB**(TCB_SP_*)里,
+;    space_cur 指向当前线程那一块,sched_pick 每次换人时更新它。
+;    于是 4 条 shell 线程可以各跑各的 ring3 程序。
+;
 ;  第二步就是**按需分页**(demand paging):程序拿到的是 208 页的地址窗口,
 ;  但建表的时候**一页物理内存都不给**。程序第一次碰某页 → CPU 报 14 号页错误
 ;  → page_fault_try_handle 判断这个地址属于哪个窗口、从页池现拿一页、
-;  把内容准备好(镜像页:从暂存区拷;堆/`.bss` 页:留 0)→ 填进页表 → iret
-;  回去把那条指令**重执行一遍**,这次就通了。程序完全不知道发生过什么。
+;  把内容准备好(镜像页:从该空间自己的暂存区拷;堆/`.bss` 页:留 0)→ 填进
+;  页表 → iret 回去把那条指令**重执行一遍**,这次就通了。程序完全不知道发生过什么。
 ;
 ;     程序视角:                         物理内存:
 ;       0x120000 ┌──────────────┐          程序碰过的页才真的存在,
@@ -335,27 +340,30 @@ SPACE_ARGS_COPY  equ (4 + 2048 + 3) / 4                            ; 拷贝长�
 
 ; ---------------------------------------------------------------------------
 ;  space_create:建一套程序地址空间 —— 只给页目录 + 页表两页,窗口页一页不给
-;  返回 eax = 页目录物理地址(0 = 页池不够);另外填好 space_pd / space_pt
+;  返回 eax = 页目录物理地址(0 = 页池不够);另外填好当前线程 TCB 里的
+;  TCB_SP_PD / TCB_SP_PT。**每条线程各建各的**,互不干扰。
 ; ---------------------------------------------------------------------------
 space_create:
     pushad
-    mov dword [space_pd], 0
-    mov dword [space_pt], 0
-    mov dword [space_pages], 0
-    mov dword [space_live], 0
-    ; ★ space_img_bytes 这里**不能清**:它是"这次要跑的镜像是多大"的输入参数,
+    mov edx, [space_cur]
+    mov dword [edx + TCB_SP_PD], 0
+    mov dword [edx + TCB_SP_PT], 0
+    mov dword [edx + TCB_SP_PAGES], 0
+    mov dword [edx + TCB_SP_LIVE], 0
+    ; ★ TCB_SP_IMGBYTES 这里**不能清**:它是"这次要跑的镜像是多大"的输入参数,
     ;   由 space_set_image 填好 —— 之前在这里清成 0,结果整个镜像窗口都被当成
     ;   `.bss` 填零页,程序拿到的是一页页的 0 字节(执行起来一路乱跳到野地址)。
-    mov dword [space_pf_run], 0
-    mov dword [space_pf_img], 0
-    mov dword [space_pf_heap], 0
-    mov dword [space_first_pa], 0
+    mov dword [edx + TCB_SP_PFRUN], 0
+    mov dword [edx + TCB_SP_PFIMG], 0
+    mov dword [edx + TCB_SP_PFHEAP], 0
+    mov dword [edx + TCB_SP_FIRSTPA], 0
 
     ; ---- 1) 页目录:从页池拿一页,把内核页目录整份拷过来 ----
     call pmem_alloc
     test eax, eax
     jz .fail
-    mov [space_pd], eax
+    mov edx, [space_cur]
+    mov [edx + TCB_SP_PD], eax
     mov edi, eax
     mov esi, PD_ADDR
     mov ecx, 1024
@@ -365,36 +373,40 @@ space_create:
     call pmem_alloc
     test eax, eax
     jz .fail
-    mov [space_pt], eax
+    mov edx, [space_cur]
+    mov [edx + TCB_SP_PT], eax
     mov edi, eax
     mov esi, PT_LOW
     mov ecx, 1024
     rep movsd
-    mov eax, [space_pt]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PT]
     or  eax, PAGE_P | PAGE_RW | PAGE_USER
     ; ★ 这一级也必须带 U/S —— 页表是"逐级查权限"的:PD 项说"用户不许",
     ;   下面页表项写得再漂亮,ring 3 一访问还是保护违规(#PF,错误码 bit0=1)。
     ;   这里踩过:程序第一条指令就挂在 0x120000,错误码 bit0=1 而不是"没有页"。
-    mov edi, [space_pd]
+    mov edi, [edx + TCB_SP_PD]
     mov [edi], eax
 
     ; ---- 3) 两个窗口的项清成"不存在" —— 这一行就是按需分页的起点 ----
     ; PT_LOW 是恒等映射的,那两个窗口的项本来也"存在"(指向内核视角的物理页)。
     ; 不抹掉的话程序一访问就拿到内核的物理页,私有页就白搭了。
-    mov edi, [space_pt]
+    mov edi, [edx + TCB_SP_PT]
     mov eax, SPACE_IMG_VA
     shr eax, 12
     and eax, 0x3FF                     ; 窗口第一页在页表里的下标(288)
     lea edi, [edi + eax * 4]
-    mov ecx, [space_heap_pages]        ; 窗口是连着的:镜像 96 页 + 堆窗口 N 页
+    mov ecx, [edx + TCB_SP_HEAPPAGES]  ; 窗口是连着的:镜像 96 页 + 堆窗口 N 页
     add ecx, SPACE_IMG_PAGES
     xor eax, eax
     rep stosd
 
     ; ---- 4) 记账:固定只占页目录 + 页表两页 ----
-    mov dword [space_pages], 2
+    mov edx, [space_cur]
+    mov dword [edx + TCB_SP_PAGES], 2
     popad
-    mov eax, [space_pd]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PD]
     clc
     ret
 .fail:
@@ -408,35 +420,43 @@ space_create:
 ;  space_set_image:告诉分页层"这次要跑的镜像有多少字节"
 ;  页错误处理拿它判断:偏移 < 文件长度 → 从暂存区拷;否则留零(`.bss`)。
 ;  习惯上的顺序是 space_create 先、这个后(create 不碰这个输入);
-;  反过来写也能用,但别在中间插一个会清 space_img_bytes 的调用。
+;  反过来写也能用,但别在中间插一个会清 TCB_SP_IMGBYTES 的调用。
 ; ---------------------------------------------------------------------------
 space_set_image:
-    mov [space_img_bytes], eax
-    mov dword [space_pf_run], 0
-    mov dword [space_pf_img], 0
-    mov dword [space_pf_heap], 0
-    mov dword [space_first_pa], 0
+    mov edx, [space_cur]
+    mov [edx + TCB_SP_IMGBYTES], eax
+    mov dword [edx + TCB_SP_PFRUN], 0
+    mov dword [edx + TCB_SP_PFIMG], 0
+    mov dword [edx + TCB_SP_PFHEAP], 0
+    mov dword [edx + TCB_SP_FIRSTPA], 0
     ret
 
 ; ---------------------------------------------------------------------------
 ;  space_activate / space_deactivate:切到程序页目录 / 切回内核页目录
 ;
-;  切换和 space_live 开关必须成对:开着的时候 14 号页错误才会走按需分页,
+;  切换和 TCB_SP_LIVE 开关必须成对:开着的时候 14 号页错误才会走按需分页,
 ;  关着(或没有程序在跑)时页错误 = 真错误,照旧 panic。
+;  状态存在当前线程的 TCB 里 —— 每条 shell 线程可以各开各的。
 ; ---------------------------------------------------------------------------
 space_activate:
     push eax
-    mov dword [space_live], 1          ; 先开开关,再换 CR3
-    mov eax, [space_pd]
+    push edx
+    mov edx, [space_cur]
+    mov dword [edx + TCB_SP_LIVE], 1   ; 先开开关,再换 CR3
+    mov eax, [edx + TCB_SP_PD]
     mov cr3, eax
+    pop edx
     pop eax
     ret
 
 space_deactivate:
     push eax
-    mov dword [space_live], 0          ; 先关开关,再换回内核页目录
+    push edx
+    mov edx, [space_cur]
+    mov dword [edx + TCB_SP_LIVE], 0   ; 先关开关,再换回内核页目录
     mov eax, PD_ADDR
     mov cr3, eax
+    pop edx
     pop eax
     ret
 
@@ -452,9 +472,13 @@ space_deactivate:
 page_fault_try_handle:
     pushad
     mov dword [pf_ret], 0
-    cmp dword [space_live], 0
+    ; 这次缺页是谁的?space_cur 在每次调度切换时更新,所以在 ring3 被打断
+    ; 的线程就是它的空间 —— 别用"当前 CR3"去猜,四条线程各有一套。
+    mov eax, [space_cur]
+    mov [pf_space], eax
+    cmp dword [eax + TCB_SP_LIVE], 0
     je .out                            ; 没有程序在跑:不关我事
-    cmp dword [space_pt], 0
+    cmp dword [eax + TCB_SP_PT], 0
     je .out                            ; 页表都没有,别硬撑
 
     mov eax, cr2
@@ -467,7 +491,8 @@ page_fault_try_handle:
     jb .image
     mov ebx, eax
     sub ebx, SPACE_HEAP_VA
-    mov ecx, [space_heap_pages]
+    mov edi, [pf_space]
+    mov ecx, [edi + TCB_SP_HEAPPAGES]
     shl ecx, 12
     cmp ebx, ecx
     jb .heap
@@ -483,7 +508,8 @@ page_fault_try_handle:
     mov eax, [pf_va]
     shr eax, 12
     and eax, 0x3FF
-    mov edi, [space_pt]
+    mov edi, [pf_space]
+    mov edi, [edi + TCB_SP_PT]
     mov eax, [edi + eax * 4]
     test eax, 1
     jnz .out
@@ -504,7 +530,7 @@ page_fault_try_handle:
 
     cmp byte [pf_is_img], 0
     je .install
-    ; ---- 镜像页:文件里有的部分从暂存区拷过来 ----
+    ; ---- 镜像页:文件里有的部分从**这套空间自己的暂存区**拷过来 ----
     ; ★ 这里必须**按页对齐**算偏移:缺页的地址不一定在页开头
     ;   (ring 3 用 call 跳进函数,取指就直接落在页中间 0x121C10)。
     ;   以前程序从 0x120000 顺序往下跑,缺页总是发生在页边界上,
@@ -514,39 +540,38 @@ page_fault_try_handle:
     sub eax, SPACE_IMG_VA
     and eax, 0xFFFFF000
     mov [pf_off], eax
-    cmp eax, [space_img_bytes]
+    mov edi, [pf_space]
+    cmp eax, [edi + TCB_SP_IMGBYTES]
     jae .install                       ; 文件之外 → 就是 `.bss`,留零
-    mov edx, [space_img_bytes]
+    mov edx, [edi + TCB_SP_IMGBYTES]
     sub edx, eax                       ; 这页还剩多少字节要拷
     cmp edx, 4096
     jbe .have_len
     mov edx, 4096                      ; 整页
 .have_len:
     mov [pf_len], edx
-    ; ★ 为什么这里要临时切回内核页目录:镜像暂存区就在 0x120000,和程序镜像
-    ;   窗口**同一个虚拟地址** —— 在程序空间里它是"正在被填的这一页",看不到
-    ;   文件。内核页目录里 0x120000 才是暂存区(恒等映射)。栈和这些变量都在
-    ;   低地址恒等区,所以切来切去是安全的。
-    mov eax, [space_pd]
-    mov [pf_saved_cr3], eax
-    mov eax, PD_ADDR
-    mov cr3, eax
-    mov esi, SPACE_IMG_VA              ; 内核视角里 0x120000 = shell 的暂存区(PROG_ADDR)
+    ; ★ 以前暂存区就是 0x120000(和程序镜像窗口同一个虚拟地址),必须临时切回
+    ;   内核页目录才能读到;现在每条线程的镜像先拷进页池里自己的暂存区
+    ;   (物理地址恒等映射,程序页目录里也映着),直接读就行 —— 不用碰 CR3,
+    ;   也不会因为"别的 shell 又 run 了一个程序"把这一页的源数据踩掉。
+    mov edi, [pf_space]
+    mov esi, [edi + TCB_SP_STAGE_PA]
+    test esi, esi
+    jz .install                        ; 没暂存区(理论上不该有)→ 当 `.bss` 留零
     add esi, [pf_off]
     mov edi, [pf_new_pa]
     mov ecx, [pf_len]
     add ecx, 3
     shr ecx, 2                         ; 字节 → dword(向上取整)
     rep movsd
-    mov eax, [pf_saved_cr3]
-    mov cr3, eax                       ; 切回程序空间
 
 .install:
     ; ---- 把新页填进程序私有页表的对应项,并让 CPU 忘掉旧翻译 ----
     mov eax, [pf_va]
     shr eax, 12
     and eax, 0x3FF
-    mov edi, [space_pt]
+    mov edi, [pf_space]
+    mov edi, [edi + TCB_SP_PT]
     mov edx, [pf_new_pa]
     or  edx, PAGE_P | PAGE_RW | PAGE_USER ; U/S=1:程序自己要用这些页(ring 3)
     mov [edi + eax * 4], edx
@@ -554,19 +579,20 @@ page_fault_try_handle:
     invlpg [eax]
 
     ; ---- 记账(给 run 的输出和测试用)----
-    inc dword [space_pf_run]
+    mov edi, [pf_space]
+    inc dword [edi + TCB_SP_PFRUN]
     inc dword [space_pf_total]
     cmp byte [pf_is_img], 0
     je .count_heap
-    inc dword [space_pf_img]
+    inc dword [edi + TCB_SP_PFIMG]
     jmp .first_page
 .count_heap:
-    inc dword [space_pf_heap]
+    inc dword [edi + TCB_SP_PFHEAP]
 .first_page:
-    cmp dword [space_first_pa], 0
+    cmp dword [edi + TCB_SP_FIRSTPA], 0
     jne .ok
     mov eax, [pf_new_pa]
-    mov [space_first_pa], eax          ; 第一次补进来的是哪页(常是镜像第 0 页)
+    mov [edi + TCB_SP_FIRSTPA], eax    ; 第一次补进来的是哪页(常是镜像第 0 页)
 .ok:
     mov dword [pf_ret], 1
     popad
@@ -585,46 +611,72 @@ page_fault_try_handle:
     ret
 
 ; ---------------------------------------------------------------------------
-;  space_destroy:拆掉程序地址空间
-;  只还"真正拿过"的页:扫私有页表,窗口里还挂着(存在)的项才是这一趟按需
-;  分页给出去的页;再加上页目录 + 页表两页,一起还给页池。
-;  (半路建失败时也能调:指针是 0 的步骤直接跳过)
-;  返回 eax = 还回去的页数
+;  space_destroy:拆掉**当前线程**的程序地址空间(空间没建也能调:指针 0 的
+;  步骤直接跳过)。返回 eax = 还回去的页数
+;
+;  space_destroy_at:拆 `edi` 指向的那块地址空间状态(用来杀别的 shell 的程序)。
+;  两条入口共用下面这段:扫私有页表里"存在的"项(那才是按需分页真给出去的
+;  页),再加上页目录 + 页表 + 镜像暂存区,一起还给页池。
 ; ---------------------------------------------------------------------------
 space_destroy:
+    mov eax, [space_cur]
+    mov [sd_block], eax
+    jmp sd_go
+space_destroy_at:
+    mov [sd_block], edi
+sd_go:                                  ; 两条入口共用(非局部标签,别改成 .go)
     pushad
     mov dword [sd_pages], 0
-    mov dword [space_live], 0          ; 先把开关关掉,免得半路又触发按需分页
+    mov ebx, [sd_block]
+    mov dword [ebx + TCB_SP_LIVE], 0   ; 先把开关关掉,免得半路又触发按需分页
 
     ; ---- 窗口里已经补进来的私有页 ----
-    mov edi, [space_pt]
+    mov edi, [ebx + TCB_SP_PT]
     test edi, edi
     jz .no_scan
     mov ebx, SPACE_IMG_VA
     mov ecx, SPACE_IMG_PAGES
     call space_free_window
     mov ebx, SPACE_HEAP_VA
-    mov ecx, [space_heap_pages]
+    mov eax, [sd_block]
+    mov ecx, [eax + TCB_SP_HEAPPAGES]
     call space_free_window
 .no_scan:
 
-    mov eax, [space_pt]
+    mov eax, [sd_block]
+    mov eax, [eax + TCB_SP_PT]
     test eax, eax
     jz .no_pt
     call pmem_free
     jc .no_pt
     inc dword [sd_pages]
 .no_pt:
-    mov eax, [space_pd]
+    mov eax, [sd_block]
+    mov eax, [eax + TCB_SP_PD]
     test eax, eax
-    jz .out
+    jz .no_pd
     call pmem_free
-    jc .out
+    jc .no_pd
     inc dword [sd_pages]
-.out:
-    mov dword [space_pd], 0
-    mov dword [space_pt], 0
-    mov dword [space_img_bytes], 0
+.no_pd:
+    ; ---- 镜像暂存区:连续几页,一起还 ----
+    mov eax, [sd_block]
+    mov eax, [eax + TCB_SP_STAGE_PA]
+    test eax, eax
+    jz .no_stage
+    mov ebx, [sd_block]
+    mov ecx, [ebx + TCB_SP_STAGE_PAGES]
+    call pmem_free_pages
+    add dword [sd_pages], eax
+.no_stage:
+    mov eax, [sd_block]
+    mov dword [eax + TCB_SP_PD], 0
+    mov dword [eax + TCB_SP_PT], 0
+    mov dword [eax + TCB_SP_IMGBYTES], 0
+    mov dword [eax + TCB_SP_PAGES], 0
+    mov dword [eax + TCB_SP_STAGE_PA], 0
+    mov dword [eax + TCB_SP_STAGE_PAGES], 0
+    mov dword [eax + TCB_SP_RUNNING], 0
     popad
     mov eax, [sd_pages]
     ret
@@ -632,7 +684,7 @@ space_destroy:
 ; ---------------------------------------------------------------------------
 ;  内部小工具
 ; ---------------------------------------------------------------------------
-; 把 [space_pt] 里从虚拟地址 ebx 起的 ecx 项中"存在的"页还给页池,并计数
+; 把 [sd_block].TCB_SP_PT 里从虚拟地址 ebx 起的 ecx 项中"存在的"页还给页池,并计数
 ; (存在的项 = 程序真的碰过、我们真给过的页;没碰过的项是 0,跳过)
 space_free_window:
     push eax
@@ -644,7 +696,8 @@ space_free_window:
     mov eax, ebx
     shr eax, 12
     and eax, 0x3FF                     ; 页表项下标
-    mov esi, [space_pt]
+    mov esi, [sd_block]
+    mov esi, [esi + TCB_SP_PT]
     mov edx, [esi + eax * 4]
     test edx, 1
     jz .next                           ; 没映过 = 这页没拿过
@@ -691,11 +744,12 @@ space_user_page:
     mov ebx, [sup_va]
     shr ebx, 12
     and ebx, 0x3FF                      ; 页表项下标
-    mov edi, [space_pt]
-    mov edx, [sup_pa]
-    or edx, PAGE_P | PAGE_RW | PAGE_USER
-    mov [edi + ebx * 4], edx
-    inc dword [space_pages]             ; 这两页不是"按需补的",跟着空间一起收摊
+    mov edx, [space_cur]
+    mov edi, [edx + TCB_SP_PT]
+    mov eax, [sup_pa]
+    or eax, PAGE_P | PAGE_RW | PAGE_USER
+    mov [edi + ebx * 4], eax
+    inc dword [edx + TCB_SP_PAGES]      ; 这两页不是"按需补的",跟着空间一起收摊
     mov eax, [sup_va]
     invlpg [eax]
     mov eax, [sup_pa]
@@ -726,7 +780,8 @@ space_prepare_user:
     mov esi, tramp_code
     mov ecx, tramp_code_end - tramp_code
     rep movsb
-    mov eax, [space_stack_va]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_STACKVA]
     call space_user_page
     test eax, eax
     jz .fail
@@ -806,8 +861,9 @@ prog_kill_from_fault:
     call term_set_color
 
     ; ---- 回 shell 的内核现场 ----
-    mov dword [run_status], 1           ; 1 = 不是正常退出,是"被干掉的"
-    mov esp, [run_esp]
+    mov edx, [space_cur]
+    mov dword [edx + TCB_SP_RUNSTAT], 1 ; 1 = 不是正常退出,是"被干掉的"
+    mov esp, [edx + TCB_SP_RUNESP]
     mov ax, GDT_KDATA
     mov ds, ax
     mov es, ax
@@ -823,23 +879,17 @@ map_va       dd 0
 map_pa       dd 0
 map_flags    dd 0
 
-space_pd       dd 0                    ; 当前程序空间的页目录(物理地址,给 CR3)
-space_pt       dd 0                    ; 它的私有页表
-space_pages    dd 0                    ; 这套空间**固定**占几页(页目录 + 页表 = 2)
-space_live     dd 0                    ; 1 = 有程序在跑(14 号页错误才走按需分页)
-space_img_bytes dd 0                   ; 这次要跑的镜像文件字节数(决定镜像页拷多少、`.bss` 从哪开始)
-space_pf_run   dd 0                    ; 这一次运行补进来几页
-space_pf_img   dd 0                    ;   其中镜像窗口几页
-space_pf_heap  dd 0                    ;   其中堆窗口几页
+; ---- 每线程状态(TCB 里的 TCB_SP_*)由 space_cur 指向:切换线程时 sched_pick 更新它 ----
+space_cur      dd 0                    ; 当前线程的地址空间块(= &tcb_table[cur])
 space_pf_total dd 0                    ; 开机到现在一共补了几页(pmem 命令会显示)
-space_first_pa dd 0                    ; 第一次补进来的物理页(显示"虚拟地址 ≠ 物理地址")
+sd_block       dd 0                    ; space_destroy(_at) 正在拆的那块空间
 sd_pages       dd 0                    ; space_destroy 数的页数
 
+pf_space       dd 0                    ; page_fault_try_handle:这次缺页属于哪块空间
 pf_va          dd 0                    ; 出错地址(从 CR2 抄下来)
 pf_new_pa      dd 0                    ; 这一页现拿的物理地址
 pf_off         dd 0                    ; 镜像页在文件里的偏移(第几页 × 4096)
 pf_len         dd 0                    ; 要从暂存区拷多少字节
-pf_saved_cr3   dd 0                    ; 临时切内核页目录前的 CR3
 pf_ret         dd 0                    ; page_fault_try_handle 的返回值
 pf_is_img      db 0                    ; 出错的是镜像窗口(1)还是堆窗口(0)
 msg_pf_oom     db 'out of physical pages while faulting in a page', 10, 0

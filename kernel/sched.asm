@@ -20,7 +20,9 @@
 ;  一次的 EOI,IRQ0 就再也不来了(定时器"死"了,但屏幕上看不出来)。
 ;
 ;  老实交代的局限(玩具够用,别当正经调度器):
-;    · 全是**内核线程**:同一个地址空间、同一个特权级,能直接碰任何内存
+;    · 线程默认共用内核地址空间,但 ring3 程序有**自己**的:地址空间状态现在
+;      也在 TCB 里(TCB_SP_*),每条 shell 线程都能各跑各的程序 —— 见 paging.asm
+;      的 space_cur 和 sched_pick 里的切换
 ;    · 内核不是可重入的:线程最好只算自己的、只打印,别一起去读写文件系统
 ;      (FAT/ATA 那些全局缓冲会被互相踩)
 ;    · 打印会互相插队:两个线程同时 term_print,字可能串行(不崩,但难看)
@@ -29,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 6                 ; 最多几个线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 40                ; 每个 TCB 40 字节(×40,见下面的 SHIFT_SIZE)
+TCB_SIZE          equ 112               ; 每个 TCB 112 字节(见 /4、imul 的用法)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -37,10 +39,35 @@ TCB_TICKS         equ 12                ; 它一共拿到过几个 tick
 TCB_STACK         equ 16                ; 栈的物理基址(死了要还给页池)
 TCB_NAME          equ 20                ; 名字(给 ps 看的)
 TCB_RUNS          equ 24                ; 被调度上去过几次
-TCB_OWNER         equ 28                ; 它出生在哪条 shell 上(kill 时按这个找地址空间)
-; ★ 为什么要 ×40 而不是 ×32:TCB 原来正好 32 字节,于是全仓都用 `shl 5` 当下标步长。
-;   加一格之后 32 不够用了,再挪一格就又要动所有 shl —— 干脆用一个宏,
-;   以后加字段只改这一个地方(踩过:改完忘了 shl,TCB 全错位)。
+TCB_OWNER         equ 28                ; 它出生在哪条 shell 上
+
+; ---- 地址空间状态:每线程一份 ----
+; 以前这些是 paging.asm 里的全局变量,于是全系统只允许一个程序;现在搬进 TCB,
+; space_cur 指向"当前线程的这一块",space_* 例程都通过它读写。
+; 注意 TCB_CR3 仍然是"真正写进 CR3 的那个页目录",切换时和这里配套。
+TCB_SP_PD         equ 32                ; 程序页目录物理地址(0 = 没在跑程序)
+TCB_SP_PT         equ 36                ; 它私有的低端页表
+TCB_SP_LIVE       equ 40                ; 1 = 这套空间正在用(14 号页错误才补页)
+TCB_SP_PAGES      equ 44                ; 这套空间固定占几页(页目录 + 页表 = 2)
+TCB_SP_IMGBYTES   equ 48                ; 这次镜像多少字节(决定 .bss 从哪开始)
+TCB_SP_PFRUN      equ 52                ; 这一次运行补进来几页
+TCB_SP_PFIMG      equ 56                ; 其中镜像窗口几页
+TCB_SP_PFHEAP     equ 60                ; 其中堆窗口几页
+TCB_SP_FIRSTPA    equ 64                ; 第一次补进来的物理页(展示用)
+TCB_SP_RUNESP     equ 68                ; 进 ring3 前的内核栈顶(退出/被杀回这儿)
+TCB_SP_RUNSTAT    equ 72                ; 0 = 正常退出,1 = 被内核干掉
+TCB_SP_FREED      equ 76                ; 收摊时还回去的页数
+TCB_SP_HEAPPAGES  equ 80                ; 堆窗口页数(开机时算好,spawn 时照抄)
+TCB_SP_ARGSVA     equ 84                ; 参数页虚拟地址
+TCB_SP_STACKVA    equ 88                ; 用户栈页虚拟地址
+TCB_SP_STACKTOP   equ 92                ; 用户栈顶
+TCB_SP_RUNNING    equ 96                ; 1 = 这条线程正在跑 ring3 程序(给 ps 看)
+TCB_SP_STAGE_PA   equ 100               ; 镜像暂存区(物理地址;按需分页从这里拷)
+TCB_SP_STAGE_PAGES equ 104              ; 暂存区占几页
+TCB_SP_KILLREQ    equ 108               ; 1 = 别的 shell 要求干掉这条线程上的程序
+                                        ;     (IRQ0 在 ring3 现场上收摊,见 pit.asm)
+; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
+;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))
 
 ST_EMPTY          equ 0                 ; 空槽
@@ -68,6 +95,18 @@ sched_init:
     mov dword [edi + TCB_STATE], ST_ALIVE
     mov dword [edi + TCB_OWNER], 0
     mov dword [edi + TCB_NAME], nm_main
+    ; 0 号线程的地址空间布局:kmain 在 paging_init 之前就算好了全局模板,
+    ; 这里抄进 TCB;之后全局的 space_heap_pages 等只是"模板",真正干活的是 TCB。
+    mov eax, [space_heap_pages]
+    mov [edi + TCB_SP_HEAPPAGES], eax
+    mov eax, [space_args_va]
+    mov [edi + TCB_SP_ARGSVA], eax
+    mov eax, [space_stack_va]
+    mov [edi + TCB_SP_STACKVA], eax
+    mov eax, [space_user_stack_top]
+    mov [edi + TCB_SP_STACKTOP], eax
+    mov [space_cur], edi                ; 现在跑的就是 0 号线程
+    mov dword [tss_blk + TSS_ESP0], 0   ; ring3 进来时才设,先清掉开机时的旧值
     mov dword [sched_cur], 0
     mov dword [sched_live], 1
     mov dword [sched_slice], SLICE_TICKS
@@ -101,7 +140,7 @@ sched_pick:
 
     ; ---- 1) 把当前线程的现场存好,顺手记一个 tick ----
     mov eax, [sched_cur]
-    imul eax, TCB_SIZE                  ; × TCB_SIZE(40,不是 2 的幂)
+    imul eax, TCB_SIZE                  ; × TCB_SIZE(112,不是 2 的幂)
     mov ebx, tcb_table
     add ebx, eax
     mov ecx, [sched_save_esp]
@@ -136,8 +175,13 @@ sched_pick:
     jne .try_next
     ; 找到人:换地址空间(每个线程自己的 cr3),再交出它的 esp
     mov [sched_cur], esi
+    mov [space_cur], edx                ; 之后 space_* 就读写这个人的 TCB
     mov eax, [edx + TCB_CR3]
     mov cr3, eax
+    ; ring3 进来的中断用它的内核栈顶:该线程正在跑程序时就是 run_esp;
+    ; 没跑程序时是 0(纯内核线程不会有特权级切换,用不到 esp0)
+    mov eax, [edx + TCB_SP_RUNESP]
+    mov [tss_blk + TSS_ESP0], eax
     inc dword [edx + TCB_RUNS]
     mov eax, [edx + TCB_ESP]
     jmp .out
@@ -236,6 +280,15 @@ sched_spawn:
     mov [edx + TCB_STACK], eax
     mov eax, [spawn_name]
     mov [edx + TCB_NAME], eax
+    ; 地址空间布局跟造它的线程一样(全局模板在 kmain 里算好就没再变过)
+    mov eax, [space_heap_pages]
+    mov [edx + TCB_SP_HEAPPAGES], eax
+    mov eax, [space_args_va]
+    mov [edx + TCB_SP_ARGSVA], eax
+    mov eax, [space_stack_va]
+    mov [edx + TCB_SP_STACKVA], eax
+    mov eax, [space_user_stack_top]
+    mov [edx + TCB_SP_STACKTOP], eax
     inc dword [sched_live]
     mov eax, [spawn_slot]                ; 返回线程号
     clc
@@ -262,6 +315,8 @@ sched_kill:
     push ebx
     push ecx
     push edx
+    push esi
+    push edi
 
     cmp eax, SCHED_MAX
     jae .bad
@@ -273,11 +328,13 @@ sched_kill:
     cmp dword [ebx + TCB_STATE], ST_ALIVE
     jne .bad
 
-    ; ★ 先把它的 cr3 和"出生在哪条 shell"记下来再清槽 —— 调用方要拿 cr3 判断
-    ;   该不该拆那套程序地址空间(不然 kill 一个正在跑程序的线程,那套页目录
-    ;   和私有页表就漏在池子里了)。
-    mov eax, [ebx + TCB_CR3]
-    mov [kill_cr3], eax
+    ; ★ 先把整块 TCB 抄到 kill_space,再清槽 —— 调用方(cmd_kill)要按里面的
+    ;   地址空间字段把那套页目录 / 私有页表 / 镜像暂存区收摊:否则 kill 一条
+    ;   正在跑程序的线程,那套空间就漏在页池里了。
+    mov esi, ebx
+    mov edi, kill_space
+    mov ecx, TCB_SIZE / 4
+    rep movsd
 
     ; 还栈(杀的是别人,它此刻没在跑,放心还)
     mov eax, [ebx + TCB_STACK]
@@ -294,6 +351,11 @@ sched_kill:
     mov dword [ebx + TCB_RUNS], 0
     mov dword [ebx + TCB_NAME], nm_free
     mov dword [ebx + TCB_OWNER], 0
+    ; 地址空间字段一起清掉(槽会被复用,别让它带着上一个人的指针)
+    lea edi, [ebx + TCB_SP_PD]
+    xor eax, eax
+    mov ecx, (TCB_SIZE - TCB_SP_PD) / 4
+    rep stosd
     dec dword [sched_live]
     clc
     jmp .out
@@ -301,6 +363,8 @@ sched_kill:
 .bad:
     stc
 .out:
+    pop edi
+    pop esi
     pop edx
     pop ecx
     pop ebx
@@ -381,14 +445,20 @@ spawn_stack     dd 0
 demo_a          dd 0                    ; alpha 数到几
 demo_b          dd 0                    ; beta 数到几
 
-kill_cr3        dd 0
+kill_space      times TCB_SIZE db 0     ; 上一次 sched_kill 杀掉的线程的 TCB 快照
 
 ; ---------------------------------------------------------------------------
-;  sched_kill_cr3:上一次 sched_kill 杀掉的线程当时用的页目录(0 = 没有)
-;  shell 靠它判断"该不该把程序的地址空间收摊" —— 见 cmd_kill。
+;  sched_kill_space:上一次 sched_kill 杀掉的线程的地址空间快照
+;    出:eax = kill_space(里面有 TCB_SP_* 字段),或者 0 = 它当时没在跑程序
+;  shell 靠它把那套页目录 / 私有页表 / 暂存区收摊 —— 见 cmd_kill。
 ; ---------------------------------------------------------------------------
-sched_kill_cr3:
-    mov eax, [kill_cr3]
+sched_kill_space:
+    xor eax, eax
+    mov edx, [kill_space + TCB_SP_PD]
+    or  edx, [kill_space + TCB_SP_PT]   ; 半路被杀的线程可能只建到一半
+    jz .none
+    mov eax, kill_space
+.none:
     ret
 
 tcb_table       times SCHED_MAX * TCB_SIZE db 0

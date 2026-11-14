@@ -2,13 +2,13 @@
 ;  HANG.BIN:把这条 shell 占住的"死循环"程序(开头报一行,约 20 秒后自己退出)
 ;
 ;  用途:演示"一个 shell 里程序卡住了,别的 shell 照样能干活"
-;  —— 切过去用 Ctrl+Right,或者敲 shell 2;顺便演示"一次只让一个程序跑"
-;  (在别的 shell 里再 run 会被拒)。
+;  —— 切过去用 Ctrl+Right,或者敲 shell 2;顺便演示"每条 shell 各跑各的程序"
+;  (另一条 shell 里照样能 run),以及从别的 shell `kill 0` 提前收掉它。
 ;
 ;  ★ 为什么是有限圈数而不是真的死循环:测试套件要在它跑完之后接着用这条 shell,
 ;  真死循环会把线程 0 永远占住(线程 0 = 第一条 shell,不可 kill),后面的用例
 ;  就没法跑了。真想看"永远回不来",把 HANG_ROUNDS 改大、或者把 `dec/ jnz`
-;  两行删掉即可 —— 那时候只能 reboot。
+;  两行删掉即可 —— 然后从另一条 shell 敲 `kill 0`,它会被下一次时钟中断收掉。
 ;
 ;  编译:make all(progs/*.asm 自动汇编成 .BIN 塞进 FAT16 镜像)
 ; ============================================================================
@@ -93,7 +93,7 @@ print_dec:
 counter dd 0
 rounds  dd 0
 digits  dd 0
-HANG_ROUNDS equ 24                  ; 24 轮 ≈ 40~60 秒(要覆盖套件里那段“切 shell + 被拒”用例)
+HANG_ROUNDS equ 24                  ; 24 轮 ≈ 40~60 秒(要覆盖套件里那段“切 shell + 另一条跑程序”用例)
 BUSY_WAIT   equ 100000000               ; 忙等一圈 ≈ 1.5 秒(估算:6 条线程轮转时
                                         ; 实测 24,000,000 一圈只要 0.4 秒,所以放大)
 msg_head db 'HANG.BIN: I am spinning for a while, this shell is stuck now.', 10, 0

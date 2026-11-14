@@ -66,6 +66,28 @@ irq0_stub:
     pushad
     call pit_irq
 
+    ; ---- 别的 shell 要求"杀掉这条线程上的程序":就在它自己的栈上收摊 ----
+    ;  只在从 ring 3 进来时处理(CS 的 CPL=3):这时 run_esp 指向 cmd_run 的
+    ;  pushad 现场,跳过去 = 程序被"退回内核"。在核心里被打断时先不动,等它
+    ;  真回到 ring 3 的下一个 tick。收摊本身在 run_resume_kernel 里:关按需分页、
+    ;  换回内核页目录、popad、jmp cmd_run.after_prog(space_destroy 也在那儿)。
+    mov eax, [esp + 44]                 ; 中断前的 CS
+    and eax, 3
+    cmp eax, 3
+    jne .no_kill_req
+    mov edx, [space_cur]
+    cmp dword [edx + TCB_SP_KILLREQ], 0
+    je .no_kill_req
+    cmp dword [edx + TCB_SP_RUNNING], 0
+    je .no_kill_req
+    cmp dword [edx + TCB_SP_RUNESP], 0
+    je .no_kill_req
+    mov dword [edx + TCB_SP_KILLREQ], 0
+    mov dword [edx + TCB_SP_RUNSTAT], 1  ; after_prog 据此打 "program was killed"
+    mov esp, [edx + TCB_SP_RUNESP]      ; 丢掉 ring 3 的中断帧,回到 cmd_run 的现场
+    jmp run_resume_kernel
+.no_kill_req:
+
     ; ---- 抢占式多任务:要不要换人 ----
     ;  此刻 esp 指着 pushad 压出来的现场,把它交给调度器:它返回"下一个线程"
     ;  的 esp,我们一句 mov 换过去 —— 下面的 popad + iret 就回到另一个人身上了。

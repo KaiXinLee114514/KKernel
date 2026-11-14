@@ -80,7 +80,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 | 键盘 | 8259A 重映射到 `0x20`,IRQ1 中断方式收键,扫描码翻译表(含 Shift)、**Caps Lock**(顺带给键盘发 `0xED` 点灯)、方向键/PgUp 等扩展键、64 字节环形缓冲 |
 | **定时器(PIT)** | 8254 通道 0 以 **100 Hz** 发 IRQ0,内核只做一件事:`inc` 一个 tick 计数。`uptime` 读开机秒数,`sleep <秒>` 用 `hlt` 等(空闲时不烧 CPU);**抢占式多任务就是在 IRQ0 里切栈**(见 §5「线程与调度」) |
 | **内核线程 + 抢占式轮转** | 6 个线程槽、每个线程 **20 ms 时间片**(`kernel/sched.asm`):IRQ0 里存 esp/CR3、轮转、换栈;`ps` 看线程表、`spawn` 起演示线程(alpha / beta 每秒各打一行)、`kill` 杀掉并把栈还给物理页池;要是被杀的那条正占着程序的地址空间,顺手把那套页目录 + 私有页表也收摊还回去(见 §5) |
-| **多 shell(4 条)** | 4 条 shell 各是一条内核线程,**Ctrl+←/→ 换键盘焦点**(在键盘中断里切,所以卡在程序里的那条也能被换走);`shell` 列出、`shell 3` 直接跳;每条 shell 有自己的行缓冲和当前目录,切换时没敲完的半行会跟着走;**一次只让一个程序跑**(别人在跑就拒绝),shell 线程本身杀不掉(见 §5) |
+| **多 shell(4 条)** | 4 条 shell 各是一条内核线程,**Ctrl+←/→ 换键盘焦点**(在键盘中断里切,所以卡在程序里的那条也能被换走);`shell` 列出、`shell 3` 直接跳;每条 shell 有自己的行缓冲和当前目录,切换时没敲完的半行会跟着走;**每条 shell 各跑一个程序**(地址空间每线程一份);shell 线程本身杀不掉,但能 `kill` 掉它跑的程序(见 §5) |
 | **提示符样式** | **kao(颜文字,默认:黄色 `(・ω・)`,命令报错时变红 `(；ω；)`)** / **plain(朴素 `>`)** / **moe(萌,粉色的 `かいかーねる>`,报错也换成吐槽)** / **DOS(`C:\>`)** / **C64(`READY.`)**;`style` 命令现场换,也能在 `RC.CONF` 里写 `style = moe`(或 kao/plain/dos/c64)开机就生效 |
 | **ring 3 用户态** | 程序不再由内核 `call` 进去,而是 `iret` 到 **CPL=3**:内核运行时重建 GDT(0x1B 用户代码 / 0x23 用户数据 / 0x28 TSS)+ `ltr` 装 TSS(从 ring 3 掉回内核的栈只能从 TSS 取);程序页表项带 U/S 位,**内核的页它碰不到** —— 故意读内核内存会被页错误干掉、内核自己接着用(`run FAULT` 现场演示);程序结尾照旧 `ret`:内核在用户栈顶压了**弹床页**(0x17F000,三条指令 `int 0x30` 功能号 15 退出),所以现有程序一行都不用改(见 §5) |
 | **rc.conf 服务 / 事件库** | 挂盘里的 `/SYS/RC.CONF` 是**纯 `key=value`**(BSD / OpenRC 那种,不是 systemd 段):`hostname` / `boot_msg` / `autostart` / `on_crash` + `service_N`(程序、参数、启用开关)。`rc` 一条命令管起来:`rc list` 看服务、`rc get KEY` 取值、`rc start N` **把服务当程序跑**(借 `run` 那条路:ring 3 + 按需分页)、`rc reload` 重读刚写的配置;另有**事件账本**:开机 / 读配置 / 服务起停 / 程序跑完 / 程序崩了 / 线程被 kill / 换 shell,每种连 100 Hz 的 tick 一起记 16 条(`rc log`);`autostart=YES` 就是开机按配置跑服务,`on_crash=reboot` 则程序崩了直接重启(见 [docs/rc-conf.md](docs/rc-conf.md)) |
@@ -530,9 +530,10 @@ killed thread 4 (alpha)
 每条 shell 有自己的行缓冲和当前目录,切换时:
 - 打一条 `--- shell N ---` 当分隔,再把提示符和**你没敲完的那半行**重新画出来
 - 半行输入跟着 shell 走:1 号敲一半 → 切到 2 号干点别的 → 切回来,那半行还在,回车就执行
-- **一次只让一个程序跑**(地址空间那套状态还是全局的):别的 shell 里 `run` 会被拒绝,提示
-  "另一条 shell 正在跑程序(线程 N)";想去就 `Ctrl+←/→`,或者 `kill` 掉那个线程
-- shell 线程**杀不掉**(`kill 0`~`kill 3` 会被拒):键盘挂在它们身上,杀了没人收键
+- **每条 shell 各跑一个程序**(地址空间那套状态现在每线程一份):一条 `run HANG` 卡着,
+  切到另一条 `run HELLO.BIN` 照样跑,互不打架
+- shell 线程本身**杀不掉**(`kill 0`~`kill 3` 不会拆线程):键盘挂在它们身上,杀了没人收键;
+  但 `kill <线程号>` 会停掉它正在跑的程序,连 ring 3 里的死循环也能被下一次时钟中断收走
 
 ```
 > shell
@@ -548,13 +549,14 @@ Ctrl+Left / Ctrl+Right switches, or: shell <n>
 3> 
 ```
 
-想亲眼看"卡死也不影响别人":`run HANG`(开头报一行、**转 16 圈约 40 秒后自己退出**的演示
-程序),趁它占着这条 shell 的时候 `Ctrl+→` 逃到别的 shell,`echo` 照样有响应 —— 这就是多
-shell 的意义。
+想亲眼看"卡死也不影响别人":`run HANG`(开头报一行、**转 24 圈约 40~60 秒后自己退出**的
+演示程序),趁它占着这条 shell 的时候 `Ctrl+→` 逃到别的 shell,`echo` 照样有响应 —— 这就是
+多 shell 的意义。要提前收回卡住的那条:在别的 shell 里 `kill 0`(线程号见 `ps`),
+它会在下一次时钟中断时被内核收摊。
 
-> `run HANG` 为什么不是真死循环:线程 0(=第 1 条 shell)杀不掉,真死循环会把后面的
-> 测试用例全堵死。想看"永远回不来",把 `progs/HANG.asm` 的 `HANG_ROUNDS` 改大、或者删掉
-> `dec dword [rounds]` / `jnz .loop` 两行 —— 那就只能 reboot 了。
+> `run HANG` 为什么不是真死循环:演示程序要有始有终,测试套件才能接着用那条 shell。
+> 想试"永远回不来",把 `progs/HANG.asm` 的 `HANG_ROUNDS` 改大、或者删掉
+> `dec dword [rounds]` / `jnz .loop` 两行 —— 然后从另一条 shell `kill 0` 把它收掉。
 
 ![4 条 shell 互相切换](docs/screenshot-shells.png)
 

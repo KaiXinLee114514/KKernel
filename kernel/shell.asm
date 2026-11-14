@@ -884,8 +884,9 @@ shell_execute_plain:
 ;
 ;  语义:生产者程序的输出(API0/1/3/13 + term_print)在管道里被内核捕获成
 ;  字节流(pipe.asm 的 pipe_capture_*),跑完后作为下一段的 stdin(程序用
-;  int 0x30 功能 17 读)。KKernel 一次只跑一个程序,不需要并发和等待队列,
-;  但数据语义跟 Unix 管道一致。
+;  int 0x30 功能 17 读)。管道的捕获缓冲是全局的,所以同一时刻只允许一条
+;  管道在跑(别的 shell 再开管道会报忙)—— 这是 Phase 1 的限制,但数据语义
+;  跟 Unix 管道一致。
 ;
 ;  限制:最多 4 段;每段可以是内建命令,也可以是 run PROG;
 ;        缓冲从页池现借现还(16 页/4 页/1 页逐级降,越多段需要越多块)。
@@ -1988,13 +1989,16 @@ str_same_path:
     ret
 
 ; ---------------------------------------------------------------------------
-;  run <文件>:把程序读进 PROG_ADDR(暂存区)→ 建一套空的程序地址空间 →
-;             切 CR3 跑 → 跑完把页全还给页池
+;  run <文件>:把程序读进 PROG_ADDR(暂存区)→ 再拷进**本线程自己的**镜像暂存区
+;             → 建一套空的程序地址空间 → 切 CR3 跑 → 跑完把页全还给页池
 ;  名字不带点就自动补 .BIN(所以 run HELLO 和 run HELLO.BIN 一样)
 ;
-;  ★ 现在程序是**按需分页**:文件读进 0x120000 之后就留在那儿当"页面来源",
-;    程序第一次碰某一页时才从页池拿页、把那一页的内容从暂存区拷过去。
+;  ★ 现在程序是**按需分页**:文件读完先拷进页池里属于这条线程的暂存区(连续页),
+;    程序第一次碰某一页时才从页池拿页、把那一页从自己的暂存区拷过去。
 ;    HELLO.BIN 这种小程序实际只拿走 1 页镜像,不再一上来就占 208 页(见 paging.asm)。
+;    ★ 为什么要多这一步拷贝:PROG_ADDR(0x120000)是全系统共用的装载区,别的
+;      shell 再 run 一个程序就会把它盖掉;而正在跑的程序可能还有没碰到的镜像页。
+;      每条线程各留一份,按需分页才有正确的来源。
 ;
 ;  ★ 加载地址为什么是 0x120000 而不是看起来更顺眼的 0x300000:
 ;    完整字库是读到 0x200000 的,1.8 MB 一直铺到 0x3BE600 ——
@@ -2011,26 +2015,10 @@ cmd_run:
     ; **shell 的 cwd** 的:先记下来,读完程序再还回去(不然 run EDIT DOCS/X 会存不进盘)。
     mov eax, [fat_dir]
     mov [cmd_saved_dir], eax
-    ; ---- 一次只让一条 shell 跑程序:space_* 那套地址空间状态还是全局的 ----
-    mov eax, [prog_owner]
-    cmp eax, -1
-    je .owner_ok
-    cmp eax, [sched_cur]
-    je .owner_ok
-    mov al, COL_ERR
-    call term_set_color
-    mov esi, msg_run_busy
-    call term_print
-    mov eax, [prog_owner]
-    call term_print_dec
-    mov esi, msg_run_busy2
-    call term_print
-    mov al, COL_NORMAL
-    call term_set_color
-    ret
-.owner_ok:
-    mov eax, [sched_cur]
-    mov [prog_owner], eax
+    ; ---- 装载锁:一次只让一条线程走"读文件 + 展开 + 建空间 + 拷参数" ----
+    ;  PROG_ADDR / PROG_ARG_STR / name_buf / prog_size 仍是全局的;但这不是
+    ;  "一次只许跑一个程序" —— 锁在 iret 进 ring 3 之前就放掉,程序本身并行。
+    call loader_lock
     ; ★ 这里**不能**调 strip_name:它会把第一个空格改成 0,而空格后面的那截
     ;   正是要传给程序的参数(`run EDIT NOTES.TXT`)—— 一改参数就没了(踩过)。
     ;   文件名在下面抄进 name_buf,到空格自然就停了。
@@ -2174,6 +2162,28 @@ cmd_run:
     ; 程序马上要跑:把 cwd 还给 shell 的目录(上面找程序可能进过 /BIN 或子目录)
     mov eax, [cmd_saved_dir]
     mov [fat_dir], eax
+    ; ---- 把镜像拷进本线程自己的暂存区(页池里的连续页)----
+    ;  之后的按需分页都从这儿取页;别的 shell 再装程序也踩不到它。
+    mov eax, [prog_size]
+    add eax, 4095
+    shr eax, 12
+    test eax, eax
+    jz .notfound                        ; 空文件,别当程序跑
+    mov [stage_pages], eax
+    mov ecx, eax
+    call pmem_alloc_pages
+    test eax, eax
+    jz .nomem                           ; 页池不够(没占住任何东西,直接报)
+    mov edx, [space_cur]
+    mov [edx + TCB_SP_STAGE_PA], eax
+    mov ecx, [stage_pages]
+    mov [edx + TCB_SP_STAGE_PAGES], ecx
+    mov edi, eax
+    mov esi, PROG_ADDR
+    mov ecx, [prog_size]
+    add ecx, 3
+    shr ecx, 2                          ; 字节 → dword(向上取整)
+    rep movsd
     ; ---- 管道里跑:别刷 "running ..." 这类提示,会混进数据流 ----
     cmp dword [pipe_active], 0
     jne .pipe_skip_run_msg
@@ -2190,10 +2200,10 @@ cmd_run:
 .pipe_skip_run_msg:
 
     ; ---- 建一套空地址空间:页目录 + 页表两页,窗口里的页一页都不给 ----
-    ; 文件也不往私有页里拷了:程序第一次碰到哪一页,页错误处理才从暂存区
-    ; 把那一页拷过去(见 paging.asm 的 page_fault_try_handle)。
+    ; 文件也不往私有页里拷了:程序第一次碰到哪一页,页错误处理才从这条线程的
+    ; 暂存区把那一页拷过去(见 paging.asm 的 page_fault_try_handle)。
     ; ★ 顺序:先 create(建页表、重置这趟的计数),再 set_image 把镜像大小写进去。
-    ;   space_create 特意**不碰** space_img_bytes —— 早期版本在 create 里顺手清它,
+    ;   space_create 特意**不碰** TCB_SP_IMGBYTES —— 早期版本在 create 里顺手清它,
     ;   结果大小被清成 0,整个镜像窗口都算成 `.bss`(零页),程序跑的是 0 字节,
     ;   一路乱跳到野地址崩溃(见 README 6.10)。这个坑踩过。
     call space_create
@@ -2207,7 +2217,8 @@ cmd_run:
     call term_set_color
     mov esi, msg_space_head
     call term_print
-    mov eax, [space_pd]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PD]
     call term_print_hex
     mov esi, msg_space_tail
     call term_print
@@ -2227,29 +2238,45 @@ cmd_run:
     ; 参数页:内核里的 PROG_ARG_ADDR(0x11F000)对 ring 3 是"别人家的内存",
     ; 所以先现拿一页挂进程序空间,再把整个参数块原样搬过去(现在还是 ring 0,
     ; 程序页表和内核的恒等映射都在,两边的地址都看得见)。
-    mov eax, [space_args_va]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_ARGSVA]
     call space_user_page
     test eax, eax
     jz .nomem_user
+    mov edx, [space_cur]
     mov esi, PROG_ARG_ADDR
-    mov edi, [space_args_va]
+    mov edi, [edx + TCB_SP_ARGSVA]
     mov ecx, SPACE_ARGS_COPY
     rep movsd
-    mov [run_esp], esp                  ; ★ 记住内核现场:正常退出/被杀都回到这儿
-    mov dword [run_status], 0
+    mov edx, [space_cur]
+    ; ★ 先清掉上一条命令可能留下的 kill 请求:如果 kill 恰好赶在上一个程序
+    ;   收摊的瞬间打进来,RUNNING 已经是 0、cmd_kill 的检查会放行,标记就留在了
+    ;   TCB 里 —— 不清的话,新程序刚进 ring 3 的第一个 tick 就会被误杀。
+    mov dword [edx + TCB_SP_KILLREQ], 0
+    mov [edx + TCB_SP_RUNESP], esp      ; ★ 记住内核现场:正常退出/被杀都回到这儿
+    mov dword [edx + TCB_SP_RUNSTAT], 0
+    mov dword [edx + TCB_SP_RUNNING], 1 ; 给 ps / 状态看:这条线程在跑程序
+    ; ★ TSS.esp0:ring 3 的每一次中断都压到这条线程的内核栈上。
+    ;   以前这个值固定是开机时的 RING3_STACK_TOP,两条线程同时跑程序时,
+    ;   后被打断的那个会把前一个的现场踩掉(单程序时代看不出来)。
+    mov eax, [edx + TCB_SP_RUNESP]
+    mov [tss_blk + TSS_ESP0], eax
+    ; 参数已经拷进程序空间了,装载锁到此为止(后面的 iret 只看本线程的 TCB)
+    call loader_unlock
     mov ax, USER_DATA_SEG
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     push dword USER_DATA_SEG            ; SS3
-    push dword [space_user_stack_top]     ; ESP3(栈顶那 4 字节就是弹床地址)
+    push dword [edx + TCB_SP_STACKTOP]  ; ESP3(栈顶那 4 字节就是弹床地址)
     push dword EFLAGS_IF                ; IF=1:新程序一上来就能被定时器打断
     push dword USER_CODE_SEG            ; CS3
     push dword [prog_entry]             ; EIP = 程序入口(平铺 BIN / ELF 的 e_entry)
     iret                                ; ★ 这一句之后就进 ring 3 了(再也不会往下走)
 .nomem_user:                            ; 页池不够连弹床/用户栈都建不出来
     call space_deactivate
+    call space_destroy                  ; 把已经拿到的页还掉(以前这里会漏)
     popad
     jmp .nomem
 .after_prog:                            ; ← run_resume_kernel 从文件末尾跳回这里
@@ -2259,14 +2286,18 @@ cmd_run:
     mov al, 10
     call term_putc
 .ap_quiet:
-    ; ---- 收摊:按需给出去的页 + 私有页表 + 页目录,全还给页池 ----
+    ; ---- 收摊:按需给出去的页 + 私有页表 + 页目录 + 暂存区,全还给页池 ----
+    ;  ★ .after_prog 里 IF=1,随时可能被切走;账目都从**本线程的 TCB**读,
+    ;    不往全局变量里搬(两条线程同时退出也不会串账)。
     call space_destroy
-    mov [space_freed], eax
+    mov edx, [space_cur]
+    mov [edx + TCB_SP_FREED], eax
     cmp dword [pipe_active], 0
     jne .ap_quiet2
+    mov edx, [space_cur]
     mov al, COL_OK
     mov esi, msg_prog_done
-    cmp dword [run_status], 0
+    cmp dword [edx + TCB_SP_RUNSTAT], 0
     je .done_msg
     mov al, COL_ERR                     ; 不是正常退出:上面已经打过崩溃原因
     mov esi, msg_prog_killed
@@ -2277,7 +2308,8 @@ cmd_run:
     call term_set_color
     mov esi, msg_space_gone
     call term_print
-    mov eax, [space_freed]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_FREED]
     call term_print_dec
     mov esi, msg_space_back
     call term_print
@@ -2289,51 +2321,83 @@ cmd_run:
     call term_set_color
     mov esi, msg_demand
     call term_print
-    mov eax, [space_pf_run]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PFRUN]
     call term_print_dec
     mov esi, msg_demand_split
     call term_print
-    mov eax, [space_pf_img]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PFIMG]
     call term_print_dec
     mov esi, msg_demand_and
     call term_print
-    mov eax, [space_pf_heap]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PFHEAP]
     call term_print_dec
     mov esi, msg_demand_first
     call term_print
-    mov eax, [space_first_pa]
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_FIRSTPA]
     call term_print_hex
     mov al, 10
     call term_putc
     mov al, COL_NORMAL
     call term_set_color
 .ap_quiet2:
-    mov dword [prog_owner], -1          ; 程序跑完了:别的 shell 也能跑了
+    mov edx, [space_cur]
+    mov dword [edx + TCB_SP_RUNNING], 0
     mov eax, EV_PROG_EXIT               ; 事件账本:跑完了(附带按需补了几页)
-    mov ebx, [space_pf_run]
+    mov edx, [space_cur]
+    mov ebx, [edx + TCB_SP_PFRUN]
     call evt_log
     ret
 .nomem:
-    mov dword [prog_owner], -1          ; 没跑起来也算"没人跑",别把别的 shell 锁住
+    call loader_unlock                  ; 没跑起来也要放锁,别把别的 shell 锁住
     mov al, COL_ERR
     call term_set_color
     mov esi, msg_space_nomem
     call term_print
     ret
 .notfound:
+    call loader_unlock
     call shell_msg_nofile
     ret
 .toobig:
+    call loader_unlock
     mov al, COL_ERR
     call term_set_color
     mov esi, msg_prog_toobig
     call term_print
     ret
 .usage:
+    call loader_unlock
     mov al, COL_NORMAL
     call term_set_color
     mov esi, api_usage
     call term_print
+    ret
+
+; ---------------------------------------------------------------------------
+;  loader_lock / loader_unlock:把"装载一个程序"这一段串起来
+;  PROG_ADDR 暂存区、PROG_ARG_STR、name_buf、prog_size 还是全局的 —— 两条
+;  shell 同时 run 会把对方的文件/参数踩掉。注意这不是"只许一个程序跑":
+;  iret 进 ring 3 之前就放锁,程序本身照样并行。
+;  等锁用 hlt:让出 CPU,别的线程继续跑(单核上自旋只会白烧)。
+; ---------------------------------------------------------------------------
+loader_lock:
+    mov al, 1
+.retry:
+    xchg byte [loader_busy], al         ; xchg 带 lock 前缀,单字节也原子
+    test al, al
+    jz .got
+    hlt                                 ; 等下一次中断;醒来再试
+    mov al, 1
+    jmp .retry
+.got:
+    ret
+
+loader_unlock:
+    mov byte [loader_busy], 0
     ret
 
 ; strip_name:把 [cmd_arg] 尾巴上的空格改成 0(顺便去掉换行)
@@ -3097,6 +3161,15 @@ cmd_ps:
     add eax, tcb_table
     mov eax, [eax + TCB_RUNS]
     call term_print_dec
+    ; 正在跑 ring 3 程序的线程标一下,一眼能看出哪条 shell 被占着
+    mov eax, [ps_i]
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    cmp dword [eax + TCB_SP_RUNNING], 0
+    je .no_prog
+    mov esi, msg_ps_prog
+    call term_print
+.no_prog:
     mov al, 10
     call term_putc
 .skip:
@@ -3161,8 +3234,8 @@ cmd_spawn:
 .do:
     call sched_spawn
     jc .full
-    ; ★ 新线程记下自己出生在哪条 shell 上(杀它的时候好按 cr3 找该收摊的地址空间 ——
-    ;   以前 kill 只把 prog_owner 抹了,那套页目录/私有页表就漏在池子里了)。
+    ; ★ 新线程记下自己出生在哪条 shell 上(ps / 归属显示用;地址空间的收摊
+    ;   靠 sched_kill 抄进 kill_space 的那份 TCB 快照)。
     ;   ⚠️ `sched_cur` 是**内存里的一个变量**(dd),不是函数 —— 写成 `call sched_cur`
     ;   就是往数据区里跳:CPU 在那儿执行零字节,一路跑过 sched_live / sched_ticks,
     ;   最后 EIP=0x1D1BA(正好落在 sched_cur 自己的存储上)、CR2=0x38000004 页错误 panic(踩过)。
@@ -3200,19 +3273,19 @@ cmd_spawn:
     ret
 
 ; ---------------------------------------------------------------------------
-;  cmd_kill:kill <线程号> —— 杀掉一个线程,它的栈还给物理页池
-;  0 号杀不掉:那就是 shell 自己,它还在那条栈上走路。
+;  cmd_kill:kill <线程号>
+;    · >= SH_MAX 的内核线程:直接杀掉,栈和它当时占着的地址空间一起还给页池
+;    · 0..SH_MAX-1 是 shell 线程:**线程本身不能杀**(键盘挂在它们身上),
+;      但它正在跑的程序可以杀 —— 给它打一个 KILLREQ 标记,它下一次被定时器
+;      打断时在**自己的栈上**收摊(见 pit.asm 的 irq0_stub),页照样还回池子。
 ; ---------------------------------------------------------------------------
 cmd_kill:
     pushad
     call parse_dec
     jc .usage
     mov [kill_id], eax
-    test eax, eax
-    jz .self
-    ; shell 线程(0..SH_MAX-1)不能杀:键盘就挂在它们身上,杀了没人接手
-    cmp eax, SH_MAX
-    jb .is_shell
+    cmp eax, [sched_cur]
+    je .self                             ; 正用它敲命令,不能杀
     cmp eax, SCHED_MAX
     jae .none
     mov ebx, eax
@@ -3220,25 +3293,25 @@ cmd_kill:
     add ebx, tcb_table
     cmp dword [ebx + TCB_STATE], ST_ALIVE
     jne .none
+    cmp eax, SH_MAX
+    jb .kill_prog                        ; shell 线程:只杀它跑的程序
 
+    ; ---- 普通内核线程:连线程带地址空间一起收 ----
     mov eax, [kill_id]
     call sched_name
     mov [kill_name], esi                  ; 名字先记下来(杀完槽就空了)
     mov eax, [kill_id]
     call sched_kill
     jc .none
-    ; ★ 它要是正在跑程序(kill 之前它占着"一次一个"的那套地址空间),
-    ;   得看它跑的是不是**现在**这套:cr3 一样才是,那就收摊、把页还回池子,
-    ;   再把锁放掉。以前只把 prog_owner 抹了 ⇒ 那套页目录 + 私有页表漏在池子里
-    ;   (症状:反复 run HANG 再 kill,`debug pmem` 的空闲页数一路往下掉)。
-    call sched_kill_cr3
+    ; ★ sched_kill 把被杀线程的整块 TCB 抄进了 kill_space(清槽之前),
+    ;   这里照着快照把它的页目录 / 私有页表 / 镜像暂存区收摊 ——
+    ;   否则反复 run 再 kill,`debug pmem` 的空闲页数会一路往下掉。
+    call sched_kill_space
     test eax, eax
-    jz .not_owner
-    cmp eax, [space_pd]
-    jne .not_owner
-    call space_destroy                 ; eax = 还回去的页数
+    jz .after_clean
+    mov edi, eax
+    call space_destroy_at              ; eax = 还回去的页数
     mov [kill_freed], eax
-    mov dword [prog_owner], -1
     mov al, COL_NORMAL
     call term_set_color
     mov esi, msg_kill_pages1
@@ -3247,12 +3320,6 @@ cmd_kill:
     call term_print_dec
     mov esi, msg_kill_pages2
     call term_print
-    jmp .after_clean
-.not_owner:
-    mov eax, [kill_id]
-    cmp eax, [prog_owner]
-    jne .after_clean
-    mov dword [prog_owner], -1
 .after_clean:
     mov al, COL_OK
     call term_set_color
@@ -3265,6 +3332,28 @@ cmd_kill:
     mov esi, [kill_name]
     call term_print
     mov esi, msg_kill_rp
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+
+    ; ---- shell 线程:它没在跑程序就没什么可杀的 ----
+.kill_prog:
+    cmp dword [ebx + TCB_SP_RUNNING], 0
+    je .is_shell
+    cmp dword [ebx + TCB_SP_RUNESP], 0
+    je .is_shell
+    cmp dword [ebx + TCB_SP_RUNSTAT], 0
+    jne .is_shell                        ; 已经在收摊了
+    mov dword [ebx + TCB_SP_KILLREQ], 1  ; 它自己的下一次 IRQ0 会捡这个标记
+    mov al, COL_OK
+    call term_set_color
+    mov esi, msg_kill_prog1
+    call term_print
+    mov eax, [kill_id]
+    call term_print_dec
+    mov esi, msg_kill_prog2
     call term_print
     mov al, COL_NORMAL
     call term_set_color
@@ -3645,9 +3734,7 @@ msg_shell_active db '   <- keyboard here', 0
 msg_shell_hint  db 'Ctrl+Left / Ctrl+Right switches, or: shell <n>', 10, 0
 msg_shell_same  db 'already here', 10, 0
 msg_shell_usage db 'usage: shell [1-4]  (no argument = list them)', 10, 0
-msg_run_busy    db 'another shell is running a program (thread ', 0
-msg_run_busy2   db ') - Ctrl+Left/Right to switch there, or kill it', 10, 0
-msg_kill_shell  db 'shell threads cannot be killed: the keyboard lives on them', 10, 0
+msg_kill_shell  db 'kill: cannot kill a shell thread itself (the keyboard lives on them)', 10, 0
 msg_ps_head    db 'ps: ', 0
 msg_ps_head2   db ' alive / ', 0
 msg_ps_head3   db ' slots, scheduled ticks ', 0
@@ -3656,6 +3743,7 @@ msg_ps_id      db '  [', 0
 msg_ps_name    db '] ', 0
 msg_ps_ticks   db '  ticks=', 0
 msg_ps_runs    db '  runs=', 0
+msg_ps_prog    db '  *prog', 0            ; 这条线程正在跑 ring3 程序
 msg_spawn_ok   db 'spawned thread ', 0
 msg_spawn_lp   db ' (', 0
 msg_spawn_rp   db ')', 10, 0
@@ -3664,7 +3752,9 @@ msg_spawn_usage db 'usage: spawn [alpha|beta]  (no arg = alpha, then beta)', 10,
 msg_kill_ok    db 'killed thread ', 0
 msg_kill_lp    db ' (', 0
 msg_kill_rp    db ')', 10, 0
-msg_kill_self  db 'kill: thread 0 is the shell itself, cannot kill that', 10, 0
+msg_kill_self  db 'kill: cannot kill the shell you are typing on', 10, 0
+msg_kill_prog1 db 'kill: thread ', 0
+msg_kill_prog2 db ' is running a program; it will be stopped on its next tick', 10, 0
 msg_kill_none  db 'kill: no such thread', 10, 0
 msg_kill_usage db 'usage: kill <id>  (get ids from ps)', 10, 0
 ; kill 掉一个正在跑程序的线程时,顺手把它那套地址空间收摊(页还回物理页池)
@@ -3684,9 +3774,9 @@ msg_help db \
     'pci [b:s.f]   list the PCI devices on bus 0, or show one in detail', 10, \
     'usb           UHCI controller / ports / USB keyboard status', 10, \
     'usbdisk       USB mass storage (read-only): info / read <lba> / hexdump <lba> / mbr / sense', 10, \
-    'ps            list scheduler threads (id / name / ticks / runs)', 10, \
+    'ps            list threads (id / name / ticks / runs / *prog = has a program)', 10, \
     'spawn [who]   start a demo kernel thread (no arg = alpha, then beta)', 10, \
-    'kill <id>     kill a thread, give its stack back to the page pool', 10, \
+    'kill <id>     kill a thread, or stop the program a shell is running', 10, \
     'shell [n]     list the 4 shells, or jump to one (Ctrl+Left / Ctrl+Right)', 10, \
     'rc <what>     rc.conf: list / get KEY / start N / log / reload (event log)', 10, \
     'reboot        restart the machine', 10, \
@@ -3839,9 +3929,11 @@ cmd_saved_dir dd 0                      ; cmd_run 进来时 shell 的 [fat_dir],
 prog_name_ptr dd 0                      ; run 用的:去掉目录部分之后的程序名
 prog_size   dd 0                        ; run 用的:程序文件多大(按它往私有页里拷)
 prog_entry  dd 0                        ; run 用的:进 ring 3 的入口(平铺=0x120000, ELF 用 e_entry)
-space_freed dd 0                        ; run 用的:收摊时还回去的页数
-run_esp     dd 0                        ; run 用的:进 ring 3 前的内核栈(退出/被杀都回它)
-run_status  dd 0                        ; run 用的:0 = 程序正常 ret,1 = 被内核干掉了
+stage_pages dd 0                        ; 这次镜像暂存区占几页(pmem_alloc_pages 要连续页数)
+loader_busy db 0                        ; 装载锁:1 = 某条线程正在读文件/建空间
+                                        ; ★ 只锁"装载"这一段,程序跑起来之前就放开 ——
+                                        ;   两条 shell 各跑各的程序,不互相排队。
+                                        ;   (run_esp / run_status / 收摊页数都在 TCB 里)
 cat_name_ptr dd 0                       ; cat 用的:去掉目录部分之后的文件名
 file_size  dd 0
 
@@ -3869,7 +3961,7 @@ msg_mv_unlink_fail db 'mv: copy done, but could not remove the source', 10, 0
 sh_active      dd 0                     ; 键盘现在归哪条 shell(线程号)
 sh_switch_flag dd 0                     ; 1 = 刚换过来,醒来要重画标题和半行
 sh_target      dd 0                     ; shell_switch_to 的临时变量
-prog_owner     dd -1                    ; 正在跑程序的线程号,-1 = 没人跑
+                                        ; (谁在跑程序?看 TCB_SP_RUNNING,不再有全局 owner)
 sh_nbuf        times SH_MAX * SH_BUF_SZ db 0
 sh_nlen        times SH_MAX dd 0
 sh_ndir        times SH_MAX * SH_DIR_SZ db 0
