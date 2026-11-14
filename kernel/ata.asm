@@ -157,49 +157,53 @@ ata_setup_lba:
 
 ; ---------------------------------------------------------------------------
 ;  ata_read_sectors:eax = LBA,ecx = 扇区数,edi = 目标地址;返回 eax = 0 成功 / -1 失败
+;
+;  ★ 调用者的寄存器(ebx/ecx/edx/esi/edi/ebp)必须原样保留,只有 eax 是返回值。
+;    (踩过:原先 pushad 只护住安全闸那一段,popad 之后 `mov dx, ATA_CMD/DATA`
+;     把 EDX 改成 0x1F0 就返回;FAT 层拿 EDX 存"扇区内字节偏移",分配器于是从
+;     扇区中间开始扫零,簇号全场乱飞 —— 一路写到 8192 号簇,把根目录写成了 FAT 表)
 ; ---------------------------------------------------------------------------
 ata_read_sectors:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    push ebp
     ; ---- 记一笔:谁(返回地址)用哪个 LBA/几个扇区/读到哪 ----
     ; 崩溃之后转储虚拟机内存、照 ATA_LOG_ADDR 一看就知道是谁把内存写穿的
-    pushad
     mov ebx, [ata_log_pos]
     and ebx, ATA_LOG_N - 1
     shl ebx, 4
     add ebx, ata_log
     mov [ebx + 0], eax                  ; LBA
     mov [ebx + 4], ecx                  ; 扇区数
-    mov eax, [esp + 28]                 ; pushad 之后的第 7 个:原 EDI = 目标
-    mov [ebx + 8], eax
-    mov eax, [esp + 32]                 ; 返回地址 = 调用者
-    mov [ebx + 12], eax
+    mov [ebx + 8], edi                  ; 目标
+    mov edx, [esp + 24]                 ; 返回地址 = 调用者(6 个 push 之后)
+    mov [ebx + 12], edx
     inc dword [ata_log_pos]
     ; ---- 安全闸:扇区数 > 255 或者目标地址不在已映射的低端内存里,一律拒绝 ----
     ; (踩过:一个算错的 LBA/长度把整块内存写成同一个值,内核自己把自己埋了)
     test ecx, ecx                       ; 0 个扇区?直接拒绝
-    jz .refuse
+    jz .fail
     cmp ecx, 0x100000                   ; 一次读 512 MB?肯定不对
-    ja .refuse
+    ja .fail
     cmp edi, 0x10000                    ; 目标必须在已映射的低端内存里
-    jb .refuse
-    mov eax, ecx                        ; 而且"目标 + 长度"不能越过恒等映射(运行时 ident_limit)
-    shl eax, 9
-    add eax, edi
-    jc .refuse
-    cmp eax, [ident_limit]
-    ja .refuse
-    popad
+    jb .fail
+    mov edx, ecx                        ; 而且"目标 + 长度"不能越过恒等映射(运行时 ident_limit)
+    shl edx, 9
+    jc .fail
+    add edx, edi
+    jc .fail
+    cmp edx, [ident_limit]
+    ja .fail
     mov [ata_lba], eax
     mov [ata_buf], edi
     mov [ata_left], ecx
-    jmp .loop
-.refuse:
-    popad
-    mov eax, -1                         ; 当"读失败"处理,调用方会正常退出
-    ret
 .loop:
     cmp dword [ata_left], 0
     je .done
-    ; 本次读几块:最多 255 扇区(ATA 的 SECCNT 是 8 位,0 表示 256)
+    ; 本次读几块:最多 ATA_MAX_CHUNK 扇区(ATA 的 SECCNT 是 8 位,0 表示 256)
     mov eax, [ata_left]
     cmp eax, ATA_MAX_CHUNK
     jbe .use_it
@@ -232,16 +236,30 @@ ata_read_sectors:
     jmp .loop
 .done:
     xor eax, eax
-    ret
+    jmp .out
 .fail:
-    mov eax, -1
+    mov eax, -1                         ; 调用方必须检查:失败时目标缓冲里是旧内容
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
     ret
 
 ; ---------------------------------------------------------------------------
 ;  ata_write_sectors:eax = LBA,ecx = 扇区数,esi = 源地址;返回 eax = 0 / -1
 ;  注意:写盘是真写 —— 拿镜像的副本试,别拿唯一的镜像练手
+;  寄存器约定同 ata_read_sectors:调用者的寄存器别动,只有 eax 是返回值。
 ; ---------------------------------------------------------------------------
 ata_write_sectors:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    push ebp
     mov [ata_lba], eax
     mov [ata_src], esi
     mov [ata_left], ecx
@@ -283,9 +301,16 @@ ata_write_sectors:
     out dx, al
     call ata_wait_ready
     xor eax, eax
-    ret
+    jmp .out
 .fail:
     mov eax, -1
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
     ret
 
 ; ---------------------------------------------------------------- 变量

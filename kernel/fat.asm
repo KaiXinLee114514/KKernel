@@ -93,6 +93,40 @@ fat_mount:
     add eax, [fat_root_lba]
     mov [fat_data_lba], eax
 
+    ; ---- 数据区一共几簇(分配器上界):总扇区 - 保留 - 每份 FAT - 根目录区 ----
+    movzx eax, word [esi + 19]          ; FAT16 的总扇区数(16 位)
+    test eax, eax
+    jnz .tot_ok
+    mov eax, [esi + 32]                 ; 16 位装不下时用 32 位字段
+.tot_ok:
+    sub eax, [fat_reserved]
+    mov ecx, [fat_nfats]
+    imul ecx, [fat_size]
+    sub eax, ecx
+    mov ecx, [fat_root_ents]
+    shl ecx, 5
+    add ecx, 511
+    shr ecx, 9
+    sub eax, ecx
+    xor edx, edx
+    div dword [fat_spc]
+    add eax, 2                          ; 簇号从 2 起
+    ; 再按 FAT 表项数封顶(表里装不下这么多簇)
+    mov ecx, [fat_size]
+    shl ecx, 9
+    cmp byte [fat_fat32], 0
+    je .cap16
+    shr ecx, 2
+    jmp .cap
+.cap16:
+    shr ecx, 1
+.cap:
+    cmp eax, ecx
+    jbe .cap_done
+    mov eax, ecx
+.cap_done:
+    mov [fat_max_cluster], eax
+
     mov dword [fat_cache_lba], -1
     mov byte [fat_ok], 1
     popad
@@ -1299,6 +1333,8 @@ fat_read_file:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov esi, FAT_BUF
     add esi, [fat_entry_off]
@@ -1351,6 +1387,8 @@ fat_stat:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov esi, FAT_BUF
     add esi, [fat_entry_off]
@@ -1386,10 +1424,12 @@ fat_set_entry:
     add eax, [fat_fat_lba]
     mov [fat_sector], eax
 
-    ; 读该 FAT 扇区
+    ; 读该 FAT 扇区(读失败就别改:FAT_BUF 里是上一次的内容)
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .done
     mov esi, FAT_BUF
     add esi, [fat_off]
     cmp byte [fat_fat32], 0
@@ -1426,7 +1466,7 @@ fat_set_entry:
     ret
 
 ; ---------------------------------------------------------------------------
-;  fat_alloc_cluster:找一个空闲簇,标记成链尾(0xFFFF),返回 eax = 簇号;0 = 没空间
+;  fat_alloc_cluster:找一个空闲簇,标记成链尾,返回 eax = 簇号;0 = 没空间
 ; ---------------------------------------------------------------------------
 fat_alloc_cluster:
     push ebx
@@ -1440,6 +1480,8 @@ fat_alloc_cluster:
     mov eax, 2
 .scan:
     mov [fat_cluster], eax
+    cmp eax, [fat_max_cluster]          ; 扫到分区数据区末尾 = 盘满
+    jae .fail
     mov eax, [fat_cluster]
     cmp byte [fat_fat32], 0
     je .al16
@@ -1452,12 +1494,25 @@ fat_alloc_cluster:
     mov ecx, 512
     div ecx
     mov [fat_off], edx
-    add eax, [fat_fat_lba]
+    ; ★ 簇基要退到本扇区的第一个表项:命中时按"簇基 + 表项序号"算簇号。
+    ;   (以前簇基不按扇区对齐,命中又加序号,簇号就偏 next_free%256)
+    mov ecx, edx
+    cmp byte [fat_fat32], 0
+    je .al16_off
+    shr ecx, 2
+    jmp .aligned
+.al16_off:
+    shr ecx, 1
+.aligned:
+    sub [fat_cluster], ecx
+    add eax, [fat_fat_lba]              ; 扇区号 → LBA
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail                           ; 读不到:别拿旧缓冲区找空簇
     mov esi, FAT_BUF
-    ; edx = 扇区内的字节偏移;每扇区能装 512/size 个表项
+    mov edx, [fat_off]                  ; 从本簇在扇区里的位置开始扫
     cmp byte [fat_fat32], 0
     je .look16
 .look32:
@@ -1481,29 +1536,34 @@ fat_alloc_cluster:
     jb .look16
     jmp .next_sector
 .found16:
-    shr edx, 1                          ; 表项序号 = 偏移 / 2
-    jmp .found
-.next_sector:
-    ; 这一扇区里没有空闲簇:跳到下一扇区
-    mov eax, [fat_cluster]
-    cmp byte [fat_fat32], 0
-    je .ns16
-    add eax, 128                        ; 一扇区 128 个 32 位表项
-    jmp .ns_done
-.ns16:
-    add eax, 256                        ; 一扇区 256 个 16 位表项
-.ns_done:
-    mov [fat_cluster], eax
-    jmp .scan
+    shr edx, 1                          ; 表项序号 = 字节偏移 / 2
 .found:
     mov eax, [fat_cluster]
-    add eax, edx
+    add eax, edx                        ; 簇号 = 扇区首项 + 序号
     mov [fat_cluster], eax
     mov [fat_next_free], eax
     inc dword [fat_next_free]
     mov eax, [fat_eoc]                  ; 先当链尾,链的时候再改
     call fat_set_entry
     mov eax, [fat_cluster]
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+.next_sector:
+    ; 这一扇区里没有空闲簇:跳到下一扇区(簇基 + 每扇区表项数)
+    mov eax, [fat_cluster]
+    cmp byte [fat_fat32], 0
+    je .ns16
+    add eax, 128                        ; 一扇区 128 个 32 位表项
+    jmp .scan
+.ns16:
+    add eax, 256                        ; 一扇区 256 个 16 位表项
+    jmp .scan
+.fail:
+    xor eax, eax                        ; 0 = 没空间/读盘失败
     pop edi
     pop esi
     pop edx
@@ -1595,11 +1655,13 @@ fat_write_file:
     sub [fat_left], eax
     jmp .cluster_loop
 .chain_done:
-    ; ---- 更新目录项 ----
+    ; ---- 更新目录项(读失败就别写回:否则会把旧缓冲当目录扇区写坏) ----
     mov eax, [fat_dir_lba]
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     cmp dword [wr_existing], 0
     jne .patch_short
     ; 新文件:把 N 个 LFN 项 + 短项整段拷进扇区(一次写完)
@@ -1689,6 +1751,8 @@ fat_list:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .done
     mov dword [fat_cache_lba], -1
     xor ebx, ebx
 .entry:
@@ -1991,10 +2055,12 @@ fat_mkdir:
     mov ecx, 1
     mov esi, dir_make
     call ata_write_sectors
-    mov eax, [fat_dir_lba]              ; 6) 目录项写进父目录
+    mov eax, [fat_dir_lba]              ; 6) 目录项写进父目录(读失败就别写)
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov edi, FAT_BUF
     add edi, [fat_entry_off]
@@ -2052,6 +2118,8 @@ fat_unlink:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov esi, FAT_BUF
     add esi, [fat_entry_off]
@@ -2087,6 +2155,8 @@ fat_unlink:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov ebx, [fat_entry_off]
     mov byte [FAT_BUF + ebx], 0xE5
@@ -2100,6 +2170,8 @@ fat_unlink:
     cmp ecx, eax
     jbe .mark_lfn
     mov ecx, eax
+    test ecx, ecx
+    jz .mark_done                       ; 短项在扇区第 0 槽:前面没得标(别写到缓冲区外)
 .mark_lfn:
     sub ebx, 32
     mov byte [FAT_BUF + ebx], 0xE5
@@ -2134,6 +2206,8 @@ fat_rmdir:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov esi, FAT_BUF
     add esi, [fat_entry_off]
@@ -2162,6 +2236,8 @@ fat_rmdir:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     xor ebx, ebx
 .rs_entry:
@@ -2209,6 +2285,8 @@ fat_rmdir:
     mov ecx, 1
     mov edi, FAT_BUF
     call ata_read_sectors
+    cmp eax, 0
+    jne .fail
     mov dword [fat_cache_lba], -1
     mov ebx, [fat_entry_off]
     mov byte [FAT_BUF + ebx], 0xE5
@@ -2222,6 +2300,8 @@ fat_rmdir:
     cmp ecx, eax
     jbe .mark_lfn
     mov ecx, eax
+    test ecx, ecx
+    jz .mark_done                       ; 短项在扇区第 0 槽:前面没得标(别写到缓冲区外)
 .mark_lfn:
     sub ebx, 32
     mov byte [FAT_BUF + ebx], 0xE5
@@ -2301,6 +2381,7 @@ fat_data_lba    dd 0
 fat_cache_lba   dd -1
 fat_cluster     dd 0
 fat_next_free   dd 2
+fat_max_cluster dd 0                    ; 数据区最后一个簇 + 1(分配上界)
 fat_off         dd 0
 fat_new_val     dw 0
 fat_sector      dd 0

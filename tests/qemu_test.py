@@ -635,10 +635,15 @@ def offline_checks(img: str, font_path: str = "font/full-kkf.bin",
             else:
                 off = fs.fat_lba + i * fs.fat_sectors * 512 + cl * 2
                 copies.append(int.from_bytes(raw[off:off + 2], "little"))
-        # 文件比一个簇小 → 它的簇项应该是"链尾",而且两份 FAT 得一样
+        # 文件比一个簇小 → 它的簇项应该是"链尾",而且两份 FAT 得一样。
+        # 还要比整份 FAT:分配器要是发出分区外的簇号,`fat_set_entry` 写第二份
+        # FAT 时会顺带把根目录区覆盖掉(踩过一回),这里能直接抓住。
+        fat_bytes = fs.fat_sectors * 512
+        fat_same = (raw[fs.fat_lba:fs.fat_lba + fat_bytes]
+                    == raw[fs.fat_lba + fat_bytes:fs.fat_lba + 2 * fat_bytes])
         out.append(("离线:两份 FAT 都写了",
-                    len(set(copies)) == 1 and copies[0] >= fs.eoc,
-                    f"簇 {cl} 在 {fs.nfats} 份 FAT 里都是链尾,实际 {copies}"))
+                    len(set(copies)) == 1 and copies[0] >= fs.eoc and fat_same,
+                    f"簇 {cl} 在两份 FAT 里都是链尾、整份 FAT 一致,实际 {copies}"))
     except Exception as e:                                   # noqa: BLE001
         out.append(("离线:两份 FAT 都写了", False, str(e)))
     return out
