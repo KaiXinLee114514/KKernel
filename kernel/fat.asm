@@ -1394,6 +1394,8 @@ fat_stat:
     add esi, [fat_entry_off]
     mov eax, [esi + 28]                 ; 目录项 +28 = 文件大小
     mov [fat_stat_size], eax
+    movzx eax, byte [esi + 11]          ; 目录项 +11 = 属性(bit4=目录)
+    mov [fat_stat_attr], eax
     popad
     mov eax, [fat_stat_size]            ; popad 会把 eax 还原,所以从内存读回来
     ret
@@ -2400,6 +2402,7 @@ fat_left        dd 0
 fat_want        dd 0
 fat_size_bytes  dd 0
 fat_stat_size   dd 0
+fat_stat_attr   dd 0
 fat_first_cluster dd 0
 fat_prev_cluster  dd 0
 fat_chunk_bytes   dd 0

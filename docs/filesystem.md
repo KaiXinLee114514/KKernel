@@ -199,6 +199,20 @@ ATA_MAX_CHUNK equ 16          ; 块大小:255 是硬件上限,16(=8 KB)实测最
   vi 存盘都认 `DOCS/NOTE.TXT` 这种路径,而且相对**当前目录**:先 `cd DOCS` 再
   `run VI NOTE.TXT`,存的还是 `DOCS/NOTE.TXT`。
 
+### 5.3 shell 层的撞名提示(R/D/O)
+
+`write`、`cp`、`mv` 真正落地之前会先查目标在不在(用 `fat_path` + `fat_stat`,
+FAT 名字不区分大小写)。在的话先打印
+
+```
+Found file with same filename. Rename / Don't write / Overwrite? (R/D/O)
+```
+
+按键:`R` 再读一行新名字(回显、退格,Enter 结束),拿新名字重新查,撞了继续问;
+`D` 或 Esc 放弃(打印 `not written.`);`O` 覆盖。`/DEV` 虚拟设备和管道里的写不弹
+提示(管道要保持数据流干净);cp/mv 的目标是目录时,查的是最终落地文件
+`DIR/basename`。
+
 ### 写文件的完整流程
 
 ```

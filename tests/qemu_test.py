@@ -1470,10 +1470,100 @@ def main() -> int:
                             ok_log and ok_ss and ok_so and ok_t,
                             "带 tick 的事件账本"))
             run('write SYS/RC.CONF hostname="newbox"', wait=1.5)
+            # 盘上已经有 RC.CONF → shell 会先问 R/D/O,补一个 O 才是覆盖写
+            mon.sendkey("o")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            results.append(("write 撞名选 O:覆盖 RC.CONF",
+                            wait_for("wrote SYS/RC.CONF", 20.0),
+                            "wrote SYS/RC.CONF"))
             run("rc reload", wait=1.5)
             results.append(("rc reload:重新读盘上的 RC.CONF",
                             wait_for("RC.CONF, 1 keys") and has("hostname newbox"),
                             "shell 写过的配置能重新解析"))
+
+            # ---- 写文件撞名:先问 R / D / O ----
+            run("clear", wait=0.8)
+            run("write cfl.txt cfl-old-111")
+            run("write cfl.txt cfl-new-222")
+            results.append(("write 撞名先弹 R/D/O 提示",
+                            wait_for("Found file with same filename", 20.0),
+                            "Found file with same filename. Rename / Don't write / Overwrite? (R/D/O)"))
+            mon.sendkey("d")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            d_msg = has("not written.")
+            run("clear", wait=0.8)
+            run("cat cfl.txt")
+            results.append(("撞名选 D:不写,原文件不变",
+                            d_msg and has("cfl-old-111"),
+                            "not written. 且 cat 仍是旧内容"))
+
+            run("write cfl.txt cfl-new-222")
+            mon.sendkey("o")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            o_msg = wait_for("wrote cfl.txt", 20.0)
+            run("clear", wait=0.8)
+            run("cat cfl.txt")
+            results.append(("撞名选 O:覆盖写,读到新内容",
+                            o_msg and has("cfl-new-222"),
+                            "wrote cfl.txt 且 cat 变成新内容"))
+
+            run("write cfl.txt cfl-ren-333")
+            mon.sendkey("r")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            r_prompt = has("new name:")
+            mon.type_text("cfl2.txt")
+            mon.sendkey("ret")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            r_wrote = wait_for("wrote cfl2.txt", 20.0)
+            run("clear", wait=0.8)
+            run("cat cfl2.txt")
+            r_content = has("cfl-ren-333")
+            run("clear", wait=0.8)
+            run("cat cfl.txt")
+            r_old = has("cfl-new-222")
+            results.append(("撞名选 R:新名字写新文件,原文件不动",
+                            r_prompt and r_wrote and r_content and r_old,
+                            "new name: → wrote cfl2.txt;cfl2 是新内容,cfl 没变"))
+
+            # ---- cp 撞名也要问 ----
+            run("write cpa.txt cpa-old-111")
+            run("write cpb.txt cpb-new-222")
+            run("cp cpb.txt cpa.txt")
+            cp_prompt = wait_for("Found file with same filename", 20.0)
+            mon.sendkey("d")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            cp_d = has("not written.")
+            run("clear", wait=0.8)
+            run("cat cpa.txt")
+            cp_old = has("cpa-old-111")
+            results.append(("cp 撞名选 D:目标文件不变",
+                            cp_prompt and cp_d and cp_old,
+                            "cp 的 D 之后 cat cpa.txt 还是旧内容"))
+
+            run("cp cpb.txt cpa.txt")
+            mon.sendkey("o")
+            time.sleep(0.4)
+            wait_idle(8.0)
+            rescan()
+            cp_o = wait_for("copied cpb.txt -> cpa.txt", 20.0)
+            run("clear", wait=0.8)
+            run("cat cpa.txt")
+            results.append(("cp 撞名选 O:覆盖目标",
+                            cp_o and has("cpb-new-222"),
+                            "copied cpb.txt -> cpa.txt 且 cat 变成源内容"))
+
             run("rc start 9", wait=1.2)
             results.append(("rc start 越界:报错不崩",
                             has("1..8"), "rc start <1..8>"))

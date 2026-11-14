@@ -1631,7 +1631,197 @@ cmd_cat:
     ret
 
 ; ---------------------------------------------------------------------------
-;  write <文件> <内容>:写文件(创建或覆盖)
+;  path_exists:esi = 路径 → eax = 1 存在 / 0 不存在
+;    路径按当前 [fat_dir] 解析(和 cmd_cat/cmd_write 一样,不清根);
+;    查完把 [fat_dir] 还原 —— 调用方多半还要接着用原来的目录。
+; ---------------------------------------------------------------------------
+path_exists:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    push ebp
+    mov ebp, [fat_dir]
+    call fat_path
+    jc .no
+    mov esi, eax
+    cmp byte [esi], 0
+    je .no                              ; "DOCS/" 这种尾巴是目录,不算文件
+    call fat_stat
+    cmp eax, -1
+    je .no
+    mov eax, 1
+    jmp .out
+.no:
+    xor eax, eax
+.out:
+    mov [fat_dir], ebp
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  shell_read_name:edi = 缓冲 → 读一行文件名(回显、退格、Enter 结束)
+;    · 只收可打印 ASCII,最长 [ow_max] 个字符
+;    · Esc / 空行 / 等待期间 shell 被切走 → eax = 0(取消)
+;    → eax = 1,缓冲区以 0 结尾
+; ---------------------------------------------------------------------------
+shell_read_name:
+    push ebx
+    push ecx
+    push edx
+    push edi
+    mov dword [rn_len], 0
+.loop:
+    call shell_wait_key
+    test al, al
+    jz .cancel
+    cmp al, 13
+    je .enter
+    cmp al, 8
+    je .back
+    cmp al, 27
+    je .cancel
+    cmp al, 32
+    jb .loop
+    cmp al, 0x7E
+    ja .loop
+    mov ecx, [rn_len]
+    cmp ecx, [ow_max]
+    jae .loop
+    mov [edi + ecx], al
+    inc dword [rn_len]
+    call term_putc
+    jmp .loop
+.back:
+    mov ecx, [rn_len]
+    test ecx, ecx
+    jz .loop
+    dec ecx
+    mov [rn_len], ecx
+    mov al, 8
+    call term_putc
+    mov al, ' '
+    call term_putc
+    mov al, 8
+    call term_putc
+    jmp .loop
+.enter:
+    mov ecx, [rn_len]
+    test ecx, ecx
+    jz .cancel
+    mov byte [edi + ecx], 0
+    mov al, 10
+    call term_putc
+    mov eax, 1
+    jmp .out
+.cancel:
+    xor eax, eax
+.out:
+    pop edi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  shell_ask_overwrite:目标已存在时问 R / D / O
+;    esi = 目标路径(相对当前 [fat_dir]);edi = 读新名字的缓冲;
+;    eax = 新名字最长多少字符(不含结尾 0)
+;    → eax = 1 继续写(最终名字在 edx)/ 0 放弃 / 2 shell 被切走(静默退出)
+;    · 管道里不问:保持原来的覆盖行为,别打乱数据流
+;    · /DEV 由调用方先分走,不会走到这里
+;    · R 给的新名字也撞名 → 接着问
+; ---------------------------------------------------------------------------
+shell_ask_overwrite:
+    push ebx
+    push ecx
+    push esi
+    push edi
+    push ebp
+    mov [ow_name], esi
+    mov [ow_buf], edi
+    mov [ow_max], eax
+    cmp dword [pipe_active], 0
+    jne .yes
+.check:
+    mov esi, [ow_name]
+    call path_exists
+    test eax, eax
+    jz .yes
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_same_name
+    call term_print
+    call shell_wait_key
+    mov bl, al
+    test bl, bl
+    jnz .have_key
+    mov eax, [sched_cur]                ; 0 = 等键时被换走了
+    cmp eax, [sh_active]
+    jne .abort
+    jmp .check
+.have_key:
+    mov al, 10
+    call term_putc
+    cmp bl, 'o'
+    je .yes
+    cmp bl, 'O'
+    je .yes
+    cmp bl, 'd'
+    je .no
+    cmp bl, 'D'
+    je .no
+    cmp bl, 27
+    je .no
+    cmp bl, 'r'
+    je .rename
+    cmp bl, 'R'
+    je .rename
+    jmp .check                          ; 别的键:重新问
+.rename:
+    mov al, COL_NORMAL
+    call term_set_color
+    mov esi, msg_new_name
+    call term_print
+    mov edi, [ow_buf]
+    call shell_read_name
+    test eax, eax
+    jnz .have_name
+    mov eax, [sched_cur]
+    cmp eax, [sh_active]
+    jne .abort
+    jmp .no                             ; Esc / 空行 = 不写
+.have_name:
+    mov eax, [ow_buf]
+    mov [ow_name], eax
+    jmp .check                          ; 新名字也可能撞名
+.yes:
+    mov edx, [ow_name]
+    mov eax, 1
+    jmp .out
+.no:
+    xor eax, eax
+    xor edx, edx
+    jmp .out
+.abort:
+    mov eax, 2
+    xor edx, edx
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  write <文件> <内容>:写文件(创建或覆盖;撞名先问 R/D/O)
 ; ---------------------------------------------------------------------------
 cmd_write:
     cmp byte [fat_ok], 0
@@ -1668,6 +1858,39 @@ cmd_write:
     call dev_lookup
     test eax, eax
     jnz .device_write
+    ; ---- 目标是目录?拒绝(否则 shell_ask_overwrite 把目录当文件,选 O 会覆盖坏) ----
+    mov esi, name_buf
+    call path_exists
+    test eax, eax
+    jz .not_a_dir
+    test dword [fat_stat_attr], 0x10
+    jz .not_a_dir
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_write_isdir
+    call term_print
+    ret
+.not_a_dir:
+    ; ---- 磁盘文件已存在?先问 R/D/O(设备在上面已分走,管道里不问) ----
+    push edi                            ; edi = 内容指针,提问要拿它当参数用
+    push ecx                            ; ecx = 内容长度
+    mov eax, 63                         ; name_buf 是 64B,最多 63 个字符
+    mov esi, name_buf
+    mov edi, name_buf
+    call shell_ask_overwrite
+    pop ecx
+    pop edi
+    cmp eax, 1
+    je .do_write
+    cmp eax, 2
+    je .quiet
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_not_written
+    call term_print
+.quiet:
+    ret
+.do_write:
     mov esi, name_buf                   ; 支持子目录路径:先解析 DOCS/ 这样的前缀
     call fat_path                       ; (fat_path 保留 edi/ecx,只改 eax)
     jc .failed
@@ -1800,10 +2023,64 @@ shell_copy_move:
     mov esi, name_buf                 ; 目录内:用源文件的本名
     call base_name
     mov [cp_dst_last], eax
+    mov byte [cp_dst_is_dir], 1
     jmp .dst_go
 .dst_file:
     mov [cp_dst_last], ebx
+    mov byte [cp_dst_is_dir], 0
 .dst_go:
+    ; ---- 最终名字先抄到稳定缓冲:下面查存在性会走 fat_path,path_buf 会被重写 ----
+    mov esi, [cp_dst_last]
+    mov edi, cp_dst_name
+    mov ecx, 127
+    call copy_str_n
+    mov dword [cp_dst_last], cp_dst_name
+    mov dword [cp_dst_disp], dst_buf   ; 没改名时提示里照旧显示用户原话
+    ; ---- 目标已存在?先问 R/D/O(管道里不问) ----
+    mov eax, 127
+    mov esi, cp_dst_name
+    mov edi, cp_new_name
+    call shell_ask_overwrite
+    cmp eax, 1
+    je .dst_have
+    mov ebx, eax
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    cmp ebx, 2
+    je .dst_quiet
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_not_written
+    call term_print
+.dst_quiet:
+    ret
+.dst_have:
+    mov [cp_dst_last], edx
+    cmp edx, cp_dst_name
+    je .dst_write                      ; 没改名:原样写
+    ; ---- R 给的新名字只能是单个文件名:fat_write_file 只接一段 ----
+    mov esi, edx
+.dst_sep:
+    mov al, [esi]
+    test al, al
+    jz .dst_renamed
+    cmp al, '/'
+    je .dst_badname
+    cmp al, 0x5C
+    je .dst_badname
+    inc esi
+    jmp .dst_sep
+.dst_badname:
+    mov eax, [cp_saved_dir]
+    mov [fat_dir], eax
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cp_newname
+    call term_print
+    ret
+.dst_renamed:
+    call cp_update_dst                 ; 只改成功提示里显示的目标
+.dst_write:
     mov esi, [cp_dst_last]
     mov edi, FILE_BUF
     mov ecx, [cp_len]
@@ -1839,7 +2116,7 @@ shell_copy_move:
     call term_print
     mov esi, msg_cp_arrow
     call term_print
-    mov esi, dst_buf
+    mov esi, [cp_dst_disp]
     call term_print
     mov al, 10
     call term_putc
@@ -1901,6 +2178,124 @@ shell_copy_move:
     mov esi, msg_mv_fail
 .f_msg:
     call term_print
+    ret
+
+; ---------------------------------------------------------------------------
+;  copy_str_n:esi → edi,最多 ecx 个字符,结尾补 0(edi 的缓冲区要够 +1)
+; ---------------------------------------------------------------------------
+copy_str_n:
+    push eax
+    push ecx
+.copy:
+    test ecx, ecx
+    jz .end
+    mov al, [esi]
+    test al, al
+    jz .end
+    mov [edi], al
+    inc esi
+    inc edi
+    dec ecx
+    jmp .copy
+.end:
+    mov byte [edi], 0
+    pop ecx
+    pop eax
+    ret
+
+; ---------------------------------------------------------------------------
+;  cp_update_dst:改名写成功后,把成功提示里的目标拼出来(只影响显示)
+;    原输入 "DOCS/"      → "DOCS/NEW.TXT"
+;    原输入 "OLD.TXT"    → "NEW.TXT"
+;    原输入 "DOCS/OLD.TXT" → "DOCS/NEW.TXT"
+;    结果放 cp_display_buf(128B),并改 [cp_dst_disp]。
+; ---------------------------------------------------------------------------
+cp_update_dst:
+    push eax
+    push ecx
+    push edx
+    push esi
+    push ebx
+    push edi
+    mov edi, cp_display_buf
+    lea edx, [edi + 127]                ; 最后一个字节留给结尾 0
+    mov esi, dst_buf
+    cmp byte [cp_dst_is_dir], 0
+    je .file
+    ; ---- 目标是目录:原样抄,末尾没 / 就补一个 ----
+.dir_copy:
+    mov al, [esi]
+    test al, al
+    jz .dir_end
+    cmp edi, edx
+    jae .done
+    mov [edi], al
+    inc edi
+    inc esi
+    jmp .dir_copy
+.dir_end:
+    cmp edi, cp_display_buf
+    je .dir_slash                       ; 空目标(正常到不了)
+    cmp byte [edi - 1], '/'
+    je .dir_name
+    cmp byte [edi - 1], 0x5C
+    je .dir_name
+.dir_slash:
+    cmp edi, edx
+    jae .done
+    mov byte [edi], '/'
+    inc edi
+    jmp .dir_name
+.file:
+    ; ---- 目标是文件:只抄最后一个分隔符之前的前缀,再拼新名字 ----
+    mov ebx, dst_buf                    ; ebx = 前缀抄到哪(默认一个字符都不抄)
+.file_scan:
+    mov al, [esi]
+    test al, al
+    jz .file_copy
+    cmp al, '/'
+    je .file_sep
+    cmp al, 0x5C
+    jne .file_next
+.file_sep:
+    lea ebx, [esi + 1]
+.file_next:
+    inc esi
+    jmp .file_scan
+.file_copy:
+    mov esi, dst_buf
+.fc_loop:
+    cmp esi, ebx
+    jae .file_name
+    cmp edi, edx
+    jae .done
+    mov al, [esi]
+    mov [edi], al
+    inc esi
+    inc edi
+    jmp .fc_loop
+.dir_name:
+.file_name:
+    mov esi, [cp_dst_last]              ; 最终名字(可能是 R 读进来的)
+.fn_loop:
+    mov al, [esi]
+    test al, al
+    jz .done
+    cmp edi, edx
+    jae .done
+    mov [edi], al
+    inc esi
+    inc edi
+    jmp .fn_loop
+.done:
+    mov byte [edi], 0
+    mov dword [cp_dst_disp], cp_display_buf
+    pop edi
+    pop ebx
+    pop esi
+    pop edx
+    pop ecx
+    pop eax
     ret
 
 ; ---------------------------------------------------------------------------
@@ -3786,8 +4181,10 @@ msg_help db \
     'rm <file>     delete a file (directories: use rmdir)', 10, \
     'cat <file>    print a text file (UTF-8; /DEV: cat DEV/RTC)', 10, \
     'write <f> <t> create/overwrite a file (/DEV: write DEV/CON hi)', 10, \
+    '              exists? R rename / D do not write / O overwrite', 10, \
     'cp <src> <dst> copy a file (dst DIR/ copies into that directory)', 10, \
     'mv <src> <dst> move a file (copy + delete; long names & subdirs supported)', 10, \
+    '              cp/mv: destination exists? same R/D/O prompt', 10, \
     'run <file>    run a program from disk (.BIN; bare "run" = the ABI)', 10, \
     'pipe: A | B   把 A 的输出接给 B 的 stdin(最多 4 段;顺序执行)', 10, \
     '              例: cat DOCS/README.TXT | run WC / ls BIN | run GREP HELLO', 10, \
@@ -3943,6 +4340,15 @@ cp_src_last  dd 0
 cp_dst_last  dd 0
 cp_len       dd 0
 dst_buf      times 128 db 0
+cp_dst_name    times 128 db 0          ; 目标本名(查存在性前先抄稳:path_buf 会被 fat_path 覆盖)
+cp_new_name    times 128 db 0          ; R 读进来的新名字
+cp_display_buf times 128 db 0          ; 改名后成功提示里显示的目标
+cp_dst_disp    dd dst_buf              ; 成功提示显示哪个串(默认用户原话)
+cp_dst_is_dir  db 0                    ; 目标是目录(1)还是文件(0)
+ow_name        dd 0                    ; 撞名提问:当前在查的路径
+ow_buf         dd 0                    ; 撞名提问:读新名字的缓冲
+ow_max         dd 63                   ; 读新名字的长度上限
+rn_len         dd 0                    ; shell_read_name 已读字符数(kbd_getchar 会冲掉 ecx)
 msg_cp_ok       db 'copied ', 0
 msg_mv_ok       db 'moved ', 0
 msg_cp_arrow    db ' -> ', 0
@@ -3954,6 +4360,13 @@ msg_cp_toobig   db 'cp/mv: file too big (max 60 KiB, the copy buffer is FILE_BUF
 msg_cp_fail     db 'cp: failed (not found / disk full / bad name?)', 10, 0
 msg_mv_fail     db 'mv: failed (not found / disk full / bad name?)', 10, 0
 msg_mv_unlink_fail db 'mv: copy done, but could not remove the source', 10, 0
+
+; ---- 撞名提示(R/D/O) ----
+msg_same_name   db "Found file with same filename. Rename / Don't write / Overwrite? (R/D/O) ", 0
+msg_new_name    db 'new name: ', 0
+msg_not_written db 'not written.', 10, 0
+msg_write_isdir db 'write: target is a directory', 10, 0
+msg_cp_newname  db 'cp/mv: new name must be a plain filename (no directory)', 10, 0
 
 ; ---- 多 shell:每条自己的状态格子 + 两个全局 ----
 ;  全局的 shell_buf / shell_len / cwd_str 永远是"当前活动 shell 的",换手时由
