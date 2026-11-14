@@ -842,9 +842,10 @@ def main() -> int:
             return report(results)
 
         if kifs_mode:
-            # ---- KiFS 内核只读驱动(Phase B0):宿主 mkifs.py 造的镜像 ----
+            # ---- KiFS 内核读写驱动(Phase C1):宿主 mkifs.py 造的镜像 ----
             #   分区固定烧在 IDE 盘 LBA 22528(16 MB 盘里 FAT16 分区之后),
-            #   测的是内核 kifs.asm:superblock 校验 / 目录遍历 / 内联 + extent 读取。
+            #   测的是内核 kifs.asm:superblock 校验 / 目录遍历 / 内联 + extent 读写 /
+            #   journal + CoW 写路径 / 重启持久化 / 崩溃恢复。
             results = []
             time.sleep(1.0)
 
@@ -852,6 +853,46 @@ def main() -> int:
                 mon.type_text(line)
                 mon.sendkey("ret")
                 time.sleep(wait)
+                rescan()
+
+            def stop_qemu() -> None:
+                """终止当前 qemu(如果还活着),别让僵尸进程占着镜像。"""
+                nonlocal qemu
+                if qemu.poll() is None:
+                    qemu.terminate()
+                try:
+                    qemu.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    qemu.kill()
+
+            def boot_image(path: str, tag: str) -> None:
+                """用同一个 kernel 盘再开一台 QEMU(换镜像/换 socket),等 shell 起来。"""
+                nonlocal qemu, mon
+                s = sock + tag
+                q = qmp_sock + tag
+                for sp in (s, q):
+                    if os.path.exists(sp):
+                        os.unlink(sp)
+                qemu = subprocess.Popen(
+                    ["qemu-system-i386",
+                     "-drive", f"file={path},format=raw,if=ide,index=0",
+                     "-boot", "c",
+                     "-display", "none", "-no-reboot", "-usb",
+                     "-monitor", f"unix:{s},server,nowait",
+                     "-qmp", f"unix:{q},server,nowait"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                mon = Monitor(s, timeout=15)
+                time.sleep(7.0)
+                for _ in range(6):
+                    try:
+                        if find_text(mon.screendump(), 'type "help" for commands.',
+                                     glyphs, None):
+                            time.sleep(2.0)
+                            break
+                    except Exception:
+                        break
+                    time.sleep(2.0)
                 rescan()
 
             kifs_run("kifs info")
@@ -907,6 +948,248 @@ def main() -> int:
             kifs_run("kifs ls /docs/hello.txt")
             results.append(("ls 文件 → 不是目录", has("kifs: not a directory"),
                             "ls /docs/hello.txt → kifs: not a directory"))
+
+            # ================= Phase C1:内核写路径 =================
+            #   mkdir / write(文本 + 管道 stdin) / rm / journal,写入走 journal+CoW。
+            kifs_run("kifs mkdir /w")
+            results.append(("内核 mkdir", has("kifs: mkdir /w (oid=12)"),
+                            "mkdir /w → oid=12"))
+
+            kifs_run("kifs write /w/a.txt hello kernel")
+            results.append(("内核 write(文本参数)",
+                            has("kifs: wrote 12 bytes to /w/a.txt (oid=13)"),
+                            "write /w/a.txt hello kernel → 12 字节 / oid=13"))
+
+            kifs_run("kifs cat /w/a.txt")
+            results.append(("内核写的内容读回", has("hello kernel"),
+                            "cat /w/a.txt → hello kernel"))
+
+            kifs_run("kifs stat /w/a.txt")
+            results.append(("stat 新写的内联文件",
+                            has("oid=13") and has("size=12 bytes") and has("inline_len=12"),
+                            "oid=13 / size=12 / inline_len=12"))
+
+            kifs_run("kifs cat /docs/hello.txt | kifs write /w/pipe.txt")
+            results.append(("管道 stdin 写入(内联)",
+                            has("kifs: wrote 16 bytes to /w/pipe.txt (oid=14)"),
+                            "cat hello.txt | write /w/pipe.txt → 16 字节(cat 补了换行)"))
+
+            kifs_run("kifs cat /docs/big.bin | kifs write /w/copy.bin", wait=3.0)
+            results.append(("管道 stdin 写入(多块)",
+                            has("kifs: wrote 12801 bytes to /w/copy.bin (oid=15)"),
+                            "cat big.bin | write /w/copy.bin → 12801 字节 / oid=15"))
+
+            kifs_run("kifs stat /w/copy.bin")
+            results.append(("多块文件 stat(CoW 新块)",
+                            has("size=12801 bytes") and has("blocks=4")
+                            and has("start=11 blocks=4"),
+                            "size=12801 / blocks=4 / extent start=11 blocks=4"))
+
+            kifs_run("kifs write /docs/big.bin small")
+            results.append(("覆盖宿主多块文件 → 内联",
+                            has("kifs: wrote 5 bytes to /docs/big.bin (oid=4)"),
+                            "write /docs/big.bin small → 5 字节(旧 4 块释放)"))
+
+            kifs_run("kifs cat /docs/big.bin")
+            results.append(("覆盖后读回", has("small"),
+                            "cat /docs/big.bin → small"))
+
+            kifs_run("kifs rm /docs/big.bin")
+            results.append(("内核 rm 文件", has("kifs: removed /docs/big.bin"),
+                            "rm /docs/big.bin → removed"))
+
+            kifs_run("kifs rm /ext")
+            results.append(("rm 非空目录被拒", has("kifs: directory not empty"),
+                            "rm /ext → kifs: directory not empty"))
+
+            kifs_run("kifs mkdir /w/sub")
+            kifs_run("kifs rm /w/sub")
+            results.append(("mkdir + rm 空目录",
+                            has("kifs: removed /w/sub") or has("kifs: mkdir /w/sub"),
+                            "mkdir /w/sub(复用已释放的 oid 4)后 rm → removed"))
+
+            # 在宿主造的 extent 目录(/ext 内容 112 B)里新建文件:
+            # 触发「目录内容从 extent 读 → CoW 换块 → 按名字排序插入」
+            kifs_run("kifs write /ext/aaa.txt s")
+            results.append(("extent 目录里新建文件",
+                            has("kifs: wrote 1 bytes to /ext/aaa.txt (oid=4)"),
+                            "write /ext/aaa.txt → oid=4(父目录内容走 extent CoW)"))
+            kifs_run("kifs ls /ext")
+            results.append(("extent 目录新增项可见",
+                            has("aaa.txt") and has("rw-r--r--"),
+                            "ls /ext → 有 aaa.txt"))
+
+            kifs_run("kifs journal")
+            results.append(("journal 列出事务", has("journal: 64 blocks")
+                            and has("transactions") and has("seq="),
+                            "journal: 64 blocks / N transactions / seq=… state=…"))
+
+            # ---- 重启:同一条盘再开一台 QEMU,验证写入真的落盘 ----
+            mon.type_text("reboot")
+            mon.sendkey("ret")
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and qemu.poll() is None:
+                time.sleep(0.5)
+            stop_qemu()
+            boot_image(img_copy, "-2")
+
+            kifs_run("kifs info")
+            results.append(("重启后 free_blocks 一致", has("free_blocks=949"),
+                            "重启后 info → free_blocks=949"))
+
+            kifs_run("kifs cat /w/a.txt")
+            results.append(("重启后内联文件持久化", has("hello kernel"),
+                            "重启后 cat /w/a.txt → hello kernel"))
+
+            kifs_run("kifs stat /w/copy.bin")
+            results.append(("重启后多块文件持久化",
+                            has("size=12801 bytes") and has("start=11 blocks=4"),
+                            "重启后 copy.bin: size=12801 / extent start=11 blocks=4"))
+
+            kifs_run("kifs ls /w")
+            results.append(("重启后目录项持久化",
+                            has("a.txt") and has("copy.bin") and has("pipe.txt"),
+                            "重启后 ls /w → a.txt / copy.bin / pipe.txt"))
+
+            kifs_run("kifs cat /docs/big.bin")
+            results.append(("删除后重启仍不存在", has("kifs: path not found"),
+                            "重启后 cat /docs/big.bin → path not found"))
+
+            kifs_run("kifs stat /ext/aaa.txt")
+            results.append(("extent 目录写入重启后仍在",
+                            has("oid=4") and has("size=1 bytes"),
+                            "重启后 stat /ext/aaa.txt → oid=4 size=1"))
+
+            kifs_run("kifs journal")
+            results.append(("重启恢复后 journal 无 pending",
+                            has("state=END") and not has("state=COMMIT"),
+                            "重启后 journal 全部 state=END(挂载时回收残留事务)"))
+
+            # ---- 宿主侧字节级交叉验证:从设备盘里 dd 出 KiFS 分区 ----
+            stop_qemu()
+            part = os.path.join(tempfile.gettempdir(),
+                                f"kkernel-kifs-part-{os.getpid()}.img")
+            with open(img_copy, "rb") as f:
+                f.seek(22528 * 512)                    # KiFS_PART_LBA
+                open(part, "wb").write(f.read(4 * 1024 * 1024))
+            host_tool = os.environ.get(
+                "KIFS_HOST_TOOL", "/home/kai/AgentWorkSpace/kifs/tools/mkifs.py")
+            read_out = os.path.join(tempfile.gettempdir(),
+                                    f"kkernel-kifs-read-{os.getpid()}.bin")
+
+            def host_tool_run(*args):
+                return subprocess.run([sys.executable, host_tool, *args],
+                                      capture_output=True, text=True)
+
+            r = host_tool_run("fsck", part)
+            results.append(("宿主 mkifs.py fsck 通过", r.returncode == 0,
+                            (r.stdout.strip().splitlines() or [r.stderr.strip()])[-1]))
+
+            def host_read(path: str):
+                if os.path.exists(read_out):
+                    os.unlink(read_out)
+                r = host_tool_run("read", part, path, "--out", read_out)
+                if r.returncode != 0 or not os.path.exists(read_out):
+                    return None
+                with open(read_out, "rb") as f:
+                    return f.read()
+
+            data = host_read("/w/copy.bin")
+            results.append(("宿主读回多块文件字节一致",
+                            data == bytes(range(256)) * 50 + b"\n",
+                            "宿主 read /w/copy.bin == big.bin + '\\n'(12801 B)"))
+
+            data = host_read("/w/a.txt")
+            results.append(("宿主读回内联文件字节一致", data == b"hello kernel",
+                            "宿主 read /w/a.txt == b'hello kernel'"))
+
+            data = host_read("/ext/aaa.txt")
+            results.append(("extent 父目录写入宿主持久化", data == b"s",
+                            "宿主 read /ext/aaa.txt == b's'"))
+
+            r = host_tool_run("ls", part, "/ext")
+            ls_lines = r.stdout.splitlines()
+            pos = [i for i, ln in enumerate(ls_lines)
+                   if "aaa.txt" in ln or "alpha.txt" in ln]
+            results.append(("目录项按名字排序落盘",
+                            r.returncode == 0 and len(pos) == 2
+                            and "aaa.txt" in ls_lines[pos[0]],
+                            "宿主 ls /ext → aaa.txt 排在 alpha.txt 前"))
+
+            r = host_tool_run("stat", part, "/docs/big.bin")
+            results.append(("宿主看不到已删文件", r.returncode != 0,
+                            "宿主 stat /docs/big.bin 报错(文件已删)"))
+
+            for tmp in (part, read_out):
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+
+            # ---- 崩溃恢复:宿主把事务停在 COMMIT / BEGIN 之后(模拟掉电) ----
+            #   完整事务(BEGIN+记录+COMMIT,还没应用)→ 内核挂载时必须重放,再补 END;
+            #   残缺事务(只有 BEGIN)→ 只回收槽位(写 END),不能应用。
+            def build_crash_image(tag: str, text: str, crash: str):
+                cimg = os.path.join(tempfile.gettempdir(),
+                                    f"kkernel-kifs-crash{tag}-{os.getpid()}.img")
+                chd = os.path.join(tempfile.gettempdir(),
+                                   f"kkernel-kifs-crash{tag}hd-{os.getpid()}.img")
+                for tmp in (cimg, chd):
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                for step in (("format", "--size-mib", "4", "--label", "KCRASH"),
+                             ("mkdir", "/d"),
+                             ("write", "/d/f.txt", "--data", "old")):
+                    r = subprocess.run(
+                        [sys.executable, host_tool, step[0], cimg, *step[1:]],
+                        capture_output=True, text=True)
+                    if r.returncode != 0:
+                        return None
+                env = dict(os.environ, KIFS_CRASH=crash)
+                r = subprocess.run(
+                    [sys.executable, host_tool, "write", cimg,
+                     "/d/f.txt", "--data", text],
+                    capture_output=True, text=True, env=env)
+                if r.returncode != 2:          # 宿主用 SystemExit(2) 模拟崩溃
+                    return None
+                shutil.copyfile(img_copy, chd)
+                with open(chd, "r+b") as f:
+                    f.seek(22528 * 512)
+                    with open(cimg, "rb") as g:
+                        f.write(g.read())
+                return cimg, chd
+
+            def crash_case(tag: str, text: str, crash: str,
+                           expect: str, label: str) -> None:
+                built = build_crash_image(tag, text, crash)
+                results.append((label + ":制造崩溃盘", built is not None,
+                                f"宿主 KIFS_CRASH={crash} 留下 pending 事务"))
+                if built is None:
+                    return
+                cimg, chd = built
+                boot_image(chd, tag)
+                kifs_run("kifs cat /d/f.txt")
+                results.append((label + ":读内容", has(expect),
+                                f"cat /d/f.txt → {expect}"))
+                kifs_run("kifs journal")
+                results.append((label + ":journal",
+                                has("state=END") and not has("state=COMMIT"),
+                                "journal → state=END(残留事务已重放/回收)"))
+                stop_qemu()
+                cpart = chd + ".part"
+                with open(chd, "rb") as f:
+                    f.seek(22528 * 512)
+                    open(cpart, "wb").write(f.read(4 * 1024 * 1024))
+                r = host_tool_run("fsck", cpart)
+                results.append((label + ":宿主 fsck", r.returncode == 0,
+                                (r.stdout.strip().splitlines() or [r.stderr.strip()])[-1]))
+                for tmp in (cimg, chd, cpart):
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+
+            crash_case("-3", "recovered content", "after_commit",
+                       "recovered content", "重放已提交事务")
+            crash_case("-4", "should not appear", "after_begin",
+                       "old", "回收残缺事务")
+
             return report(results)
 
         if kbd_mode:

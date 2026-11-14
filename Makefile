@@ -317,7 +317,7 @@ test-hd-font: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 #   宿主 mkifs.py 造 4 MB KiFS 镜像(带内联文件/多块文件/超 92 B 目录),
 #   dd 到 HD 镜像 LBA 22528(正好在 FAT16 分区尾巴后面,不覆盖),QEMU 里敲命令组。
 test-kifs: $(PROG_BINS) font/full-kkf.bin
-	@echo "── KiFS 内核只读驱动:固定分区 LBA 22528,info / ls / cat / stat ──"
+	@echo "── KiFS 内核读写驱动(Phase C1):固定分区 LBA 22528,journal+CoW 写路径 ──"
 	$(MAKE) -s -B $(HDIMG)
 	@test -f $(KIFS_HOST_TOOL) || { echo "test-kifs: 找不到宿主工具 $(KIFS_HOST_TOOL)(先用 git 拉 kifs 仓库)"; exit 1; }
 	python3 $(KIFS_HOST_TOOL) format $(KIFS_IMG) --size-mib 4 --label KKIFS
