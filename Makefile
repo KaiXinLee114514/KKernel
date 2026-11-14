@@ -41,6 +41,13 @@ BUILD   := build
 IMG     := $(BUILD)/kkernel.img
 # 硬盘镜像(16 MB,带完整字库)
 HDIMG   := $(BUILD)/kkernel-hd.img
+# KiFS 内核只读驱动(Phase B0)用的测试镜像:
+#   16 MB 盘 = FAT16 分区 6144 起 8 MB(到 LBA 22528 结束)+ 后面 4 MB 留给 KiFS 分区。
+#   宿主工具 mkifs.py 是格式的权威实现;内核 kifs.asm 以它生成的镜像为准自测。
+KIFS_IMG  := $(BUILD)/kifs-test.img
+KIFS_BIG  := $(BUILD)/kifs-big.bin
+KIFS_HOST_TOOL ?= /home/kai/AgentWorkSpace/kifs/tools/mkifs.py
+KIFS_LBA  := 22528
 # QMP socket:`make hd` / `make hd32` 把它开在这儿,
 # tools/text2alt.py --send 就靠它把中文/日文/韩文打进去(见该脚本的说明)
 QMP_SOCK := $(BUILD)/qmp.sock
@@ -116,7 +123,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-hd32 div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -305,6 +312,29 @@ test-hd-font: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── 硬盘镜像:磁盘字库 + FAT16 读写 + 计算器 + 编辑器 ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin
+
+# KiFS 只读驱动(Phase B0)真盘测试:
+#   宿主 mkifs.py 造 4 MB KiFS 镜像(带内联文件/多块文件/超 92 B 目录),
+#   dd 到 HD 镜像 LBA 22528(正好在 FAT16 分区尾巴后面,不覆盖),QEMU 里敲命令组。
+test-kifs: $(PROG_BINS) font/full-kkf.bin
+	@echo "── KiFS 内核只读驱动:固定分区 LBA 22528,info / ls / cat / stat ──"
+	$(MAKE) -s -B $(HDIMG)
+	@test -f $(KIFS_HOST_TOOL) || { echo "test-kifs: 找不到宿主工具 $(KIFS_HOST_TOOL)(先用 git 拉 kifs 仓库)"; exit 1; }
+	python3 $(KIFS_HOST_TOOL) format $(KIFS_IMG) --size-mib 4 --label KKIFS
+	python3 $(KIFS_HOST_TOOL) mkdir $(KIFS_IMG) /docs
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /docs/hello.txt --data "hello from KiFS"
+	python3 -c 'open("$(KIFS_BIG)","wb").write(bytes(range(256))*50)'
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /docs/big.bin --from $(KIFS_BIG)
+	python3 $(KIFS_HOST_TOOL) mkdir $(KIFS_IMG) /ext
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /ext/alpha.txt --data "alpha"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /ext/beta.txt --data "beta"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /ext/delta.txt --data "delta"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /ext/epsilon.txt --data "epsilon"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /ext/gamma.txt --data "gamma"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_IMG) /ext/zeta.txt --data "zeta"
+	python3 $(KIFS_HOST_TOOL) fsck $(KIFS_IMG)
+	dd if=$(KIFS_IMG) of=$(HDIMG) bs=512 seek=$(KIFS_LBA) conv=notrunc status=none
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --kifs --font font/full-kkf.bin
 
 # 两个"开机就炸"的镜像:自测代码用 -D 开关才编进去,正常镜像里没有
 $(BUILD)/kernel-div.bin: $(KERNEL_SRCS) $(FONT_DEPS) | $(BUILD)

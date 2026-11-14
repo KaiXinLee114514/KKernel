@@ -30,6 +30,8 @@
 ;      (字库/字库临时缓冲:运行时放在恒等映射顶部 ident-2 MiB 的 2 MiB 槽里,不再固定 0x200000)
 ;      0x3B0000-0x3BFFFF PINYIN 拼音表(ime.asm)
 ;      0x3C0000-0x3C1FFF USB 帧列表/QH/TD(usb.asm)
+;      0x3C2000-0x3C2FFF usbdisk 的 4 KiB 数据缓冲(usbdisk.asm)
+;      0x3C3000-0x3C5FFF KiFS 块/目录/record/路径缓冲(kifs.asm;只读驱动)
 ;      0x3D0000-0x3D1FFF 页池位图(pmem.asm;8 KiB,最多记 64512 页 = 252 MiB)
 ;      0x400000-ident    物理页池(pmem.asm 的位图分配器;上界按 RAM 自适应,最大 252 MiB)
 ;      0xFD000000…       VBE 线性帧缓冲(页表按 4 MiB 窗口映射,真实基址看 fb_phys)
@@ -421,6 +423,7 @@ COL_ERR    equ 0x0C                    ; 亮红
 
     ; ---- 文件系统 + 程序接口 ----
     call fat_mount
+    call kifs_init                      ; KiFS 只读驱动探测(没镜像时静默失败,不影响启动)
     call api_install
     cmp byte [fat_ok], 0
     je .fs_none_print

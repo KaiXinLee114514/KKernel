@@ -3919,6 +3919,7 @@ n_ps     db 'ps', 0
 n_spawn  db 'spawn', 0
 n_kill   db 'kill', 0
 n_rc     db 'rc', 0
+n_kifs   db 'kifs', 0
 n_fmt_ymd  db 'ymd', 0
 n_fmt_mdy  db 'mdy', 0
 n_fmt_dmy  db 'dmy', 0
@@ -4059,6 +4060,7 @@ cmd_table:
     dd n_spawn,  cmd_spawn
     dd n_kill,   cmd_kill
     dd n_rc,     cmd_rc
+    dd n_kifs,   cmd_kifs
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -4169,6 +4171,7 @@ msg_help db \
     'pci [b:s.f]   list the PCI devices on bus 0, or show one in detail', 10, \
     'usb           UHCI controller / ports / USB keyboard status', 10, \
     'usbdisk       USB mass storage (read-only): info / read <lba> / hexdump <lba> / mbr / sense', 10, \
+    'kifs          KiFS read-only driver: info|ls|cat|stat', 10, \
     'ps            list threads (id / name / ticks / runs / *prog = has a program)', 10, \
     'spawn [who]   start a demo kernel thread (no arg = alpha, then beta)', 10, \
     'kill <id>     kill a thread, or stop the program a shell is running', 10, \

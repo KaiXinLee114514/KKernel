@@ -93,6 +93,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 | **/DEV 设备抽象层** | 「一切皆文件」的最小版:`DEV/` 开头的名字不查磁盘,改查内核设备表 —— `DEV/NULL`(黑洞)/`DEV/ZERO`(零)/`DEV/RANDOM`(伪随机)/`DEV/RTC`(实时时钟)/`DEV/CON`(写屏幕)/`DEV/DEVICES`(列设备);`cat`/`write` 和 `int 0x30` 的读写接口共用同一批 handler,C 程序 `fopen("DEV/RTC")` 直接能读(见 [docs/devices.md](docs/devices.md)) |
 | **管道(pipe)** | `A | B` 把 A 的屏幕输出接给 B 的 stdin(顺序执行,不需要并发):最多 4 段,缓冲从物理页池现借现还(64 KB/16 KB/4 KB 逐级降,页池不够就报错不崩);内建命令和 `run PROG` 都能当管道段;配 `WC` / `UPPER` / `GREP` / `HEAD` 四个 C 小工具,见 [docs/pipes.md](docs/pipes.md) |
 | **USB 大容量储存(只读裸盘)** | 插一个 U 盘(或 QEMU 的 `usb-storage`),`usbdisk` 一条命令就能看它是什么、读任意扇区、解 MBR 分区表:内核里是 UHCI 控制器 + **Bulk-Only Transport**(CBW/CSW)+ **SCSI 最小集**(INQUIRY / TEST UNIT READY / READ CAPACITY / READ(10) / REQUEST SENSE);只读、裸扇区,不接 FAT 也不写盘。`usbdisk` / `usbdisk read <lba>` / `usbdisk hexdump <lba>` / `usbdisk mbr` / `usbdisk sense`(见 [docs/usb-disk.md](docs/usb-disk.md)) |
+| **KiFS 只读驱动(Phase B0)** | 在 IDE 盘**固定分区 LBA 22528**(16 MB 盘里 FAT16 分区正好在 22528 结束)上认宿主工具 `mkifs.py` 造的 KiFS 卷:校验 superblock(**魔数/版本/CRC32**)+ 按目录项逐段遍历路径 + 读**内联或 extent** 文件;`kifs info` / `kifs ls [路径]` / `kifs cat <路径>` / `kifs stat <路径>` 四个子命令。只读(不写盘、不重放 journal、不挂 VFS),盘上没有 KiFS 卷时**静默不打扰**(见 `kernel/kifs.asm`) |
 | **跑磁盘上的程序** | `run HELLO`:从磁盘读进来 → 给这个程序**建一套自己的页目录**(私有页,见下) → 切 CR3 → 执行(镜像超 384 KB 直接拒绝),程序用 `int 0x30` 调用内核(见 [docs/programs.md](docs/programs.md)) |
 | **程序接口 17 个功能** | 打印/颜色/收键 + 清屏、读写文件、定位光标、读键事件(方向键)、屏幕尺寸、程序参数、定位画字、**蜂鸣器(14 号 `beep`)**、**读 stdin(17 号 `j_pipe_read`,管道右半边用)** —— 够写全屏程序,还够唱一首 |
 | **组件:计算器** | `run CALC`:`+ - * /`、小数点、平方,自己实现定点小数(6 位小数),除零/溢出都会报错 |
@@ -127,6 +128,7 @@ make hd                 # 完整硬盘镜像:字库 + FAT16 + 示例程序(推�
 #   开机那两行算是它的墓碑:一行说"完整功能请用硬盘版",一行是 `Goodbye Floppy disk`。
 #   它没有真的死掉 —— 每次 make test 都还会把这块镜像拉出来跑一遍,守那条最老的 BIOS 退路。
 make test               # 无头自动化测试:8 组,全过会打 ✅
+make test-kifs          # KiFS 只读驱动测试(需宿主 KiFS 仓库的 mkifs.py,不在 8 组里)
 make clean              # 清掉 build/
 
 ./tools/run.sh          # 启动脚本:自动构建 + 选"怎么挂盘"
@@ -184,7 +186,7 @@ qemu-system-i386 -machine pcspk-audiodev=snd0 -audiodev pa,id=snd0,out.stream-na
 VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issues.md](docs/known-issues.md))。
 谱子怎么写、怎么改自己的歌:[docs/quickstart.md](docs/quickstart.md)。
 
-`make test` 的 8 组(每组都真的启动 QEMU、抓屏、断言屏幕内容):
+`make test` 的 8 组(每组都真的启动 QEMU、抓屏、断言屏幕内容;表里最后一行是**单独跑**的额外目标):
 
 | 目标 | 测什么 |
 |---|---|
@@ -196,14 +198,28 @@ VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issue
 | `test-shell` | 敲 `help`/`info`/`page`/`echo`/`clear`,验证命令、滚屏、清屏、中文、UTF-8 边界 |
 | `test-hd-font` | 硬盘镜像:字库从磁盘读、`ls`/`cat`/`write`/`run`、**计算器的八组算式**、**编辑器的敲字/存盘/退出**,最后**离线解析镜像**证明字节真落盘 |
 | `test-usb` | QEMU 挂一个假 U 盘(`usb-storage`),断言设备识别 / 容量 / READ(10) 读扇区 / MBR 分区表 / REQUEST SENSE |
+| `test-kifs` | **单独跑**(不在 `make test` 里):宿主 `mkifs.py` 造 4 MB KiFS 镜像 `dd` 到 IDE 盘 LBA 22528,断言 `kifs info` / `ls` / `cat` / `stat` 的屏幕输出与错误文案 |
 
 最后那一项有两套独立的验证手段:一套看屏幕像素(把期望的文字用字库渲染成图案再去截图里找),
 一套在 QEMU 关掉之后**直接解析镜像文件的 FAT 分区**(FAT16/FAT32 都认,不信内核自己打印的"写成功了")。
 
 ```bash
 make test-hd-font  # 单独跑某一组
+make test-kifs     # KiFS 只读驱动(需要 /home/kai/AgentWorkSpace/kifs 仓库里的 mkifs.py)
 make div           # 构建"开机就除零"的镜像,自己开着 QEMU 看 panic 屏
 python3 tests/qemu_test.py build/kkernel-hd.img --hda --dump   # 只把屏幕打出来,不做断言
+```
+
+**KiFS 手动试**(不想跑整套断言时;内核只读、镜像随便造):
+
+```bash
+make -s -B build/kkernel-hd.img
+KIFS=/home/kai/AgentWorkSpace/kifs/tools/mkifs.py
+python3 $KIFS format build/kifs-test.img --size-mib 4        # 4 MB 空卷
+python3 $KIFS mkdir build/kifs-test.img /docs
+python3 $KIFS write build/kifs-test.img /docs/hello.txt --data "hello from KiFS"
+dd if=build/kifs-test.img of=build/kkernel-hd.img bs=512 seek=22528 conv=notrunc
+make hd   # 起来后敲:kifs info / kifs ls / / kifs cat /docs/hello.txt / kifs stat /docs/hello.txt
 ```
 
 ## 3. 源码地图
@@ -233,6 +249,7 @@ kernel/fontdisk.asm    启动时把完整字库从磁盘读进 0x200000(读不�
 kernel/fat.asm         FAT16/FAT32:挂载(BPB 自动判)/找文件/读/写/删(rm/rmdir)/列目录/子目录
 kernel/dev.asm         /DEV 设备抽象层:设备表 + 名字解析 + 六个虚拟设备(devices.md)
 kernel/usbdisk.asm     USB 大容量储存:bulk 传输 + BOT + SCSI 只读裸扇区(usb-disk.md)
+kernel/kifs.asm        KiFS 只读驱动(Phase B0):固定分区 LBA 22528、superblock CRC32、目录遍历、inline/extent 读
 kernel/api.asm         int 0x30 程序接口(打印字符串/数字/码位、设颜色、等按键)
 kernel/speaker.asm     PC 蜂鸣器:14 号 beep(PIT 通道 2 定音高 + 0x61 开关扬声器,毫秒是忙等估的)
 kernel/shell.asm       shell:行编辑、命令解析、各命令实现
@@ -289,6 +306,7 @@ tests/probe_disk.asm   探针:实测"软盘到底支不支持 LBA 读"(见第 6 
 0x3B0000 - 0x3BFFFF   PINYIN 拼音表(ime.asm,最多 60 KiB)
 0x3C0000 - 0x3C1FFF   USB 帧列表/QH/TD(usb.asm)
 0x3C1200 - 0x3C2FFF   USB bulk QH/TD + BOT/CBW/CSW/数据缓冲(usbdisk.asm)
+0x3C3000 - 0x3C5FFF   KiFS 块/目录/record/路径缓冲(kifs.asm,只读驱动;Phase B0)
 0x3D0000 - 0x3D1FFF   页池位图(8 KiB)          (pmem.asm,PMEM_BITMAP;最多记 64512 页 = 252 MiB)
 0x400000 - ident      物理页池(4 MiB ~ 恒等映射上限;上界按 RAM 自适应,最大 252 MiB)
 0xFD000000            VBE 线性帧缓冲(单独挂一张页表,映射到它所在的 4 MiB 窗口)

@@ -692,12 +692,13 @@ def main() -> int:
     hd_mode = "--fontdisk" in argv          # 硬盘镜像:磁盘字库 + FAT16 + 跑程序
     fat32_mode = "--fat32" in argv          # 同一个内核,但分区是 FAT32(镜像得开大)
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
+    kifs_mode = "--kifs" in argv            # KiFS 内核只读驱动:固定分区 LBA 22528
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk")]
+                         "--fontdisk", "--fat32", "--usbdisk", "--kifs")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -838,6 +839,74 @@ def main() -> int:
             usb_run("usbdisk sense")
             results.append(("REQUEST SENSE", has("sense: rc=0x70"),
                             "sense: rc=0x70 key=0x00 asc=0x00 ascq=0x00"))
+            return report(results)
+
+        if kifs_mode:
+            # ---- KiFS 内核只读驱动(Phase B0):宿主 mkifs.py 造的镜像 ----
+            #   分区固定烧在 IDE 盘 LBA 22528(16 MB 盘里 FAT16 分区之后),
+            #   测的是内核 kifs.asm:superblock 校验 / 目录遍历 / 内联 + extent 读取。
+            results = []
+            time.sleep(1.0)
+
+            def kifs_run(line: str, wait: float = 1.6) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            kifs_run("kifs info")
+            results.append(("superblock:magic/版本",
+                            has("magic=KIFS") and has("version=0x00010000"),
+                            "kifs info → magic=KIFS version=0x00010000"))
+            results.append(("superblock:布局/卷标",
+                            has("block_size=4096") and has("total_blocks=1024")
+                            and has("root_oid=1") and has("label=KKIFS"),
+                            "block_size=4096 / total_blocks=1024 / root_oid=1 / label=KKIFS"))
+
+            kifs_run("kifs ls /")
+            results.append(("根目录列出 docs/ext",
+                            has("docs") and has("ext") and has("rwxr-xr-x"),
+                            "ls / → docs / ext(目录权限 rwxr-xr-x)"))
+
+            kifs_run("kifs cat /docs/hello.txt")
+            results.append(("内联文件 cat", has("hello from KiFS"),
+                            "cat /docs/hello.txt → hello from KiFS"))
+
+            kifs_run("kifs ls /docs")
+            results.append(("目录 ls /docs",
+                            has("hello.txt") and has("big.bin") and has("rw-r--r--"),
+                            "/docs 有 hello.txt / big.bin,文件权限 rw-r--r--"))
+
+            kifs_run("kifs stat /docs/hello.txt")
+            results.append(("stat 内联文件",
+                            has("oid=3") and has("type=file") and has("size=15 bytes")
+                            and has("inline_len=15"),
+                            "oid=3 / type=file / size=15 bytes / inline_len=15"))
+
+            kifs_run("kifs stat /docs/big.bin")
+            results.append(("stat 多块文件",
+                            has("size=12800 bytes") and has("blocks=4")
+                            and has("extents=1") and has("start=5 blocks=4"),
+                            "big.bin: size=12800 / blocks=4 / extents=1 (start=5 blocks=4)"))
+
+            kifs_run("kifs ls /ext")
+            results.append(("extent 目录 /ext",
+                            has("alpha.txt") and has("epsilon.txt") and has("zeta.txt"),
+                            "/ext 内容(112 B)走 extent 读出:alpha.txt…zeta.txt"))
+
+            kifs_run("kifs cat /ext/zeta.txt")
+            results.append(("extent 目录里的文件", has("zeta"),
+                            "cat /ext/zeta.txt → zeta"))
+
+            kifs_run("kifs cat /nope")
+            results.append(("路径不存在", has("kifs: path not found"),
+                            "cat /nope → kifs: path not found"))
+            kifs_run("kifs cat /docs")
+            results.append(("cat 目录 → 不是文件", has("kifs: not a file"),
+                            "cat /docs → kifs: not a file"))
+            kifs_run("kifs ls /docs/hello.txt")
+            results.append(("ls 文件 → 不是目录", has("kifs: not a directory"),
+                            "ls /docs/hello.txt → kifs: not a directory"))
             return report(results)
 
         if kbd_mode:

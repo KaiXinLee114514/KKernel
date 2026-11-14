@@ -25,6 +25,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "pci.asm"                       ; PCI 总线枚举(USB 的前置工作)
 %include "usb.asm"                       ; UHCI + HID 键盘(第一步,只有键盘)
 %include "usbdisk.asm"                    ; USB 大容量储存(只读裸盘)
+%include "kifs.asm"                     ; KiFS 只读驱动(Phase B0;固定 LBA 22528,没挂 VFS)
 %include "fontdisk.asm"                  ; 从磁盘加载完整字库
 %include "fat.asm"                       ; FAT16 文件系统
 %include "dev.asm"                       ; /DEV 设备抽象层(虚拟设备:NULL/ZERO/RTC/...)
