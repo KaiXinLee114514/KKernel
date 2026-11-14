@@ -222,6 +222,8 @@ pinyin:
 #    /SYS   配置与数据(RC.CONF/拼音表)    /DOCS  文档与演示文本
 #    /SRC   C 源码示例                    /TEST  测试用(大目录/长名/子目录程序)
 # ---------------------------------------------------------------------------
+TCCINC_FILES := $(foreach h,$(notdir $(wildcard tccinc/*.h)),INCLUDE/$(h)=tccinc/$(h))
+
 MKFAT_FILES := BIN/ BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    $(foreach p,$(PROGS) $(C_PROGS),BIN/$(p)=$(BUILD)/$(p)) \
 	    LIB/ LIB/CRT_TCC.O=$(CRT_TCC_OBJ) LIB/MINIC.O=$(MINIC_OBJ) \
@@ -229,19 +231,21 @@ MKFAT_FILES := BIN/ BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    DOCS/ DOCS/README.TXT=progs/README.TXT DOCS/NOTES.TXT=progs/NOTES.TXT \
 	    DOCS/ZH.TXT=progs/ZH.TXT DOCS/EN.TXT=progs/EN.TXT DOCS/JPKR.TXT=progs/JPKR.TXT \
 	    DOCS/NOTE.TXT=progs/NOTES.TXT DOCS/Long_Note.txt=progs/NOTES.TXT \
-	    SRC/ SRC/T1.C=progs/T1.C SRC/T2.C=progs/T2.C \
+	    SRC/ SRC/T1.C=progs/T1.C SRC/T2.C=progs/T2.C SRC/TCC_INC.C=progs/TCC_INC.C \
 	    TEST/ TEST/HELLO.BIN=$(BUILD)/HELLO.BIN TEST/LONGNAME_TEST.txt=progs/README.TXT \
 	    TEST/BIGDIR/ $(BIGDIR_SPECS) \
 	    DEV/ DEV/README.TXT=progs/DEV_README.TXT \
 	    DEV/NULL=progs/DEV_NODE.txt DEV/ZERO=progs/DEV_NODE.txt \
 	    DEV/RANDOM=progs/DEV_NODE.txt DEV/RTC=progs/DEV_NODE.txt \
 	    DEV/CON=progs/DEV_NODE.txt DEV/DEVICES=progs/DEV_NODE.txt \
-	    MNT/ MNT/README.TXT=progs/UPDATE_SOON.txt
+	    MNT/ MNT/README.TXT=progs/UPDATE_SOON.txt \
+	    INCLUDE/ $(TCCINC_FILES)
 
 $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
           $(PINYIN_BIN) $(BUILD)/TCC.BIN \
           $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
-          progs/DEV_README.TXT progs/DEV_NODE.txt tools/mkimg.py tools/mkfat.py \
+          progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
+          $(wildcard tccinc/*.h) \
           $(BUILD)/bigdir/.stamp
 	python3 tools/mkimg.py $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(HDIMG) font/full-kkf.bin
 	python3 tools/mkfat.py $(HDIMG) 6144 8 $(MKFAT_FILES)
@@ -258,7 +262,8 @@ HD32IMG := $(BUILD)/kkernel-hd32.img
 
 $(HD32IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
             $(PINYIN_BIN) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
-            progs/DEV_README.TXT progs/DEV_NODE.txt tools/mkimg.py tools/mkfat.py \
+            progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
+            $(wildcard tccinc/*.h) \
             $(BUILD)/bigdir/.stamp
 	python3 tools/mkimg.py $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(HD32IMG) \
 	    font/full-kkf.bin --disk-mb 96

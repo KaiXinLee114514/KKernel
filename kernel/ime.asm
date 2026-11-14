@@ -346,6 +346,17 @@ ime_draw_bar:
 .eol:
     mov esi, msg_ime_hint_end_bar
     call ime_put_str
+    ; ---- 第二行:拼音回显(候选占第一行,拼音占第二行,谁也不挤谁) ----
+    mov eax, [ime_row]
+    inc eax
+    mov [ime_row], eax
+    mov dword [ime_col], 0
+    mov al, COL_NORMAL
+    call term_set_color
+    mov esi, msg_ime_pinyin_bar
+    call ime_put_str
+    mov esi, ime_buf
+    call ime_put_str
     mov dword [fb_no_lb], 0
     popad
     ret
@@ -581,6 +592,7 @@ msg_ime_hint    db ' 1-9 pick  space pick first', 0
 msg_ime_page    db '  ,/. page ', 0
 msg_ime_hint_end db ' Esc cancel', 10, 0
 msg_ime_hint_end_bar db ' Esc cancel', 0   ; 悬浮条用:末尾不带换行
+msg_ime_pinyin_bar db '拼音: ', 0          ; 悬浮条第二行:拼音回显
 ime_slash       db '/', 0
 ime_row         dd 0                    ; 悬浮条那行的字符行号
 ime_col         dd 0                    ; 画到第几列(会随画随推进)

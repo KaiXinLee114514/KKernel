@@ -20,7 +20,7 @@
 ![KKernel shell](docs/screenshot.png) ![中文显示(cat DOCS/ZH.TXT)](docs/screenshot-zh.png)
 
 > 注:这几张截图拍自**早期版本** —— 项目当时还叫 JoyOS,文件也都摊在根目录。
-> 现在它叫 KKernel,文件收进了 `/BIN /LIB /SYS /DOCS /SRC /TEST /DEV /MNT` 八个分类目录
+> 现在它叫 KKernel,文件收进了 `/BIN /LIB /SYS /DOCS /SRC /TEST /DEV /MNT /INCLUDE` 九个分类目录
 > (`run HELLO` 这类命令不变,shell 会自动去 `/BIN` 找)。功能和界面没变,只是路径不一样;
 > 截图留作早期版本的存档。
 
@@ -84,7 +84,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 | **提示符样式** | **kao(颜文字,默认:黄色 `(・ω・)`,命令报错时变红 `(；ω；)`)** / **plain(朴素 `>`)** / **moe(萌,粉色的 `かいかーねる>`,报错也换成吐槽)** / **DOS(`C:\>`)** / **C64(`READY.`)**;`style` 命令现场换,也能在 `RC.CONF` 里写 `style = moe`(或 kao/plain/dos/c64)开机就生效 |
 | **ring 3 用户态** | 程序不再由内核 `call` 进去,而是 `iret` 到 **CPL=3**:内核运行时重建 GDT(0x1B 用户代码 / 0x23 用户数据 / 0x28 TSS)+ `ltr` 装 TSS(从 ring 3 掉回内核的栈只能从 TSS 取);程序页表项带 U/S 位,**内核的页它碰不到** —— 故意读内核内存会被页错误干掉、内核自己接着用(`run FAULT` 现场演示);程序结尾照旧 `ret`:内核在用户栈顶压了**弹床页**(0x17F000,三条指令 `int 0x30` 功能号 15 退出),所以现有程序一行都不用改(见 §5) |
 | **rc.conf 服务 / 事件库** | 挂盘里的 `/SYS/RC.CONF` 是**纯 `key=value`**(BSD / OpenRC 那种,不是 systemd 段):`hostname` / `boot_msg` / `autostart` / `on_crash` + `service_N`(程序、参数、启用开关)。`rc` 一条命令管起来:`rc list` 看服务、`rc get KEY` 取值、`rc start N` **把服务当程序跑**(借 `run` 那条路:ring 3 + 按需分页)、`rc reload` 重读刚写的配置;另有**事件账本**:开机 / 读配置 / 服务起停 / 程序跑完 / 程序崩了 / 线程被 kill / 换 shell,每种连 100 Hz 的 tick 一起记 16 条(`rc log`);`autostart=YES` 就是开机按配置跑服务,`on_crash=reboot` 则程序崩了直接重启(见 [docs/rc-conf.md](docs/rc-conf.md)) |
-| **拼音输入法** | 按 **Shift** 切中英;打 `shuang`,**屏幕最底行浮出候选条**「1.双 2.爽 3.霜 …」(不打断正在敲的命令行,选完字拼音原地换成汉字),**数字 1-9 或空格**选字、回车出候选、Esc 取消;一页 9 个、**`,` / `.` 翻页**(提示里有页码)。词表是盘上的 `/SYS/PINYIN.BIN`(6000 常用字,按词频排序,`tools/mkpinyin.py` 生成) |
+| **拼音输入法** | 按 **Shift** 切中英;打 `shuang`,**屏幕最底两行浮出候选条**「1.双 2.爽 3.霜 …」+ 第二行拼音回显(不打断正在敲的命令行,选完字拼音原地换成汉字),**数字 1-9 或空格**选字、回车出候选、Esc 取消;一页 9 个、**`,` / `.` 翻页**(提示里有页码)。词表是盘上的 `/SYS/PINYIN.BIN`(6000 常用字,按词频排序,`tools/mkpinyin.py` 生成) |
 | **实时时钟(CMOS)** | 从 CMOS(`0x70`/`0x71`)读日期/时间/星期:等 UIP 清零 + **读两遍比对**(正好翻秒就重试,最多 3 遍)、BCD→二进制、12 小时制的 PM 位也认、世纪没有就按 20xx 猜;`date` 一条命令看时间,`date ymd` / `mdy` / `dmy` / `time` 换格式(见第 7 节) |
 | **PCI 总线枚举** | 开机扫 bus 0:`pci` 列出机器上所有设备(厂商:设备号 / 类别名 / 中断号),`pci 0:1.2` 看单台设备详情(类别、命令寄存器、六个 BAR 是内存还是 I/O、内存 BAR 多大);配置空间走 **机制 #1**(`0xCF8` 地址 / `0xCFC` 数据),多功能设备的"兄弟功能"也会一起扫出来 —— 这是 USB 的前置工作(见 [docs/pci.md](docs/pci.md)) |
 | **ATA 驱动** | 直接操作 `0x1F0~0x1F7` 的 PIO 读写硬盘(分块 + 每扇区等 DRQ + FLUSH CACHE),见 [docs/filesystem.md](docs/filesystem.md) |
@@ -97,6 +97,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 | **程序接口 17 个功能** | 打印/颜色/收键 + 清屏、读写文件、定位光标、读键事件(方向键)、屏幕尺寸、程序参数、定位画字、**蜂鸣器(14 号 `beep`)**、**读 stdin(17 号 `j_pipe_read`,管道右半边用)** —— 够写全屏程序,还够唱一首 |
 | **组件:计算器** | `run CALC`:`+ - * /`、小数点、平方,自己实现定点小数(6 位小数),除零/溢出都会报错 |
 | **组件:文本编辑器** | `run EDIT [文件名]`:全屏编辑,可见光标(亮绿 `_`)、方向键/Home/End/Delete/PgUp/PgDn、`Ctrl-S` 存盘、`Ctrl-F` 查找(大小写不敏感、找完自动绕回开头,再按一次找下一个)、`Ctrl-Q` 退出;`Shift` 切换中/英输入法(中文下 a-z 打拼音、空格/回车出候选、1-9 选字、`,/.` 翻页、`Esc` 取消,和 shell 里同一份 `/SYS/PINYIN.BIN`);退格/Delete 按 UTF-8 整字符删,不会留半个字 |
+| **组件:系统内 C 编译器(TCC 移植)** | `run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o` 在系统里编译 C;系统头文件在 `/INCLUDE`(仓库 `tccinc/`,含 stdio/stdlib/string/ctype/stdint/limits/errno/time/unistd + TCC 自带 stdarg/stddef 等),`#include <stdio.h>` 可直接用;链接用 `-static -nostdlib` + `LIB/CRT_TCC.O`/`LIB/MINIC.O`,产物是内核 ELF loader 能跑的 ELF(见 [extensions/tcc/README.md](extensions/tcc/README.md)) |
 | **组件:蜂鸣器 + 文本谱播放器(不含示例谱,自备谱文件)** | `run PLAY MYSONG.TXT`:PC 喇叭按 FAT 上的**纯文本谱**唱歌(注释、音名 `C4`~`B5` 带 `#`、时值、tempo 都能改);`run PLAY --list` 只解析不出声、把谱子打到屏幕上(可测);内核那头就是 14 号 `beep`,忙等标定见 [kernel/speaker.asm](kernel/speaker.asm)(见 [docs/quickstart.md](docs/quickstart.md)) |
 | **键盘扩展键** | `0xE0` 前缀的方向键/Home/End/Del/PgUp/PgDn,还有 Ctrl 组合键(Ctrl-S / Ctrl-Q / Ctrl-F) |
 | **vi(STEVIE 移植)** | `run VI DOCS/NOTES.TXT`:公有领域的 vi 克隆(STEVIE 3.68,vim 的前身),约 10 900 行 C 一行没改,只把平台层换成 `int 0x30` —— 插入模式、方向键、`:w` 存盘、`:q` 退出(移植记在 [docs/vi.md](docs/vi.md)) |
@@ -141,7 +142,7 @@ QEMU_DISPLAY=none ./tools/run.sh   # 无窗口跑
 在硬盘模式里值得敲一遍的:
 
 ```
-> ls                    ← 列当前目录(根目录只有八个分类子目录)
+> ls                    ← 列当前目录(根目录只有九个分类子目录)
 > cat DOCS/README.TXT   ← 读一个 UTF-8 文本文件(里面有中文)
 > run HELLO             ← 跑磁盘上的程序
 > write MY.TXT hello    ← 写文件(真的落到磁盘上)
@@ -153,6 +154,9 @@ QEMU_DISPLAY=none ./tools/run.sh   # 无窗口跑
 > run VI DOCS/NOTES.TXT ← vi(STEVIE 移植):i 进插入模式,ESC 回普通模式,:w 存盘,:q 退出
 > run PLAY MYSONG.TXT   ← 蜂鸣器按文本谱唱歌(谱子自己写,音名/时值/tempo 都在 txt 里)
 > run PLAY --list MYSONG.TXT ← 只解析:把谱子打到屏幕上(不出声,改谱时拿它对答案)
+> run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o  ← 系统内编译(系统头文件在 /INCLUDE)
+> run TCC.BIN -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf
+> run tcc_inc.elf       ← 输出 TCC #include: include works
 > ls BIN                ← 列 /BIN 里的程序(目录显示成 <DIR>)
 > ls DOCS               ← 列 /DOCS 里的文档与演示文本
 > cat DOCS/NOTE.TXT     ← 路径里带目录也行(斜杠/反斜杠都认)
@@ -564,13 +568,14 @@ shell 的意义。
 
 ```
 > shuang
-（屏幕最底行浮出候选条,命令行保持不动）
+（屏幕最底两行浮出候选条,命令行保持不动）
  1.双 2.爽 3.霜 4.塽   1-9 pick  space pick first Esc cancel
+ 拼音: shuang
 > 霜
 ```
 
-选字之后,拼音被原地擦掉、换成汉字,命令行**不换行也不重画**,候选条直接消失。
-候选多于一页时,底行右侧会显示页码,按 `,` / `.` 就地翻页重画候选条:
+选字之后,拼音被原地擦掉、换成汉字,命令行**不换行也不重画**,候选条(两行)直接消失。
+候选多于一页时,第一行右侧会显示页码,按 `,` / `.` 就地翻页重画候选条:
 
 ```
 > xiang
@@ -1261,8 +1266,20 @@ physical     = 0x00400000
 unmapped, gave back 0x00400000  (page returned to the pool; empty page table recycled)
 ```
 
-键盘直接给字节、**没有输入法**,所以命令行本身只能打 ASCII;
-想看中文就用 `cat`(文件里是 UTF-8):`cat DOCS/ZH.TXT` 是现成的演示。
+键盘直接给字节;中文靠 **Shift 切拼音输入法**输入(候选条浮在屏幕最底两行,见 §5);
+也可以直接用 `cat` 看 UTF-8 文件:`cat DOCS/ZH.TXT` 是现成的演示。
+
+想在系统里自己编程序,可以跑 TCC(系统内 C 编译器):
+
+```
+> run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o
+> run TCC.BIN -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf
+> run tcc_inc.elf        ← TCC #include: include works / sizeof(size_t)=4
+```
+
+系统头文件在镜像的 `/INCLUDE` 里(来自仓库 `tccinc/`),`#include <stdio.h>` / `<string.h>` 这些
+都能用;细节见 [extensions/tcc/README.md](extensions/tcc/README.md)。注意 TCC 按**后缀**认文件,
+命令行里写小写 `.c` / `.o`(FAT 查找大小写不敏感,但 TCC 拿到的是你敲的那个字符串)。
 
 ## 8. 怎么改
 

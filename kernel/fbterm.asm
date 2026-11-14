@@ -18,6 +18,7 @@
 
 FB_CELL_H   equ 16                      ; 字符格高(像素)
 FB_LINE_PAGES equ 13                    ; 行缓冲要的页数:13 × 4096 = 53248 B
+FB_BAR_PAGES  equ FB_LINE_PAGES * 2    ; 悬浮条要的页数(两行,给拼音/候选各留一行)
                                         ;   (800 像素 × 16 扫描行 × 4 B = 51200 B,
                                         ;    多要的那一页是给 pitch 留的余量)
 
@@ -546,10 +547,10 @@ fb_newline:
 ; ---------------------------------------------------------------------------
 ;  悬浮条:把屏幕最后一行临时借来画浮层(输入法候选词),画完把这行像素原样还回去
 ;
-;  fb_bar_begin:刷行缓冲 → 记下借哪一行(如果当前输入行正好在最后一行,往上借一行,
-;               免得把自己正在敲的命令行糊掉)→ 把这行 16 扫描行的像素存进页池缓冲
-;               → 清黑准备画;CF=1 = 没有备用缓冲(低内存),调用方退回老办法
-;  fb_bar_end:  把借来那一行恢复成原样
+;  fb_bar_begin:刷行缓冲 → 借屏幕最后两行(候选一行、拼音一行;输入行落在里面就整体上挪)
+;               → 把这两行 32 个扫描行的像素存进页池缓冲 → 清黑准备画
+;               CF=1 = 没有备用缓冲(低内存),调用方退回老办法
+;  fb_bar_end:  把借来的两行恢复成原样
 ; ---------------------------------------------------------------------------
 fb_bar_begin:
     pushad
@@ -560,31 +561,36 @@ fb_bar_begin:
     call fb_flush                       ; 先把脏行落盘,免得保存到半截像素
     mov eax, [fb_height]
     and eax, ~(FB_CELL_H - 1)
-    sub eax, FB_CELL_H                  ; 屏幕最后一行(字符行号 = y/16)
+    sub eax, FB_CELL_H * 2              ; 最后两行的顶
+.place:
     cmp eax, [fb_cur_y]
-    jne .have_row
-    sub eax, FB_CELL_H                  ; 输入行就在最后一行 → 往上借一行
+    ja .have_row                        ; 悬浮条在光标行上面,安全
+    lea edx, [eax + FB_CELL_H * 2]
+    cmp [fb_cur_y], edx
+    jae .have_row                       ; 光标行在悬浮条下面,安全
+    sub eax, FB_CELL_H                  ; 撞上了:整体往上挪一行
+    jmp .place
 .have_row:
     mov [fb_bar_row], eax
-    ; 保存:16 个扫描行 × pitch 字节
+    ; 保存:32 个扫描行 × pitch 字节
     mov eax, [fb_bar_row]
     imul eax, [fb_pitch]
     mov esi, [fb_phys]
     add esi, eax
     mov edi, [fb_bar_base]
     mov ecx, [fb_pitch]
-    imul ecx, FB_CELL_H
+    imul ecx, FB_CELL_H * 2
     shr ecx, 2
     rep movsd
     mov dword [fb_bar_active], 1
 .clear_only:
-    ; 清黑借来那一行
+    ; 清黑借来的两行
     mov eax, [fb_bar_row]
     imul eax, [fb_pitch]
     mov edi, [fb_phys]
     add edi, eax
     mov ecx, [fb_pitch]
-    imul ecx, FB_CELL_H
+    imul ecx, FB_CELL_H * 2
     shr ecx, 2
     xor eax, eax
     rep stosd
@@ -609,7 +615,7 @@ fb_bar_end:
     add edi, eax
     mov esi, [fb_bar_base]
     mov ecx, [fb_pitch]
-    imul ecx, FB_CELL_H
+    imul ecx, FB_CELL_H * 2
     shr ecx, 2
     rep movsd
     mov dword [fb_bar_active], 0
@@ -642,9 +648,9 @@ fb_init:
     jz .no_lb                           ; 页池没页了 → 退回逐字直写,绝不能挂
     mov [fb_lb_base], eax
 .no_lb:
-    ; ---- 悬浮条缓冲:再要 13 页,用来保存"借来画候选词的那一行"像素 ----
-    ;   (输入法候选条会把屏幕最后一行临时借走,画完原样还回去)
-    mov ecx, FB_LINE_PAGES
+    ; ---- 悬浮条缓冲:再要 26 页(两行),给拼音和候选各留一行 ----
+    ;   (输入法把屏幕最后两行临时借走,画完原样还回去)
+    mov ecx, FB_BAR_PAGES
     call pmem_alloc_pages
     test eax, eax
     jz .no_bar
@@ -689,7 +695,7 @@ fb_dirty_line   dd 0                    ; 脏标志:1 = 缓冲里有没刷进显
 fb_lb_x0        dd 800                  ; 脏段左边界(像素,含)
 fb_lb_x1        dd 0                    ; 脏段右边界(像素,不含)
 ; ---- 悬浮条(输入法候选等)的记账 ----
-fb_bar_base     dd 0                    ; 悬浮条保存缓冲(页池,13 页);0 = 没要到 → 不用悬浮
+fb_bar_base     dd 0                    ; 悬浮条保存缓冲(页池,26 页/两行);0 = 没要到 → 不用悬浮
 fb_bar_row      dd 0                    ; 借的是哪一行(像素 y)
 fb_bar_active   dd 0                    ; 1 = 当前正借着一行
 fb_no_lb        dd 0                    ; 1 = 下一次 fb_blit 绕开行缓冲直接写显存

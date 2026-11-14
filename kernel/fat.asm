@@ -1177,6 +1177,20 @@ fat_path:
     mov byte [edi], 0
     mov dword [pp_cur], path_buf
 
+    ; ---- 1.5) 跳过开头的 '/' 或 '\'(TCC 的系统 include 路径是 /include/...,当相对根目录用)
+    mov ebx, [pp_cur]
+.skip_sep:
+    mov al, [ebx]
+    cmp al, '/'
+    je .adv_sep
+    cmp al, 0x5C
+    jne .sep_done
+.adv_sep:
+    inc ebx
+    jmp .skip_sep
+.sep_done:
+    mov [pp_cur], ebx
+
     ; ---- 2) 一段一段地进目录 ----
 .next:
     mov ebx, [pp_cur]                   ; ebx = 这一段的名字(nasm 里 ebx 最"干净")

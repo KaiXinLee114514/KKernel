@@ -1003,10 +1003,10 @@ def main() -> int:
                              layout.get("pool", ""))
                 return (int(m.group(1), 16), int(m.group(2), 16)) if m else (-1, -1)
             def expected_free_pages():
-                """boot 后页池固定占用:32 页常驻(6 页 + 行缓冲 13 页
-                + 输入法悬浮条还原缓冲 13 页)
+                """boot 后页池固定占用:45 页常驻(6 页 + 行缓冲 13 页
+                + 输入法悬浮条还原缓冲 26 页[两行])
                 + 恒等映射 4 MiB 以上每 4 MiB 一张页表(动态从页池拿)"""
-                return (layout_val("pages") - 32
+                return (layout_val("pages") - 45
                         - (layout_val("ident") // 0x400000 - 1))
             pool_start, pool_end = layout_pool()
             results.append(("layout 行: RAM → 恒等映射 → 页池,大小自洽",
@@ -1203,11 +1203,11 @@ def main() -> int:
                             "page beyond the file (bss at 0x17E000): was zero, as it should be"))
 
             run("debug pmem")
-            # 基线 = 池总页数 - 32(6 页常驻 + 行缓冲 13 页 + 悬浮条缓冲 13 页)
+            # 基线 = 池总页数 - 45(6 页常驻 + 行缓冲 13 页 + 悬浮条缓冲 26 页)
             #        - 恒等映射页表页数(4 MiB 以上每 4 MiB 一张,动态从池里拿)。
             # 这条断言要抓的是"跑完程序没泄漏",数字按 layout 行动态算。
             results.append(("程序退出后页池没泄漏", has(f"free: {expected_free_pages()} pages"),
-                            f"free: {expected_free_pages()} pages(32 页常驻 + 动态页表 {layout_val('ident')//0x400000 - 1} 页)"))
+                            f"free: {expected_free_pages()} pages(45 页常驻 + 动态页表 {layout_val('ident')//0x400000 - 1} 页)"))
 
             # ---- 定时器(PIT):tick 在涨、uptime 读得到、sleep 真的等够 ----
             def uptime_ticks() -> int:
@@ -1652,6 +1652,9 @@ def main() -> int:
             rescan()
             results.append(("输入法:敲拼音出候选", has("1-9 pick") and has("1."),
                             "Shift 切中文、打 shuang、空格 → 出现候选行"))
+            results.append(("输入法:候选条是两行(候选+拼音)",
+                            has("拼音: shuang"),
+                            "候选占一行、拼音回显占第二行(屏幕最底两行)"))
             mon.sendkey("shift")                      # 切回英文(数字选字用例已按用户要求移除)
             time.sleep(0.3)
             run("clear")
@@ -1685,6 +1688,27 @@ def main() -> int:
             rescan()
             results.append(("Ctrl-Q 退出编辑器", has("editor closed."),
                             "editor closed. + 回到 shell"))
+
+            # ---- TCC:系统头文件 include(/INCLUDE) ----
+            run("clear")
+            run("run tcc.bin -c src/tcc_inc.c -o tcc_inc.o", wait=2.5)
+            ok_c = wait_for("program returned to the shell", 30.0)
+            rescan()
+            results.append(("TCC 编译带 #include 的 C 文件",
+                            ok_c and "tcc: error" not in screen_lines(),
+                            "tcc -c + #include <stdio.h>/<string.h> 编译通过"))
+            run("run tcc.bin -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf", wait=2.5)
+            ok_l = wait_for("program returned to the shell", 30.0)
+            rescan()
+            results.append(("TCC 链接带 include 的目标文件",
+                            ok_l and "tcc: error" not in screen_lines(),
+                            "tcc -static -nostdlib 链接出 ELF"))
+            run("run tcc_inc.elf", wait=2.0)
+            results.append(("TCC #include 产物能跑",
+                            wait_for("TCC #include: include works", 30.0)
+                            and wait_for("sizeof(size_t)=4", 10.0),
+                            "运行输出 #include 与 sizeof(size_t)"))
+            run("clear")
 
             # ---- 子目录:路径解析 / cd / mkdir / rmdir / 子目录里读写 ----
             run("ls docs")
@@ -2011,6 +2035,9 @@ def main() -> int:
         if os.path.exists(sock):
             os.unlink(sock)
         if os.path.exists(img_copy):
+            keep = os.environ.get("KKEEP_IMG")
+            if keep:
+                shutil.copyfile(img_copy, keep)   # 调试用:保留跑完的镜像副本
             os.unlink(img_copy)          # 临时副本用完就删
         if usb_img and os.path.exists(usb_img):
             os.unlink(usb_img)           # 假 U 盘镜像也删掉

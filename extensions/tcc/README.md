@@ -16,8 +16,22 @@ Tiny C Compiler 0.9.28rc (<https://github.com/TinyCC/tinycc>) 的 KKernel 移植
   ```
   注意 **必须加 `-static`**（默认动态链接会带 `PT_INTERP /lib/ld-tcc.so.1`，
   KKernel 没有动态链接器）；`-nostdlib` 是因为系统里没有 libc.a/libtcc1.a。
-- 限制：TCC 还不能 include 标准头（磁盘上没部署 include 头文件）；暂不支持
-  动态链接、`-run`、自定义链接脚本。
+- ✅ **支持 `#include <...>`**：镜像里新增 `/INCLUDE` 目录（由仓库 `tccinc/` 的 18 个头文件生成），
+  `#include <stdio.h>` / `<stdlib.h>` / `<string.h>` / `<ctype.h>` / `<stdint.h>` / `<limits.h>` /
+  `<errno.h>` / `<time.h>` / `<unistd.h>` 以及 TCC 自带的 `stdarg.h`/`stddef.h`/`stdbool.h` 等都能用。
+  TCC 对系统头按 `sysinclude_path + "/" + name` 拼路径（`CONFIG_TCC_SYSINCLUDEPATHS "/include"`），
+  内核的 `fat_path` 已支持跳过开头的 `/` 当相对根目录解析 —— 所以 **TCC 源码一行没改**。
+  ```
+  > run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o
+  > run TCC.BIN -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf
+  > run tcc_inc.elf
+  TCC #include: include works
+  sizeof(size_t)=4
+  ```
+  示例源码在 `progs/TCC_INC.C`（镜像里是 `/SRC/TCC_INC.C`）。
+  注意 TCC 按**后缀**认文件类型：命令行里用小写 `.c` / `.o`（FAT 查名字大小写不敏感，
+  但 TCC 拿到的是你敲的那个字符串）。
+- 限制：暂不支持动态链接、`-run`、自定义链接脚本；系统头是最小集（实现以 `lib/minic.c` 为准）。
 
 ## 构建
 
@@ -33,6 +47,14 @@ make hd              # 重建硬盘镜像（TCC.BIN + T1.C 进 FAT16）
 ```
 > run tcc.bin -c t1.c -o t1.o
 > ls          # 能看到 T1.O
+```
+
+带系统头编译（`/INCLUDE` 由 `make` 从仓库 `tccinc/` 生成进镜像）：
+
+```
+> run tcc.bin -c src/tcc_inc.c -o tcc_inc.o
+> run tcc.bin -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf
+> run tcc_inc.elf
 ```
 
 ## 目录
@@ -59,6 +81,7 @@ make hd              # 重建硬盘镜像（TCC.BIN + T1.C 进 FAT16）
 
 ## 已知限制 / 下一步
 
-- TCC 运行时需要的 include 头文件还没部署到磁盘（`-c` 编译不 include 标准头时可用）
+- 系统头是最小集：声明以 `lib/minic.c` 实际实现为准，缺的头文件可以在仓库 `tccinc/` 里补
+  （改完 `make` 就会重新生成镜像里的 `/INCLUDE`）
 - `libtcc1.a`（TCC 自带运行时库）没有
 - 生成的 `.o` 还不能链接成 KKernel 可执行 BIN（需要 linker + ELF loader）
