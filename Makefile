@@ -46,7 +46,7 @@ HDIMG   := $(BUILD)/kkernel-hd.img
 #   宿主工具 mkifs.py 是格式的权威实现;内核 kifs.asm 以它生成的镜像为准自测。
 KIFS_IMG  := $(BUILD)/kifs-test.img
 KIFS_BIG  := $(BUILD)/kifs-big.bin
-KIFS_HOST_TOOL ?= /home/kai/AgentWorkSpace/kifs/tools/mkifs.py
+KIFS_HOST_TOOL ?= /Files/Project/kifs/tools/mkifs.py
 KIFS_LBA  := 22528
 # QMP socket:`make hd` / `make hd32` 把它开在这儿,
 # tools/text2alt.py --send 就靠它把中文/日文/韩文打进去(见该脚本的说明)
@@ -123,7 +123,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-hd32 div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-kifs-crash test-hd32 div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -335,6 +335,16 @@ test-kifs: $(PROG_BINS) font/full-kkf.bin
 	python3 $(KIFS_HOST_TOOL) fsck $(KIFS_IMG)
 	dd if=$(KIFS_IMG) of=$(HDIMG) bs=512 seek=$(KIFS_LBA) conv=notrunc status=none
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --kifs --font font/full-kkf.bin
+
+# KiFS 真断电注入压测(Phase C2):
+#   每轮在 QEMU 里敲一条 kifs write,在写到一半的各个时机直接 SIGKILL(模拟拔电),
+#   再用同一个镜像重启:journal 恢复后文件内容只能是旧值或新值、宿主 fsck 必须过、
+#   盘上不允许留下 OPEN 事务。20 轮随机覆盖 6 种崩溃时机。
+test-kifs-crash: $(PROG_BINS) font/full-kkf.bin
+	@echo "── KiFS 真断电注入压测(Phase C2):20 轮 kill -9,每轮重启验 journal 恢复 ──"
+	$(MAKE) -s -B $(HDIMG)
+	@test -f $(KIFS_HOST_TOOL) || { echo "test-kifs-crash: 找不到宿主工具 $(KIFS_HOST_TOOL)(先用 git 拉 kifs 仓库)"; exit 1; }
+	python3 -u tests/kifs_crash_test.py --img $(HDIMG) --iters 20 --host-tool $(KIFS_HOST_TOOL)
 
 # 两个"开机就炸"的镜像:自测代码用 -D 开关才编进去,正常镜像里没有
 $(BUILD)/kernel-div.bin: $(KERNEL_SRCS) $(FONT_DEPS) | $(BUILD)

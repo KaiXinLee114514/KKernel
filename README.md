@@ -129,6 +129,7 @@ make hd                 # 完整硬盘镜像:字库 + FAT16 + 示例程序(推�
 #   它没有真的死掉 —— 每次 make test 都还会把这块镜像拉出来跑一遍,守那条最老的 BIOS 退路。
 make test               # 无头自动化测试:8 组,全过会打 ✅
 make test-kifs          # KiFS 读写驱动测试(需宿主 KiFS 仓库的 mkifs.py,不在 8 组里)
+make test-kifs-crash    # KiFS 真断电注入压测:每轮 kifs write 写到一半 SIGKILL,重启验恢复(20 轮,约 4 分钟)
 make clean              # 清掉 build/
 
 ./tools/run.sh          # 启动脚本:自动构建 + 选"怎么挂盘"
@@ -199,13 +200,15 @@ VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issue
 | `test-hd-font` | 硬盘镜像:字库从磁盘读、`ls`/`cat`/`write`/`run`、**计算器的八组算式**、**编辑器的敲字/存盘/退出**,最后**离线解析镜像**证明字节真落盘 |
 | `test-usb` | QEMU 挂一个假 U 盘(`usb-storage`),断言设备识别 / 容量 / READ(10) 读扇区 / MBR 分区表 / REQUEST SENSE |
 | `test-kifs` | **单独跑**(不在 `make test` 里):宿主 `mkifs.py` 造 4 MB KiFS 镜像 `dd` 到 IDE 盘 LBA 22528,断言 `kifs` 的 info/ls/cat/stat 与**内核写路径**(mkdir/write/管道 stdin/覆盖/rm/journal);再 `reboot` 重启一次验证持久化,最后从镜像 **dd 出 KiFS 分区**,用宿主 `mkifs.py fsck` + `read` 做**字节级**交叉验证 |
+| `test-kifs-crash` | **单独跑**:真断电注入压测。每轮在 QEMU 里敲一条 `kifs write`,在事务写到一半的各个时机(BEGIN/记录中、COMMIT 已落盘待回放、END 之后……共 6 种)直接 **SIGKILL**,等于物理拔电;然后用**同一个镜像**重启,断言 journal 恢复后文件内容只能是旧值或新值、宿主 `mkifs.py fsck` 必过、盘上不残留 OPEN 事务。20 轮随机覆盖,跑一次约 4 分钟 |
 
 最后那一项有两套独立的验证手段:一套看屏幕像素(把期望的文字用字库渲染成图案再去截图里找),
 一套在 QEMU 关掉之后**直接解析镜像文件的 FAT 分区**(FAT16/FAT32 都认,不信内核自己打印的"写成功了")。
 
 ```bash
 make test-hd-font  # 单独跑某一组
-make test-kifs     # KiFS 读写驱动(需要 /home/kai/AgentWorkSpace/kifs 仓库里的 mkifs.py)
+make test-kifs        # KiFS 读写驱动(需要 /Files/Project/kifs 仓库里的 mkifs.py)
+make test-kifs-crash  # 真断电注入压测(SIGKILL 循环 + 重启验 journal 恢复)
 make div           # 构建"开机就除零"的镜像,自己开着 QEMU 看 panic 屏
 python3 tests/qemu_test.py build/kkernel-hd.img --hda --dump   # 只把屏幕打出来,不做断言
 ```
@@ -214,7 +217,7 @@ python3 tests/qemu_test.py build/kkernel-hd.img --hda --dump   # 只把屏幕打
 
 ```bash
 make -s -B build/kkernel-hd.img
-KIFS=/home/kai/AgentWorkSpace/kifs/tools/mkifs.py
+KIFS=/Files/Project/kifs/tools/mkifs.py
 python3 $KIFS format build/kifs-test.img --size-mib 4        # 4 MB 空卷
 python3 $KIFS mkdir build/kifs-test.img /docs
 python3 $KIFS write build/kifs-test.img /docs/hello.txt --data "hello from KiFS"

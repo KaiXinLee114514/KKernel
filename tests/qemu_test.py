@@ -1073,7 +1073,7 @@ def main() -> int:
                 f.seek(22528 * 512)                    # KiFS_PART_LBA
                 open(part, "wb").write(f.read(4 * 1024 * 1024))
             host_tool = os.environ.get(
-                "KIFS_HOST_TOOL", "/home/kai/AgentWorkSpace/kifs/tools/mkifs.py")
+                "KIFS_HOST_TOOL", "/Files/Project/kifs/tools/mkifs.py")
             read_out = os.path.join(tempfile.gettempdir(),
                                     f"kkernel-kifs-read-{os.getpid()}.bin")
 
