@@ -48,6 +48,14 @@ KIFS_IMG  := $(BUILD)/kifs-test.img
 KIFS_BIG  := $(BUILD)/kifs-big.bin
 KIFS_HOST_TOOL ?= /Files/Project/kifs/tools/mkifs.py
 KIFS_LBA  := 22528
+# v2 16 KiB 块:64 MiB 小卷,塞进 128 MiB 盘(只改块大小,分区 LBA 不变)
+KIFS16_IMG := $(BUILD)/kifs16-test.img
+KIFS16_HD  := $(BUILD)/kkernel-hd16.img
+# LBA48 高地址:200 GiB 稀疏盘,16K 卷放在 LBA 300000000(约 143 GiB 处,
+# 32 位 LBA 的 0x11E1A300 会直接溢出成低地址,必须走 ATA READ/WRITE EXT)
+KIFS_BIG_LBA := 300000000
+KIFS_BIG_IMG := $(BUILD)/kifs-big16.img
+KIFS_BIG_HD  := $(BUILD)/kkernel-hd-big.img
 # QMP socket:`make hd` / `make hd32` 把它开在这儿,
 # tools/text2alt.py --send 就靠它把中文/日文/韩文打进去(见该脚本的说明)
 QMP_SOCK := $(BUILD)/qmp.sock
@@ -123,7 +131,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-kifs-crash test-hd32 div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-kifs16 test-kifs-big test-kifs-crash test-hd32 div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -257,6 +265,21 @@ $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ)
 	python3 tools/mkimg.py $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(HDIMG) font/full-kkf.bin
 	python3 tools/mkfat.py $(HDIMG) 6144 8 $(MKFAT_FILES)
 
+# LBA48 测试内核:KiFS 分区 LBA 用 -D 覆盖(其他功能与常规内核一致)
+$(BUILD)/kernel-big.bin: $(KERNEL_SRCS) $(FONT_DEPS) | $(BUILD)
+	$(NASM) -f bin -I kernel/ -DKIFS_PART_LBA=$(KIFS_BIG_LBA) kernel/start.asm -o $@ -l $(BUILD)/kernel-big.lst
+	@printf '   内核(LBA48): %s 字节\n' "$$(stat -c %s $@)"
+
+# 高地址测试盘:和 $(HDIMG) 同一套 FAT16 + 字库,只是内核里的 KiFS LBA 不同
+$(KIFS_BIG_HD): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel-big.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
+          $(PINYIN_BIN) $(BUILD)/TCC.BIN \
+          $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
+          progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
+          $(wildcard tccinc/*.h) \
+          $(BUILD)/bigdir/.stamp
+	python3 tools/mkimg.py $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel-big.bin $(KIFS_BIG_HD) font/full-kkf.bin
+	python3 tools/mkfat.py $(KIFS_BIG_HD) 6144 8 $(MKFAT_FILES)
+
 hd: $(HDIMG)
 	@rm -f $(QMP_SOCK)
 	$(QEMU) -drive file=$(HDIMG),format=raw,if=ide,index=0 -boot c -qmp unix:$(QMP_SOCK),server,nowait $(RTC_ARG) $(USB_ARG)
@@ -335,6 +358,47 @@ test-kifs: $(PROG_BINS) font/full-kkf.bin
 	python3 $(KIFS_HOST_TOOL) fsck $(KIFS_IMG)
 	dd if=$(KIFS_IMG) of=$(HDIMG) bs=512 seek=$(KIFS_LBA) conv=notrunc status=none
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --kifs --font font/full-kkf.bin
+
+# KiFS v2:16 KiB 块镜像(64 MiB 卷 / 128 MiB 盘),验证从 superblock 读块大小
+test-kifs16: $(PROG_BINS) font/full-kkf.bin
+	@echo "── KiFS v2:16 KiB 块,64 MiB 卷 write/cat/ls/fsck ──"
+	$(MAKE) -s -B $(HDIMG)
+	@test -f $(KIFS_HOST_TOOL) || { echo "test-kifs16: 找不到宿主工具 $(KIFS_HOST_TOOL)(先用 git 拉 kifs 仓库)"; exit 1; }
+	python3 $(KIFS_HOST_TOOL) format $(KIFS16_IMG) --size-mib 64 --block-size 16384 --label KKIFS16
+	python3 $(KIFS_HOST_TOOL) mkdir $(KIFS16_IMG) /docs
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /docs/hello.txt --data "hello from KiFS"
+	python3 -c 'open("$(KIFS_BIG)","wb").write(bytes(range(256))*50)'
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /docs/big.bin --from $(KIFS_BIG)
+	python3 $(KIFS_HOST_TOOL) mkdir $(KIFS16_IMG) /ext
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /ext/alpha.txt --data "alpha"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /ext/beta.txt --data "beta"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /ext/delta.txt --data "delta"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /ext/epsilon.txt --data "epsilon"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /ext/gamma.txt --data "gamma"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS16_IMG) /ext/zeta.txt --data "zeta"
+	python3 $(KIFS_HOST_TOOL) fsck $(KIFS16_IMG)
+	cp $(HDIMG) $(KIFS16_HD)
+	truncate -s 128M $(KIFS16_HD)
+	dd if=$(KIFS16_IMG) of=$(KIFS16_HD) bs=512 seek=$(KIFS_LBA) conv=notrunc status=none
+	python3 -u tests/qemu_test.py $(KIFS16_HD) --hda --kifs16k --font font/full-kkf.bin
+
+# KiFS v2:LBA48 高地址验证(>128 GiB 处建卷,32 位 LBA 必溢出)
+test-kifs-big: $(PROG_BINS) font/full-kkf.bin
+	@echo "── KiFS v2:LBA48 高地址(分区 LBA $(KIFS_BIG_LBA),200 GiB 稀疏盘)──"
+	$(MAKE) -s -B $(KIFS_BIG_HD)
+	@test -f $(KIFS_HOST_TOOL) || { echo "test-kifs-big: 找不到宿主工具 $(KIFS_HOST_TOOL)(先用 git 拉 kifs 仓库)"; exit 1; }
+	python3 $(KIFS_HOST_TOOL) format $(KIFS_BIG_IMG) --size-mib 64 --block-size 16384 --label KKIFSBIG
+	python3 $(KIFS_HOST_TOOL) mkdir $(KIFS_BIG_IMG) /docs
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_BIG_IMG) /docs/hello.txt --data "hello from KiFS"
+	python3 -c 'open("$(KIFS_BIG)","wb").write(bytes(range(256))*50)'
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_BIG_IMG) /docs/big.bin --from $(KIFS_BIG)
+	python3 $(KIFS_HOST_TOOL) mkdir $(KIFS_BIG_IMG) /ext
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_BIG_IMG) /ext/alpha.txt --data "alpha"
+	python3 $(KIFS_HOST_TOOL) write $(KIFS_BIG_IMG) /ext/zeta.txt --data "zeta"
+	python3 $(KIFS_HOST_TOOL) fsck $(KIFS_BIG_IMG)
+	truncate -s 200G $(KIFS_BIG_HD)
+	dd if=$(KIFS_BIG_IMG) of=$(KIFS_BIG_HD) bs=512 seek=$(KIFS_BIG_LBA) conv=notrunc status=none
+	python3 -u tests/qemu_test.py $(KIFS_BIG_HD) --hda --kifs-big --font font/full-kkf.bin
 
 # KiFS 真断电注入压测(Phase C2):
 #   每轮在 QEMU 里敲一条 kifs write,在写到一半的各个时机直接 SIGKILL(模拟拔电),

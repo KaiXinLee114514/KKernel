@@ -313,8 +313,230 @@ ata_write_sectors:
     pop ebx
     ret
 
+; ===========================================================================
+;  LBA48(64 位 LBA)读 / 写 —— KiFS v2 用
+;  入参:edx:eax = 64 位 LBA,ecx = 扇区数,edi / esi = 目标 / 源地址
+;  返回:eax = 0 成功 / -1 失败;其它寄存器保持(和 LBA28 版一致)
+;  LBA28 接口原样保留给 FAT16 / boot 路径。
+; ===========================================================================
+
+; ---------------------------------------------------------------------------
+ata_setup_lba48:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    mov ebx, eax                    ; 低 32 位
+    mov ecx, edx                    ; 高 32 位(只用低 16 位)
+    ; ---- 先选盘 + 进 LBA48 模式 ----
+    mov al, [ata_drive]
+    and al, 1
+    shl al, 4
+    or  al, 0x40
+    mov dx, ATA_DRIVE
+    out dx, al
+    call ata_delay400
+    ; ---- 高 24 位(ATA 约定:高字节先写,低字节后写)----
+    mov dx, ATA_SECCNT
+    xor al, al                      ; 扇区数高 8 位 = 0(一次命令 ≤ 16 扇区)
+    out dx, al
+    mov eax, ecx
+    shr eax, 8
+    mov dx, ATA_LBA_HI              ; LBA 47:40
+    out dx, al
+    mov eax, ecx
+    mov dx, ATA_LBA_MID             ; LBA 39:32
+    out dx, al
+    mov eax, ebx
+    shr eax, 24
+    mov dx, ATA_LBA_LO              ; LBA 31:24
+    out dx, al
+    ; ---- 低 24 位 ----
+    mov dx, ATA_SECCNT
+    mov al, [ata_chunk]
+    out dx, al
+    mov eax, ebx
+    mov dx, ATA_LBA_LO              ; LBA 7:0
+    out dx, al
+    shr eax, 8
+    mov dx, ATA_LBA_MID             ; LBA 15:8
+    out dx, al
+    shr eax, 8
+    mov dx, ATA_LBA_HI              ; LBA 23:16
+    out dx, al
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ---------------------------------------------------------------------------
+;  ata_read_sectors48:edx:eax = 64 位 LBA,ecx = 扇区数,edi = 目标
+; ---------------------------------------------------------------------------
+ata_read_sectors48:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    push ebp
+    ; ---- 安全闸(和 LBA28 版一致;高 16 位之外拒绝)----
+    test ecx, ecx
+    jz .fail
+    cmp ecx, 0x100000
+    ja .fail
+    cmp edi, 0x10000
+    jb .fail
+    mov ebx, ecx
+    shl ebx, 9
+    jc .fail
+    add ebx, edi
+    jc .fail
+    cmp ebx, [ident_limit]
+    ja .fail
+    cmp edx, 0x0000FFFF
+    ja .fail
+    mov [ata_lba], eax
+    mov [ata_lba_hi], edx
+    mov [ata_buf], edi
+    mov [ata_left], ecx
+.loop:
+    cmp dword [ata_left], 0
+    je .done
+    call ata_wait_ready
+    jc .fail
+    mov eax, [ata_left]
+    cmp eax, ATA_MAX_CHUNK
+    jbe .use_it
+    mov eax, ATA_MAX_CHUNK
+.use_it:
+    mov [ata_chunk], al
+    mov eax, [ata_lba]
+    mov edx, [ata_lba_hi]
+    call ata_setup_lba48
+    mov dx, ATA_CMD
+    mov al, 0x24                    ; READ SECTORS EXT
+    out dx, al
+    mov edi, [ata_buf]
+    movzx ebp, byte [ata_chunk]
+.sector:
+    call ata_wait_drq
+    jc .fail
+    mov ecx, 256
+    mov dx, ATA_DATA
+    rep insw
+    dec ebp
+    jnz .sector
+    ; 64 位 LBA / 目标地址推进
+    movzx eax, byte [ata_chunk]
+    add [ata_lba], eax
+    adc dword [ata_lba_hi], 0
+    imul eax, 512
+    add [ata_buf], eax
+    movzx eax, byte [ata_chunk]
+    sub [ata_left], eax
+    jmp .loop
+.done:
+    xor eax, eax
+    jmp .out
+.fail:
+    mov eax, -1
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  ata_write_sectors48:edx:eax = 64 位 LBA,ecx = 扇区数,esi = 源地址
+; ---------------------------------------------------------------------------
+ata_write_sectors48:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    push ebp
+    test ecx, ecx
+    jz .fail
+    cmp ecx, 0x100000
+    ja .fail
+    cmp esi, 0x10000
+    jb .fail
+    mov ebx, ecx
+    shl ebx, 9
+    jc .fail
+    add ebx, esi
+    jc .fail
+    cmp ebx, [ident_limit]
+    ja .fail
+    cmp edx, 0x0000FFFF
+    ja .fail
+    mov [ata_lba], eax
+    mov [ata_lba_hi], edx
+    mov [ata_src], esi
+    mov [ata_left], ecx
+.loop:
+    cmp dword [ata_left], 0
+    je .flush
+    call ata_wait_ready
+    jc .fail
+    mov eax, [ata_left]
+    cmp eax, ATA_MAX_CHUNK
+    jbe .use_it_w
+    mov eax, ATA_MAX_CHUNK
+.use_it_w:
+    mov [ata_chunk], al
+    mov eax, [ata_lba]
+    mov edx, [ata_lba_hi]
+    call ata_setup_lba48
+    mov dx, ATA_CMD
+    mov al, 0x34                    ; WRITE SECTORS EXT
+    out dx, al
+    mov esi, [ata_src]
+    movzx ebp, byte [ata_chunk]
+.sector_w:
+    call ata_wait_drq
+    jc .fail
+    mov ecx, 256
+    mov dx, ATA_DATA
+    rep outsw
+    call ata_delay400
+    dec ebp
+    jnz .sector_w
+    movzx eax, byte [ata_chunk]
+    add [ata_lba], eax
+    adc dword [ata_lba_hi], 0
+    imul eax, 512
+    add [ata_src], eax
+    movzx eax, byte [ata_chunk]
+    sub [ata_left], eax
+    jmp .loop
+.flush:
+    mov dx, ATA_CMD
+    mov al, 0xE7                    ; FLUSH CACHE
+    out dx, al
+    call ata_wait_ready
+    jc .fail
+    xor eax, eax
+    jmp .out
+.fail:
+    mov eax, -1
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
 ; ---------------------------------------------------------------- 变量
 ata_lba    dd 0
+ata_lba_hi dd 0
 ata_buf    dd 0
 ata_src    dd 0
 ata_left   dd 0

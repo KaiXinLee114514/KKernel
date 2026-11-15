@@ -128,7 +128,9 @@ make hd                 # 完整硬盘镜像:字库 + FAT16 + 示例程序(推�
 #   开机那两行算是它的墓碑:一行说"完整功能请用硬盘版",一行是 `Goodbye Floppy disk`。
 #   它没有真的死掉 —— 每次 make test 都还会把这块镜像拉出来跑一遍,守那条最老的 BIOS 退路。
 make test               # 无头自动化测试:8 组,全过会打 ✅
-make test-kifs          # KiFS 读写驱动测试(需宿主 KiFS 仓库的 mkifs.py,不在 8 组里)
+make test-kifs          # KiFS v2 读写(4K 块,需宿主 KiFS 仓库的 mkifs.py,不在 8 组里)
+make test-kifs16        # KiFS v2:16K 块 / 64 MiB 卷
+make test-kifs-big      # KiFS v2:LBA48 高地址(200 GiB 稀疏盘,LBA 300000000)
 make test-kifs-crash    # KiFS 真断电注入压测:每轮 kifs write 写到一半 SIGKILL,重启验恢复(20 轮,约 4 分钟)
 make clean              # 清掉 build/
 
@@ -199,7 +201,9 @@ VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issue
 | `test-shell` | 敲 `help`/`info`/`page`/`echo`/`clear`,验证命令、滚屏、清屏、中文、UTF-8 边界 |
 | `test-hd-font` | 硬盘镜像:字库从磁盘读、`ls`/`cat`/`write`/`run`、**计算器的八组算式**、**编辑器的敲字/存盘/退出**,最后**离线解析镜像**证明字节真落盘 |
 | `test-usb` | QEMU 挂一个假 U 盘(`usb-storage`),断言设备识别 / 容量 / READ(10) 读扇区 / MBR 分区表 / REQUEST SENSE |
-| `test-kifs` | **单独跑**(不在 `make test` 里):宿主 `mkifs.py` 造 4 MB KiFS 镜像 `dd` 到 IDE 盘 LBA 22528,断言 `kifs` 的 info/ls/cat/stat 与**内核写路径**(mkdir/write/管道 stdin/覆盖/rm/journal);再 `reboot` 重启一次验证持久化,最后从镜像 **dd 出 KiFS 分区**,用宿主 `mkifs.py fsck` + `read` 做**字节级**交叉验证 |
+| `test-kifs` | **单独跑**(不在 `make test` 里):宿主 `mkifs.py` 造 **v2 4 KiB 块**的 4 MB KiFS 镜像 `dd` 到 IDE 盘 LBA 22528,断言 `kifs` 的 info/ls/cat/stat 与**内核写路径**(mkdir/write/管道 stdin/覆盖/rm/journal);再 `reboot` 重启一次验证持久化,最后从镜像 **dd 出 KiFS 分区**,用宿主 `mkifs.py fsck` + `read` 做**字节级**交叉验证 |
+| `test-kifs16` | **单独跑**:v2 **16 KiB 块**、64 MiB 卷(放 128 MiB 盘);同样的 write/cat/ls/stat/journal + reboot + 宿主 fsck,验证块大小从 superblock 读、record 索引按 128 条/块 |
+| `test-kifs-big` | **单独跑**:用 `-DKIFS_PART_LBA=300000000` 编的内核 + **200 GiB 稀疏盘**,卷放在 **>128 GiB** 的 LBA(32 位 LBA 必溢出);验证 ATA **LBA48** 的读写/cat/ls/stat/journal + 宿主 fsck/字节比对 |
 | `test-kifs-crash` | **单独跑**:真断电注入压测。每轮在 QEMU 里敲一条 `kifs write`,在事务写到一半的各个时机(BEGIN/记录中、COMMIT 已落盘待回放、END 之后……共 6 种)直接 **SIGKILL**,等于物理拔电;然后用**同一个镜像**重启,断言 journal 恢复后文件内容只能是旧值或新值、宿主 `mkifs.py fsck` 必过、盘上不残留 OPEN 事务。20 轮随机覆盖,跑一次约 4 分钟 |
 
 最后那一项有两套独立的验证手段:一套看屏幕像素(把期望的文字用字库渲染成图案再去截图里找),
@@ -207,7 +211,9 @@ VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issue
 
 ```bash
 make test-hd-font  # 单独跑某一组
-make test-kifs        # KiFS 读写驱动(需要 /Files/Project/kifs 仓库里的 mkifs.py)
+make test-kifs        # KiFS v2 读写(4K 块;需要 /Files/Project/kifs 仓库里的 mkifs.py)
+make test-kifs16      # KiFS v2 16K 块
+make test-kifs-big    # KiFS v2 + LBA48 高地址
 make test-kifs-crash  # 真断电注入压测(SIGKILL 循环 + 重启验 journal 恢复)
 make div           # 构建"开机就除零"的镜像,自己开着 QEMU 看 panic 屏
 python3 tests/qemu_test.py build/kkernel-hd.img --hda --dump   # 只把屏幕打出来,不做断言

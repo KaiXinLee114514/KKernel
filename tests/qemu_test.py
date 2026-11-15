@@ -692,13 +692,16 @@ def main() -> int:
     hd_mode = "--fontdisk" in argv          # 硬盘镜像:磁盘字库 + FAT16 + 跑程序
     fat32_mode = "--fat32" in argv          # 同一个内核,但分区是 FAT32(镜像得开大)
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
-    kifs_mode = "--kifs" in argv            # KiFS 内核只读驱动:固定分区 LBA 22528
+    kifs_mode = "--kifs" in argv            # KiFS 内核读写驱动:固定分区 LBA 22528(4K 块)
+    kifs16_mode = "--kifs16k" in argv       # KiFS v2 16K 块:64 MiB 小卷
+    kifs_big_mode = "--kifs-big" in argv    # KiFS v2 16K 块 + LBA48:分区在 LBA 300000000
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk", "--kifs")]
+                         "--fontdisk", "--fat32", "--usbdisk", "--kifs",
+                         "--kifs16k", "--kifs-big")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -711,7 +714,11 @@ def main() -> int:
     #   谁要是在旁边敲一句 `make`(重造镜像)就会把正在跑的虚拟机脚下的盘换掉 ——
     #   症状是莫名其妙的中途失败/虚拟机自己退出。副本 + 跑完自动删,两边都省心。
     img_copy = os.path.join(tempfile.gettempdir(), f"kkernel-test-{os.getpid()}.img")
-    shutil.copyfile(img, img_copy)
+    if kifs_big_mode:
+        # 200 GiB 稀疏盘:普通 copyfile 会把它拷成实心 200 GiB,用 cp 保留空洞
+        subprocess.run(["cp", "--sparse=always", img, img_copy], check=True)
+    else:
+        shutil.copyfile(img, img_copy)
     print(f"(跑的是镜像副本 {img_copy},原镜像 {img} 不动)")
     img = img_copy
 
@@ -897,8 +904,8 @@ def main() -> int:
 
             kifs_run("kifs info")
             results.append(("superblock:magic/版本",
-                            has("magic=KIFS") and has("version=0x00010000"),
-                            "kifs info → magic=KIFS version=0x00010000"))
+                            has("magic=KIFS") and has("version=0x00020000"),
+                            "kifs info → magic=KIFS version=0x00020000"))
             results.append(("superblock:布局/卷标",
                             has("block_size=4096") and has("total_blocks=1024")
                             and has("root_oid=1") and has("label=KKIFS"),
@@ -1190,6 +1197,193 @@ def main() -> int:
             crash_case("-4", "should not appear", "after_begin",
                        "old", "回收残缺事务")
 
+            return report(results)
+
+        if kifs16_mode or kifs_big_mode:
+            # ---- KiFS v2:16 KiB 块 / LBA48 高地址 ----
+            #   16K 卷放 64 MiB 小盘(镜像在 LBA 22528);
+            #   big 模式用 -DKIFS_PART_LBA=300000000 编的内核,分区在 200 GiB 稀疏盘
+            #   的 300000000 号扇区(>128 GiB,32 位 LBA 一定溢出,只能走 LBA48)。
+            results = []
+            big = kifs_big_mode
+            part_lba = 300000000 if big else 22528
+            vol_label = "KKIFSBIG" if big else "KKIFS16"
+            # big 卷的宿主准备少几个文件(7 条 record),新 oid 从 8 起;
+            # 16K 卷有 11 条 record,新 oid 从 12 起。
+            oid_mkdir = 8 if big else 12
+            oid_write = 9 if big else 13
+            oid_copy = 10 if big else 14
+            free_expect = "4024" if big else "4023"
+            time.sleep(1.0)
+
+            def kifs_run2(line: str, wait: float = 1.6) -> None:
+                if kifs_big_mode:
+                    wait = max(wait, 3.0)   # 200 GiB 稀疏盘上首次写要分配块，慢一点
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            def stop_qemu2() -> None:
+                nonlocal qemu
+                if qemu.poll() is None:
+                    qemu.terminate()
+                try:
+                    qemu.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    qemu.kill()
+
+            def boot_image2(path: str, tag: str) -> None:
+                nonlocal qemu, mon
+                s2 = sock + tag
+                q2 = qmp_sock + tag
+                for sp in (s2, q2):
+                    if os.path.exists(sp):
+                        os.unlink(sp)
+                qemu = subprocess.Popen(
+                    ["qemu-system-i386",
+                     "-drive", f"file={path},format=raw,if=ide,index=0",
+                     "-boot", "c",
+                     "-display", "none", "-no-reboot", "-usb",
+                     "-monitor", f"unix:{s2},server,nowait",
+                     "-qmp", f"unix:{q2},server,nowait"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                mon = Monitor(s2, timeout=15)
+                time.sleep(7.0)
+                for _ in range(6):
+                    try:
+                        if find_text(mon.screendump(), 'type "help" for commands.',
+                                     glyphs, None):
+                            time.sleep(2.0)
+                            break
+                    except Exception:
+                        break
+                    time.sleep(2.0)
+                rescan()
+
+            kifs_run2("kifs info")
+            results.append(("v2 superblock/16K 块",
+                            has("magic=KIFS") and has("version=0x00020000")
+                            and has("block_size=16384") and has("total_blocks=4096"),
+                            "version=0x00020000 / block_size=16384 / total_blocks=4096"))
+            results.append(("卷标/根目录", has("root_oid=1") and has("label=" + vol_label),
+                            f"root_oid=1 / label={vol_label}"))
+            if big:
+                results.append(("分区 LBA48 高地址", has("LBA 300000000"),
+                                "kifs info → partition at LBA 300000000"))
+
+            kifs_run2("kifs ls /")
+            results.append(("根目录 docs/ext", has("docs") and has("ext"),
+                            "ls / → docs / ext"))
+
+            kifs_run2("kifs cat /docs/hello.txt")
+            results.append(("16K 卷 cat 内联文件", has("hello from KiFS"),
+                            "cat /docs/hello.txt → hello from KiFS"))
+
+            kifs_run2("kifs stat /docs/big.bin")
+            results.append(("16K 卷 stat 多块文件(1 块)",
+                            has("size=12800 bytes") and has("blocks=1")
+                            and has("start=5 blocks=1"),
+                            "big.bin: size=12800 / blocks=1 / start=5"))
+
+            kifs_run2("kifs ls /ext")
+            results.append(("16K 卷 ls /ext", has("alpha.txt") and has("zeta.txt"),
+                            "ls /ext → alpha.txt…zeta.txt"))
+
+            kifs_run2("kifs mkdir /w")
+            results.append(("16K 卷 mkdir", has(f"kifs: mkdir /w (oid={oid_mkdir})"),
+                            f"mkdir /w → oid={oid_mkdir}"))
+            kifs_run2("kifs write /w/a.txt hello kernel")
+            results.append(("16K 卷 write", has(f"kifs: wrote 12 bytes to /w/a.txt (oid={oid_write})"),
+                            f"write /w/a.txt → 12 字节 / oid={oid_write}"))
+            kifs_run2("kifs cat /w/a.txt")
+            results.append(("16K 卷读回内联写入", has("hello kernel"),
+                            "cat /w/a.txt → hello kernel"))
+
+            kifs_run2("kifs cat /docs/big.bin | kifs write /w/copy.bin", wait=3.0)
+            results.append(("16K 卷 pipe 写 12801 B",
+                            has(f"kifs: wrote 12801 bytes to /w/copy.bin (oid={oid_copy})"),
+                            "cat big.bin | write /w/copy.bin → 12801 字节 / oid=14"))
+            kifs_run2("kifs stat /w/copy.bin")
+            results.append(("16K 卷 copy 只占 1 块",
+                            has("size=12801 bytes") and has("blocks=1")
+                            and has("start=6 blocks=1"),
+                            "copy.bin: size=12801 / blocks=1 / start=6"))
+
+            kifs_run2("kifs journal")
+            results.append(("16K 卷 journal", has("journal: 64 blocks") and has("seq="),
+                            "journal: 64 blocks / seq=…"))
+
+            # ---- 重启验证持久化 ----
+            mon.type_text("reboot")
+            mon.sendkey("ret")
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and qemu.poll() is None:
+                time.sleep(0.5)
+            stop_qemu2()
+            boot_image2(img_copy, "-2")
+
+            kifs_run2("kifs info")
+            results.append(("16K 卷重启 free_blocks", has("free_blocks=" + free_expect),
+                            f"重启后 free_blocks={free_expect}"))
+            kifs_run2("kifs cat /w/a.txt")
+            results.append(("16K 卷重启内联持久化", has("hello kernel"),
+                            "重启后 cat /w/a.txt → hello kernel"))
+            kifs_run2("kifs stat /w/copy.bin")
+            results.append(("16K 卷重启多块持久化",
+                            has("size=12801 bytes") and has("start=6 blocks=1"),
+                            "重启后 copy.bin: start=6 blocks=1"))
+            kifs_run2("kifs journal")
+            results.append(("16K 卷重启 journal 无 pending",
+                            has("state=END") and not has("state=COMMIT"),
+                            "重启后 journal 全部 state=END"))
+
+            # ---- 宿主侧:按真实分区 LBA 抽出来做 fsck / 字节比对 ----
+            stop_qemu2()
+            part = os.path.join(tempfile.gettempdir(),
+                                f"kkernel-kifs-v2part-{os.getpid()}.img")
+            with open(img_copy, "rb") as f:
+                f.seek(part_lba * 512)                  # KiFS_PART_LBA(64 位)
+                open(part, "wb").write(f.read(64 * 1024 * 1024))
+            host_tool = os.environ.get(
+                "KIFS_HOST_TOOL", "/Files/Project/kifs/tools/mkifs.py")
+
+            def host_run(*args):
+                return subprocess.run([sys.executable, host_tool, *args],
+                                      capture_output=True, text=True)
+
+            r = host_run("fsck", part)
+            results.append(("16K 卷宿主 fsck", r.returncode == 0,
+                            (r.stdout.strip().splitlines() or [r.stderr.strip()])[-1]))
+
+            read_out = os.path.join(tempfile.gettempdir(),
+                                    f"kkernel-kifs-v2read-{os.getpid()}.bin")
+
+            def host_read2(path: str):
+                if os.path.exists(read_out):
+                    os.unlink(read_out)
+                r = host_run("read", part, path, "--out", read_out)
+                if r.returncode != 0 or not os.path.exists(read_out):
+                    return None
+                with open(read_out, "rb") as f:
+                    return f.read()
+
+            data = host_read2("/w/copy.bin")
+            results.append(("16K 卷宿主读回多块字节", data == bytes(range(256)) * 50 + b"\n",
+                            "宿主 read /w/copy.bin == big.bin + '\n'(12801 B)"))
+            data = host_read2("/w/a.txt")
+            results.append(("16K 卷宿主读回内联字节", data == b"hello kernel",
+                            "宿主 read /w/a.txt == b'hello kernel'"))
+
+            r = host_run("stat", part, "/docs/big.bin")
+            results.append(("16K 卷宿主 stat 多块文件",
+                            r.returncode == 0 and "blocks     : 1" in r.stdout,
+                            "宿主 stat /docs/big.bin → blocks=1"))
+
+            for tmp in (part, read_out):
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
             return report(results)
 
         if kbd_mode:
