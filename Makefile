@@ -81,7 +81,7 @@ MINIC_OBJ   := $(BUILD)/minic.o
 CRT_TCC_OBJ := $(BUILD)/crt_tcc.o      # TCC 链接 ELF 用的最小 crt(见 lib/crt_tcc.asm)
 ifeq ($(CC_OK),yes)
 C_PROGS     := CHELLO.BIN PLAY.BIN RNGTEST.BIN P2TEST.BIN FPU.BIN FCALC.BIN ECHO.BIN MEMTEST.BIN IOTEST.BIN \
-               WC.BIN UPPER.BIN GREP.BIN HEAD.BIN
+               WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN
 else
 C_PROGS     :=
 endif
@@ -116,7 +116,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -175,6 +175,10 @@ $(BUILD)/%.o: progs/%.c include/kkernel.h lib/minic.h | $(BUILD)
 #   会当成 C++ 编 —— 那样 -std=gnu89、隐式 void* 转换这些立刻全是错。所以这条规则
 #   显式写 -x c:语言由规则定,不由后缀名说了算。
 $(BUILD)/PLAY.o: progs/PLAY.C include/kkernel.h lib/minic.h | $(BUILD)
+	$(CC) $(C_CFLAGS) -x c -c $< -o $@
+
+# MINE.C 同样是大写后缀(扫雷,见 progs/MINE.C 开头的注释)
+$(BUILD)/MINE.o: progs/MINE.C include/kkernel.h lib/minic.h | $(BUILD)
 	$(CC) $(C_CFLAGS) -x c -c $< -o $@
 
 $(BUILD)/%.BIN: $(BUILD)/%.o $(CRT0_OBJ) $(MINIC_OBJ) lib/kkernel.ld
@@ -369,6 +373,11 @@ test-fda: $(IMG)
 test-hda: $(IMG)
 	@echo "── 作为硬盘启动(BIOS 有 LBA,应走 EDD)──"
 	python3 -u tests/qemu_test.py $(IMG) --hda
+
+# 扫雷:PROGS 在 /BIN 里,测试只读盘,不 -B 重建(那会把整盘重做一遍)
+test-mine: $(HDIMG)
+	@echo "── 扫雷(MINE.BIN):菜单/棋盘/光标/旗子/退出 ──"
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --mine --font font/full-kkf.bin
 
 test-div: $(DIV_IMG)
 	@echo "── 故意除零(应打出 KERNEL PANIC + divide error)──"

@@ -692,12 +692,13 @@ def main() -> int:
     hd_mode = "--fontdisk" in argv          # 硬盘镜像:磁盘字库 + FAT16 + 跑程序
     fat32_mode = "--fat32" in argv          # 同一个内核,但分区是 FAT32(镜像得开大)
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
+    mine_mode = "--mine" in argv            # 扫雷(BIN/MINE.BIN):菜单/棋盘/光标/旗子/退出
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk")]
+                         "--fontdisk", "--fat32", "--usbdisk", "--mine")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -892,6 +893,168 @@ def main() -> int:
         mode = ("boot disk: LBA (EDD multi-sector read)" if as_hdd
                 else "boot disk: CHS fallback (BIOS has no LBA)")
         print(f'(模式: {"图形 VBE" if graphics else "VGA 文本"})')
+
+        if mine_mode:
+            # ---- 扫雷(progs/MINE.C → BIN/MINE.BIN)----
+            #  全屏程序:断言全靠"像素比字库"认文字(和别的全屏模式一样)。
+            #  每个按键之后等屏幕静下来再抓 —— 直接抓会读到重画到一半的帧。
+            results = []
+
+            def m_idle(max_wait=15.0):
+                """等屏幕不再变化(内核往 VBE 帧缓冲画字是 MMIO,慢)"""
+                last = None
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < max_wait:
+                    blob = mon.screendump().tobytes()
+                    if blob == last:
+                        return
+                    last = blob
+                    time.sleep(0.25)
+
+            def m_key(key: str, wait: float = 0.4):
+                """按一下键:等上一次重画结束 → 按键 → 等这次重画结束 → 抓屏"""
+                m_idle(10.0)
+                mon.sendkey(key)
+                time.sleep(wait)
+                m_idle(10.0)
+                rescan()
+
+            def m_wait_for(text: str, timeout: float = 15.0) -> bool:
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < timeout:
+                    rescan()
+                    if has(text):
+                        return True
+                    time.sleep(0.3)
+                return False
+
+            def m_screen_text() -> str:
+                """抓一屏 OCR 成文字(失败诊断用)"""
+                m_idle(10.0)
+                best = ""
+                for _ in range(3):
+                    rescan()
+                    raw = screen_text(shot, glyphs)
+                    text = "\n".join(l for l in raw if l.strip())
+                    if sum(1 for l in raw for ch in l if ch not in " ?") >= 20:
+                        return text
+                    if len(text) > len(best):
+                        best = text
+                    time.sleep(0.3)
+                return best
+
+            def m_mines_left():
+                """OCR 读状态行的 MINES LEFT 数字(读不到返回 None)"""
+                m_idle(10.0)
+                for _ in range(3):
+                    rescan()
+                    txt = "\n".join(screen_text(shot, glyphs))
+                    mm = re.search(r"MINES LEFT (\d+)", txt)
+                    if mm:
+                        return int(mm.group(1))
+                    time.sleep(0.3)
+                return None
+
+            # 从 shell 里跑起来(程序在 /BIN,run 没写扩展名/目录时会兜底去 /BIN 找)
+            m_idle(12.0)
+            mon.type_text("run mine.bin")
+            mon.sendkey("ret")
+            time.sleep(1.0)
+            m_idle(12.0)
+            rescan()
+
+            results.append(("扫雷启动:菜单出现",
+                            m_wait_for("MINESWEEPER") and has("pick a level:"),
+                            "MINESWEEPER / pick a level:"))
+            results.append(("菜单列出四种难度",
+                            has("1) 5x5") and has("2) 6x6")
+                            and has("3) 8x8") and has("4) 12x12")
+                            and has("5%-12%"),
+                            "1) 5x5  2) 6x6  3) 8x8  4) 12x12 / mines 5%-12%"))
+
+            # ---- 选 1:5x5,雷数随机 5%~12%(25 格 → 1..3 颗)----
+            m_key("1")
+            n5 = m_mines_left()
+            results.append(("按 1 进入 5x5(标题/状态行,雷数随机 5%-12%)",
+                            has("LEVEL 1") and has("5x5")
+                            and n5 is not None and 1 <= n5 <= 3,
+                            f"LEVEL 1 ... 5x5 ... / MINES LEFT {n5}(应为 1-3)"))
+
+            # 棋盘:未翻开 [#] + 光标 [*](左上角);光标格显示 * 是显示优先级
+            results.append(("棋盘画出来了:[#] 与 [*]",
+                            has("[#]") and has("[*]"),
+                            "棋盘上有 [#](未翻开)也有 [*](光标)"))
+
+            # ---- 光标移动:比状态行的坐标(比两帧截图对比更稳)----
+            m_key("down")
+            results.append(("方向键 下:光标到 1,2",
+                            m_wait_for("POS 1,2"), "状态行 POS 1,2"))
+            m_key("right")
+            results.append(("方向键 右:光标到 2,2",
+                            m_wait_for("POS 2,2"), "状态行 POS 2,2"))
+
+            # ---- 插旗:光标格永远显示 [*],插完要挪开一格才能看到 [%] ----
+            n_before = m_mines_left()
+            m_key("f")
+            n_flag = m_mines_left()
+            m_key("right")
+            results.append(("f 插旗:剩余雷数 -1 且露出 [%]",
+                            n_before is not None and n_flag == n_before - 1
+                            and has("[%]") and has("POS 3,2"),
+                            f"MINES LEFT {n_before}->{n_flag},原来的格子显示 [%]"))
+
+            # ---- r 重开:旗子清空、光标回左上 ----
+            m_key("r")
+            nr = m_mines_left()
+            results.append(("r 重开当前难度(雷数重新随机)",
+                            has("POS 1,1") and nr is not None and 1 <= nr <= 3
+                            and not has("[%]"),
+                            f"POS 1,1 / MINES LEFT {nr}(应为 1-3) / 没有 [%]"))
+
+            # ---- 第一下必安全:翻开 (1,1) 不该炸(布雷时排除了那一圈)----
+            #      QEMU 的空格键名是 "spc"(写成 "space" 会被 monitor 静默丢掉)。
+            #      (1,1) 的 8 邻格都被排除布雷,所以它必是 0 格 → 一定展开,
+            #      边界上必有数字格 → 屏上出现 [1]..[8] 才算真的翻开了。
+            m_key("spc")
+            opened_digit = any(has(f"[{d}]") for d in "12345678")
+            safe = not has("GAME OVER")
+            m_key("right")
+            results.append(("第一下必安全(空格翻开:不炸且展开出数字格)",
+                            safe and opened_digit and has("POS 2,1"),
+                            "没有 GAME OVER,棋盘上出现了 [1]-[8],光标到 2,1"))
+
+            # ---- 4 换难度:12x12,雷数随机 5%~12%(144 格 → 7..17 颗)----
+            m_key("4")
+            n12 = m_mines_left()
+            results.append(("按 4 切到 12x12(雷数随机 5%-12%)",
+                            has("12x12") and has("LEVEL 4")
+                            and n12 is not None and 7 <= n12 <= 17,
+                            f"LEVEL 4 ... 12x12 ... / MINES LEFT {n12}(应为 7-17)"))
+
+            # ---- 作弊码 QUICKPASS:先翻开一手布雷,再输入作弊码 ----
+            m_key("spc")                        # 第一下安全,顺带布雷
+            for ck in "quickpass":
+                m_key(ck)
+            results.append(("作弊码 QUICKPASS:雷位置标红且状态行 CHEAT ON",
+                            m_wait_for("CHEAT ON", 10.0) and has("[@]"),
+                            "CHEAT ON / [@] 出现"))
+
+            # ---- 退出键是 Ctrl-C,不是 q(q 现在只用于作弊码,单按不退出)----
+            m_key("q")
+            still_playing = has("MINES LEFT") and not has("program returned")
+            m_key("ctrl-c")
+            results.append(("q 不退出,Ctrl-C 退出回 shell",
+                            still_playing
+                            and m_wait_for("program returned to the shell", 20.0),
+                            "按 q 仍在游戏里;Ctrl-C 后 program returned to the shell"))
+
+            rc = report(results)
+            if rc:
+                shot.save("build/screen-fail.png")
+                print("── 失败时的屏幕(OCR,存了 build/screen-fail.png)──")
+                for i, line in enumerate(m_screen_text().splitlines()[:25]):
+                    print(f"   {i:2d}| {line}")
+            return rc
 
         if hd_mode:
             # ---- 硬盘模式:字库在磁盘上、FAT16 能读能写、程序能从磁盘跑 ----
