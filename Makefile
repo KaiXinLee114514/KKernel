@@ -131,7 +131,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-kifs16 test-kifs-big test-kifs-crash test-hd32 div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-kifs test-kifs16 test-kifs-big test-kifs-multibm test-kifs-crash test-hd32 div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -358,6 +358,14 @@ test-kifs: $(PROG_BINS) font/full-kkf.bin
 	python3 $(KIFS_HOST_TOOL) fsck $(KIFS_IMG)
 	dd if=$(KIFS_IMG) of=$(HDIMG) bs=512 seek=$(KIFS_LBA) conv=notrunc status=none
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --kifs --font font/full-kkf.bin
+
+# KiFS 内核多块位图支持:256 MiB/4 KiB 块卷,位图占 2 块;
+#   data_next 预置 40000,强制写入分配跨进第 2 个位图块,验证 mount/flush/journal/重启。
+test-kifs-multibm: $(PROG_BINS) font/full-kkf.bin
+	@echo "── KiFS 内核多块位图:256 MiB/4 KiB 卷(位图 2 块,data_next=40000)──"
+	$(MAKE) -s -B $(HDIMG)
+	@test -f $(KIFS_HOST_TOOL) || { echo "test-kifs-multibm: 找不到宿主工具 $(KIFS_HOST_TOOL)(先用 git 拉 kifs 仓库)"; exit 1; }
+	python3 -u tests/kifs_multibm_test.py --img $(HDIMG) --host-tool $(KIFS_HOST_TOOL)
 
 # KiFS v2:16 KiB 块镜像(64 MiB 卷 / 128 MiB 盘),验证从 superblock 读块大小
 test-kifs16: $(PROG_BINS) font/full-kkf.bin

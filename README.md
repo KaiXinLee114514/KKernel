@@ -93,7 +93,7 @@ python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
 | **/DEV 设备抽象层** | 「一切皆文件」的最小版:`DEV/` 开头的名字不查磁盘,改查内核设备表 —— `DEV/NULL`(黑洞)/`DEV/ZERO`(零)/`DEV/RANDOM`(伪随机)/`DEV/RTC`(实时时钟)/`DEV/CON`(写屏幕)/`DEV/DEVICES`(列设备);`cat`/`write` 和 `int 0x30` 的读写接口共用同一批 handler,C 程序 `fopen("DEV/RTC")` 直接能读(见 [docs/devices.md](docs/devices.md)) |
 | **管道(pipe)** | `A | B` 把 A 的屏幕输出接给 B 的 stdin(顺序执行,不需要并发):最多 4 段,缓冲从物理页池现借现还(64 KB/16 KB/4 KB 逐级降,页池不够就报错不崩);内建命令和 `run PROG` 都能当管道段;配 `WC` / `UPPER` / `GREP` / `HEAD` 四个 C 小工具,见 [docs/pipes.md](docs/pipes.md) |
 | **USB 大容量储存(只读裸盘)** | 插一个 U 盘(或 QEMU 的 `usb-storage`),`usbdisk` 一条命令就能看它是什么、读任意扇区、解 MBR 分区表:内核里是 UHCI 控制器 + **Bulk-Only Transport**(CBW/CSW)+ **SCSI 最小集**(INQUIRY / TEST UNIT READY / READ CAPACITY / READ(10) / REQUEST SENSE);只读、裸扇区,不接 FAT 也不写盘。`usbdisk` / `usbdisk read <lba>` / `usbdisk hexdump <lba>` / `usbdisk mbr` / `usbdisk sense`(见 [docs/usb-disk.md](docs/usb-disk.md)) |
-| **KiFS 读写驱动(Phase C1)** | 在 IDE 盘**固定分区 LBA 22528**(16 MB 盘里 FAT16 分区正好在 22528 结束)上认宿主工具 `mkifs.py` 造的 KiFS 卷:校验 superblock(**魔数/版本/CRC32**)+ 按目录项逐段遍历路径 + 读写**内联或 extent** 文件。写入走 **journal + CoW**:record/位图/superblock 三副本先进 64 块 journal(`KJRN` 头 + CRC16,BEGIN→记录→COMMIT→应用→END),数据块写新块后直接 ATA 落盘;挂载时重放完整事务、回收残缺事务。命令:`kifs info` / `ls` / `cat` / `stat` / `mkdir` / `write <路径> [文本]`(无文本时读管道 stdin)/ `rm` / `journal`。盘上没有 KiFS 卷时**静默不打扰**(见 `kernel/kifs.asm`) |
+| **KiFS 读写驱动(Phase C1)** | 在 IDE 盘**固定分区 LBA 22528**(16 MB 盘里 FAT16 分区正好在 22528 结束)上认宿主工具 `mkifs.py` 造的 KiFS 卷:校验 superblock(**魔数/版本/CRC32**)+ 按目录项逐段遍历路径 + 读写**内联或 extent** 文件。写入走 **journal + CoW**:record/位图/superblock 三副本先进 64 块 journal(`KJRN` 头 + CRC16,BEGIN→记录→COMMIT→应用→END),数据块写新块后直接 ATA 落盘;挂载时重放完整事务、回收残缺事务。命令:`kifs info` / `ls` / `cat` / `stat` / `mkdir` / `write <路径> [文本]`(无文本时读管道 stdin)/ `rm` / `journal`。**位图按需分块换入**(每块位图管 `block_size*8` 个数据块),大卷不再受单块位图限制;盘上没有 KiFS 卷时**静默不打扰**(见 `kernel/kifs.asm`) |
 | **跑磁盘上的程序** | `run HELLO`:从磁盘读进来 → 给这个程序**建一套自己的页目录**(私有页,见下) → 切 CR3 → 执行(镜像超 384 KB 直接拒绝),程序用 `int 0x30` 调用内核(见 [docs/programs.md](docs/programs.md)) |
 | **程序接口 17 个功能** | 打印/颜色/收键 + 清屏、读写文件、定位光标、读键事件(方向键)、屏幕尺寸、程序参数、定位画字、**蜂鸣器(14 号 `beep`)**、**读 stdin(17 号 `j_pipe_read`,管道右半边用)** —— 够写全屏程序,还够唱一首 |
 | **组件:计算器** | `run CALC`:`+ - * /`、小数点、平方,自己实现定点小数(6 位小数),除零/溢出都会报错 |
@@ -131,6 +131,7 @@ make test               # 无头自动化测试:8 组,全过会打 ✅
 make test-kifs          # KiFS v2 读写(4K 块,需宿主 KiFS 仓库的 mkifs.py,不在 8 组里)
 make test-kifs16        # KiFS v2:16K 块 / 64 MiB 卷
 make test-kifs-big      # KiFS v2:LBA48 高地址(200 GiB 稀疏盘,LBA 300000000)
+make test-kifs-multibm  # KiFS 内核多块位图:256 MiB/4K 卷,分配跨第 2 个位图块
 make test-kifs-crash    # KiFS 真断电注入压测:每轮 kifs write 写到一半 SIGKILL,重启验恢复(20 轮,约 4 分钟)
 make clean              # 清掉 build/
 
@@ -203,6 +204,7 @@ VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issue
 | `test-usb` | QEMU 挂一个假 U 盘(`usb-storage`),断言设备识别 / 容量 / READ(10) 读扇区 / MBR 分区表 / REQUEST SENSE |
 | `test-kifs` | **单独跑**(不在 `make test` 里):宿主 `mkifs.py` 造 **v2 4 KiB 块**的 4 MB KiFS 镜像 `dd` 到 IDE 盘 LBA 22528,断言 `kifs` 的 info/ls/cat/stat 与**内核写路径**(mkdir/write/管道 stdin/覆盖/rm/journal);再 `reboot` 重启一次验证持久化,最后从镜像 **dd 出 KiFS 分区**,用宿主 `mkifs.py fsck` + `read` 做**字节级**交叉验证 |
 | `test-kifs16` | **单独跑**:v2 **16 KiB 块**、64 MiB 卷(放 128 MiB 盘);同样的 write/cat/ls/stat/journal + reboot + 宿主 fsck,验证块大小从 superblock 读、record 索引按 128 条/块 |
+| `test-kifs-multibm` | **单独跑**:256 MiB/**4 KiB 块**卷,位图占 2 块;把 `data_next` 预置 40000,让分配跨进第 2 个位图块,断言 mount/info/extent start=40000/free_blocks 65430→65426/journal END + 重启持久化 + 宿主 fsck(free_blocks 与位图一致)/字节读回 |
 | `test-kifs-big` | **单独跑**:用 `-DKIFS_PART_LBA=300000000` 编的内核 + **200 GiB 稀疏盘**,卷放在 **>128 GiB** 的 LBA(32 位 LBA 必溢出);验证 ATA **LBA48** 的读写/cat/ls/stat/journal + 宿主 fsck/字节比对 |
 | `test-kifs-crash` | **单独跑**:真断电注入压测。每轮在 QEMU 里敲一条 `kifs write`,在事务写到一半的各个时机(BEGIN/记录中、COMMIT 已落盘待回放、END 之后……共 6 种)直接 **SIGKILL**,等于物理拔电;然后用**同一个镜像**重启,断言 journal 恢复后文件内容只能是旧值或新值、宿主 `mkifs.py fsck` 必过、盘上不残留 OPEN 事务。20 轮随机覆盖,跑一次约 4 分钟 |
 
@@ -327,7 +329,7 @@ tests/probe_disk.asm   探针:实测"软盘到底支不支持 LBA 读"(见第 6 
 0x3C0000 - 0x3C1FFF   USB 帧列表/QH/TD(usb.asm)
 0x3C1200 - 0x3C2FFF   USB bulk QH/TD + BOT/CBW/CSW/数据缓冲(usbdisk.asm)
 0x3C3000 - 0x3C5FFF   KiFS 块/目录/record/路径缓冲(kifs.asm)
-0x3C6000 - 0x3C7FFF   KiFS 位图缓存 + journal 块构建/目标块暂存(kifs.asm)
+0x3C6000 - 0x3C7FFF   KiFS 位图缓存(按需换入的位图块)+ journal 块构建/目标块暂存(kifs.asm)
 0x3C8000 - 0x3CFFFF   KiFS 写入数据/目录内容 staging(32 KiB,kifs.asm)
 0x3D2000 - 0x3D32FF   KiFS superblock 影子 / delta 表 / 事务表(kifs.asm;避开 0x3D0000 页池位图)
 0x3D0000 - 0x3D1FFF   页池位图(8 KiB)          (pmem.asm,PMEM_BITMAP;最多记 64512 页 = 252 MiB)
