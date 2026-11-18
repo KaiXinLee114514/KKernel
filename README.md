@@ -1,1532 +1,179 @@
-# KKernel(演示版)
+# KKernel
+
+**一个从零手写的 32 位 x86 操作系统。目标：功能对标并超越 1975 年的 Unix v6。**
+
+引导扇区、保护模式、分页、抢占调度、VBE 图形终端、FAT16/FAT32、`/DEV` 设备层、管道、多 shell、系统内 C 编译器、USB 大容量存储——全部自己实现，不 fork 任何现成内核。
+
+这不是教学演示。每一次提交都要求：能启动、能通过自动化测试、有文档。
 
 ![KKernel 硬盘模式:字库从磁盘读、FAT16 列目录、跑磁盘上的程序](docs/screenshot-fat.png)
 
-上图是完整硬盘镜像的实拍:字库从磁盘读进来(42 112 个字形)、FAT16 挂上了,
-`ls` 列目录、`run HELLO` 跑磁盘上的程序、`write` / `cat` 读写文件。
+*硬盘模式启动：从磁盘加载 42 112 字形全字库、挂载 FAT16、`ls` 列目录、`run` 跑盘上的程序。*
 
-两个"用 int 0x30 写出来的组件":**计算器**(`run CALC`,定点小数、加减乘除、平方)
-和**全屏文本编辑器**(`run EDIT`,方向键、存盘、打开):
+![4 条 shell 互相切换](docs/screenshot-shells.png) ![计算器](docs/screenshot-calc.png) ![文本编辑器](docs/screenshot-edit.png) ![拼音输入法悬浮候选条](docs/screenshot-ime.png)
 
-![计算器](docs/screenshot-calc.png)
-![文本编辑器](docs/screenshot-edit.png)
+## 为什么对标 Unix v6
 
-**vi 也搬进来了** —— 不是从头写的,是公有领域的 STEVIE(vim 的前身):
+Unix v6（1975）是「小而完整」的标杆：在 64 KB 地址空间的 PDP-11 上，同时做到多任务、分层文件系统、shell、C 编译器和设备抽象——一个能自己养活自己的最小系统。
 
-![vi 跑在 KKernel 上](docs/screenshot-vi.png)
+KKernel 用同一套标准要求自己，但放在 2026 年的 x86 硬件上，并把 v6 时代没有的东西补上：图形、UTF-8/中文、USB、系统内自举编译器。
 
-还有图形模式(800×600 VBE)里敲 `info` 和 `cat DOCS/ZH.TXT`(中文 / emoji 演示)的样子:
+**现在的 KKernel 已经覆盖了 v6 的骨架，并在图形、中文、自举编译、USB 上超出；差距在多用户、信号、fork、网络——这些是路线图里明确的目标。**
 
-![KKernel shell](docs/screenshot.png) ![中文显示(cat DOCS/ZH.TXT)](docs/screenshot-zh.png)
+## 和 Unix v6 对照
 
-> 注:这几张截图拍自**早期版本** —— 项目当时还叫 JoyOS,文件也都摊在根目录。
-> 现在它叫 KKernel,文件收进了 `/BIN /LIB /SYS /DOCS /SRC /TEST /DEV /MNT /INCLUDE` 九个分类目录
-> (`run HELLO` 这类命令不变,shell 会自动去 `/BIN` 找)。功能和界面没变,只是路径不一样;
-> 截图留作早期版本的存档。
+| 能力 | Unix v6 (1975) | KKernel (2026) |
+|---|---|---|
+| 平台 | PDP-11/40，64 KB 地址空间 | x86 32 位，分页 + ring 3 |
+| 内存管理 | 交换，无分页 | 分页 + 按需分页，每程序独立地址空间 |
+| 进程 | 分时多用户进程 | 抢占式内核线程（20 ms 轮转）+ 4 条 shell，每条 shell 各跑一个程序 |
+| 用户态隔离 | 有（多用户） | 有（ring 3 + TSS + 页表 U/S 位） |
+| 文件系统 | 原生 Unix FS（RK05 盘） | FAT16/FAT32 读写；实验性 KiFS（独立仓库，journal + CoW） |
+| 设备抽象 | 字符/块设备 | `/DEV` 虚拟设备层 + ATA PIO（LBA28/48）+ UHCI USB 存储（只读） |
+| 终端 | 串口 ASCII | VBE 800×600×32 图形终端，UTF-8 + 42 112 字形 + 拼音输入法 |
+| 编译器 | 系统自带 C 编译器 | 内置 TCC 移植：系统内编译 C → ELF → 运行 |
+| shell | sh（管道、重定向） | KKernel shell：管道、`cp`/`mv`、`/DEV`、样式、rc.conf 开机服务 |
+| 网络 | 无 | 无（PCI 已能枚举 e1000，协议栈在路线图上） |
+| 多用户/权限 | 多用户 + 权限位 | 单用户；FAT 无权限位（隔离靠 ring 3） |
+| 体积 | 内核数十 KB，磁盘 2.5 MB 级 | 内核 128 KB，镜像 16 MB，代码约 2.4 万行 |
 
-一个**从头写的、4000 多行的 x86 操作系统**,能启动、能分页、能读硬盘、
-有自己的文件系统和 shell,还能**跑你写的小程序**。
-没有引用任何现成内核 —— 引导扇区是手写的机器码级汇编,VGA 输出、中断、页表、ATA 驱动全靠自己填。
+> 一句话：**KKernel 是 v6 的能力骨架 + 2026 年的终端/编译器/USB，还差 v6 的多用户与网络。**
 
-写它的目的不是"做个能用的系统",而是**把 计算机启动到底发生了什么 一层层摊开给你看**:
-从 BIOS 把 512 字节读进 0x7C00,到 GDT/保护模式/IDT/分页/键盘中断/ATA 读盘/FAT16,
-每一段都在源码注释里讲清楚,包括**踩过的坑**(下面有专门一节)。
-(ps:哪来的精力时间给linux加个带中文的fb然后大改喂给你赤?)
+## 已实现
 
-> 你可以随便改。改坏了 `make test` 会告诉你哪一项坏了。
->
-> 想最快见效?**别碰内核,写个程序丢到磁盘上跑** —— 见 [docs/programs.md](docs/programs.md)。
+| 子系统 | 内容 |
+|---|---|
+| 引导 | 512 B 引导扇区（软盘/硬盘双路径，LBA + CHS 兜底），加载内核到 0x100000 |
+| 内核骨架 | 保护模式、GDT/IDT、26 个中断/异常、TSS、`iret` 进入 ring 3 |
+| 内存 | E820 探测、运行时 `ident`、物理页池、分页 + 按需分页、每程序独立地址空间、页泄漏回收 |
+| 调度 | 抢占式轮转（20 ms 时间片，6 个线程槽），`ps`/`spawn`/`kill`；多 shell 各一条内核线程，`Ctrl+←/→` 切焦点 |
+| 图形 | VBE 800×600×32、帧缓冲行缓冲与滚动、UTF-8 终端（解码 + 全宽汉字）、42 112 字形全字库（磁盘）/ 416 字形内置子集、光标/清屏/颜色、提示符样式（`kao` 默认 / `plain` / `moe` / `dos` / `c64`） |
+| 输入 | PS/2 键盘、拼音输入法（Shift 切换，候选条浮在屏幕最底两行，候选 + 拼音回显） |
+| 文件系统 | FAT16/FAT32 读写（子目录、VFAT 长文件名、多簇文件、FAT 双份一致性）；`mkfat.py` 生成镜像；镜像根目录 `/BIN` `/LIB` `/SYS` `/DOCS` `/SRC` `/TEST` `/DEV` `/MNT` `/INCLUDE` |
+| 设备 | `/DEV` 虚拟设备（`NULL` `ZERO` `RANDOM` `RTC` `CON` `DEVICES`）、ATA PIO、UHCI USB + USB 大容量储存只读（INQUIRY / READ CAPACITY / READ(10) / MBR）、PCI 总线枚举 |
+| shell | 30+ 命令：`ls` `cd` `cat` `write` `cp` `mv` `rm` `mkdir` `run` `ps` `shell` `style` `usbdisk` 等 |
+| 管道 | `A \| B` 顺序管道（最多 4 段）：生产者屏幕输出被内核捕获进页池缓冲，消费者用 `int 0x30` 功能 17 读回；配套工具 `WC` / `UPPER` / `GREP` / `HEAD` |
+| 工具链 | 内置 TCC 0.9.28 移植（源码没改，配 18 个标准头文件到 `/INCLUDE`）：系统内编译 C → ELF → 运行；宿主机 `bin/kkernel-cc` + SDK |
+| 用户程序 | 计算器、文本编辑器（UTF-8 整字符退格 + 拼音输入）、vi（STEVIE 移植）、扫雷（4 难度 / 随机雷数 / QUICKPASS 作弊）、FCALC 浮点计算器、播放器、自测试程序等 |
+| 系统服务 | `RC.CONF` 开机配置（hostname/services/style…）、服务启动、事件账本（环形缓冲 + `rc log`） |
+| 测试 | 9 组 QEMU 自动化套件（软盘/硬盘/FAT32/异常/键盘/shell/完整字库/USB），测试台屏幕 OCR 断言；另有 KiFS 断电注入测试（独立项目） |
+
+## 路线图摘要
+
+**已完成的大项**：多 shell 地址空间地基（每线程 TCB 持地址空间状态）、管道、`/DEV`、USB 大容量储存、FAT32、系统内 TCC 自举、KiFS 实验文件系统（journal + CoW，独立仓库）。
+
+**下一步**：
+1. **每 shell 独立虚拟控制台**（Phase 2）：后台 shell 不再共用一块屏，`Ctrl+←/→` 切出真正的多窗口体验——设计见 [docs/design-multishell-cow.md](docs/design-multishell-cow.md)。
+2. **fork + 写时复制 + wait**（Phase 3）：真正的进程模型，为 POSIX 兼容打地基。
+3. **网络**：PCI 已能枚举 e1000，协议栈（ARP/IP/ICMP/UDP/TCP）是中期目标。
+4. **POSIX-lite**：在 `int 0x30` 之上叠一层类 POSIX 系统调用，让现成 C 程序更容易移植。
+5. **多用户与权限**、**USB 写入**、**SMP**：长期目标。
+
+详见 [docs/roadmap.md](docs/roadmap.md)。
+
+## 快速开始
+
+依赖（Debian/Ubuntu）：
+
+```sh
+sudo apt install nasm qemu-system-x86 gcc-multilib python3 genisoimage
+```
+
+编译并启动：
+
+```sh
+git clone https://github.com/KaiXinLee114514/KKernel.git
+cd KKernel
+make hd                 # 构建 16 MB 硬盘镜像 build/kkernel-hd.img
+./tools/run.sh --hd     # 用 QEMU 启动
+```
+
+也可以 `make run` 直接跑默认硬盘镜像。
+
+### 有哪些能玩的
+
+```text
+> help                  # 命令列表
+> ls                    # 列目录（根目录是 9 个分类目录）
+> run CALC              # 计算器
+> run MINE.BIN          # 扫雷（1-4 选难度；QUICKPASS 作弊码把雷标红）
+> run EDIT DOCS/NOTES.TXT
+> cat DOCS/ZH.TXT       # 《黄鹤楼》——中文显示
+> cat DOCS/ZH.TXT | run GREP 黄鹤    # 管道
+> run TCC.BIN -c SRC/TCC_INC.C -o A.O
+> run TCC.BIN -static -nostdlib A.O LIB/CRT_TCC.O LIB/MINIC.O -o A.ELF
+> run A.ELF             # 系统内编译 C 并运行
+```
+
+> TCC 按文件后缀识别文件类型，命令行里请用小写 `.c` / `.o`。
+
+### 测试
+
+```sh
+make test               # 全部 9 组 QEMU 套件（约 40–60 分钟）
+make test-hda           # 单组：硬盘模式快速验证
+make test-mine          # 扫雷专项
+make test-usb           # USB 大容量储存（挂一个假 U 盘启动）
+```
+
+测试台会真的启动 QEMU、截图、用 OCR 断言屏幕内容；每项测试都对应一个真实行为，而不是 mock。
+
+## 源码地图
+
+```text
+boot/        引导扇区（512 B）与内核加载
+kernel/      内核：kmain / paging / sched / fat / ata / usb / fbterm / ime / shell / api / elf …
+lib/         迷你 libc（minic）与 C 启动代码
+include/     kkernel.h —— int 0x30 API 声明
+progs/       C / 汇编用户程序：计算器、编辑器、vi、扫雷、TCC 工具链、测试程序…
+extensions/  TCC 移植、STEVIE(vi)、播放器等扩展
+tccinc/      系统内 TCC 的 18 个标准头文件（生成镜像里的 /INCLUDE）
+font/        字库数据与生成工具
+tools/       mkfat / mkimg / run.sh / onekey_push.sh 等
+tests/       QEMU 自动化测试（qemu_test.py 等）
+docs/        架构、踩坑、shell 命令、子系统文档
+```
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | 图形模式、磁盘/地址空间/ring 3/线程/多 shell/输入法/rc.conf 实现细节 |
+| [docs/pitfalls.md](docs/pitfalls.md) | 39 条真实踩坑记录（调试笔记，精华所在） |
+| [docs/shell-commands.md](docs/shell-commands.md) | shell 命令参考 |
+| [docs/hacking.md](docs/hacking.md) | 怎么改：构建、测试、调试、提交约定 |
+| [docs/roadmap.md](docs/roadmap.md) | 路线图与待办 |
+| [docs/filesystem.md](docs/filesystem.md) | FAT16/32 实现、镜像布局、mkfat 用法 |
+| [docs/encoding.md](docs/encoding.md) | UTF-8、字库、拼音输入法 |
+| [docs/programs.md](docs/programs.md) | 用户程序(SDK) 与 int 0x30 API |
+| [docs/pci.md](docs/pci.md) | PCI 总线枚举 |
+| [docs/usb-disk.md](docs/usb-disk.md) | USB 大容量储存（只读裸盘） |
+| [docs/pipes.md](docs/pipes.md) | 顺序管道实现 |
+| [docs/devices.md](docs/devices.md) | `/DEV` 设备层 |
+| [docs/font.md](docs/font.md) | 中文与字库数据 |
+| [docs/rc-conf.md](docs/rc-conf.md) | `RC.CONF` 配置项 |
+| [docs/known-issues.md](docs/known-issues.md) | 已知限制与 flaky 测试说明 |
+| [docs/design-multishell-cow.md](docs/design-multishell-cow.md) | 多 shell 虚拟控制台 + fork/CoW 设计稿 |
+
+## 已知限制
+
+- **单用户，无账户/权限体系**：隔离只有 ring 3；FAT 没有权限位。
+- **没有 fork/exec/信号**：程序由 shell 启动，退出回 shell；进程模型的 Phase 2/3 在路线图上。
+- **没有网络**：PCI 能枚举网卡，协议栈还没写。
+- **USB 只支持 UHCI + 只读储存**，第一个 USB 设备必须是 U 盘，不支持热插拔。
+- **单核**：无 SMP；图形终端逐像素刷新，不适合高频动画游戏。
+- 真机兼容性有限（主要在 QEMU 验证）；详细清单见 [docs/known-issues.md](docs/known-issues.md)。
+
+## 参与开发
+
+- 开发流程与约定见 [docs/hacking.md](docs/hacking.md)：中文注释、改完必须跑 `make test-hda`、提交信息中文前缀。
+- 遇到 bug 请开 issue，附 QEMU 版本与复现命令。
+- 也可以直接提 PR——小型、可测试、带说明的改动最容易合入。
+
+## 许可
+
+[GPL-3.0](LICENSE)。字库来自 GNU Unifont（GPL-2+，见 [font/README.md](font/README.md)）；TCC 移植、STEVIE 等第三方组件版权归各自作者，见对应目录的 README。
 
 ---
 
-## 键盘打中文/日文/韩文:Alt 码位输入
-
-键盘只认 ASCII?**按住左 Alt,敲十进制码位,松开 Alt** —— 就打出那个字符:
-`Alt+20013` = 中、`Alt+22909` = 好、`Alt+128512` = 😀。
-原理见 [docs/quickstart.md](docs/quickstart.md) 第 7 节(内核里把码位编成 UTF-8 塞进按键缓冲)。
-
-因为是"码位直通",**日文/韩文/emoji 一样能打**(磁盘字库里有全平假名、全片假名、
-全部谚文音节、CJK 基本区两万多字)。手敲数字太累,有个转换脚本:
-
-```bash
-python3 tools/text2alt.py "日本語 한국어"        # 每个字 = Alt+多少,顺便查字库有没有这个字形
-python3 tools/text2alt.py --line "你好,世界"     # 只要一行数字
-python3 tools/text2alt.py --decode 26085 26412   # 反着来:码位 → 字
-python3 tools/text2alt.py --send build/qmp.sock "こんにちは"
-                                # ↑ 直接打进正在跑的虚拟机(make hd 已经把 QMP 开在 build/qmp.sock)
-```
-
-大小写:**Shift 和 Caps Lock 都管用**(字母是 `Shift XOR Caps Lock`,和真键盘一样 ——
-两个都开反而是小写),Caps Lock 按一下还会给键盘发 `0xED` 把灯点对。
-
-## 用纯 C 写程序(SDK)
-
-不想碰汇编?`bin/kkernel-cc` 一条命令把你的 `.c` 编成 KKernel 能跑的 `.BIN`,
-`bin/kkernel-run` 直接造镜像开机看结果 —— 见 [docs/quickstart.md](docs/quickstart.md)。
-
-**vi 已经不是主线了**:STEVIE 移植搬去了 `extensions/vi/`,默认镜像里没有它,
-`make ext-img` / `make run-ext` 才构建和启动(规矩见 [extensions/README.md](extensions/README.md))。
-(作者ps:或者系统内run tcc.bin 先生成.o文件 然后是-static -nostdlib写进去)
-
-## 1. 现在能干什么
-
-| 功能 | 说明 |
-|---|---|
-| 启动 | 512 字节引导扇区,BIOS 传统 MBR 方式加载到 `0x7C00` |
-| **多扇区读盘** | 一次读多个扇区把 128 KiB 内核搬进内存;**LBA(EDD)和 CHS 两条路径都有**,自动探测 |
-| 保护模式 | GDT(代码段 + 数据段,平坦 4 GiB)、`CR0.PE`、32 位段寄存器全部就位 |
-| IDT | 256 个中断门,0~31 号 CPU 异常都有处理程序,出错就红屏报**异常名 / 错误码 / EIP / CS / EFLAGS**(页错误还会报 CR2) |
-| 分页 | 页目录 + 页表,**恒等映射 0~ident**(按可用内存自适应,最多 256 MiB;所以指针就是物理地址)+ VBE 帧缓冲高地址窗口;运行期能**动态建表**(`debug pmap`),物理页池 = 位图分配器(按可用内存自适应,最大 250 MiB(让出字库槽),`debug pmem` / `debug ptest`);**跑程序时进按需分页**:每个程序一套空地址空间,碰到哪页才补哪页(见第 5 节) |
-| 键盘 | 8259A 重映射到 `0x20`,IRQ1 中断方式收键,扫描码翻译表(含 Shift)、**Caps Lock**(顺带给键盘发 `0xED` 点灯)、方向键/PgUp 等扩展键、64 字节环形缓冲 |
-| **定时器(PIT)** | 8254 通道 0 以 **100 Hz** 发 IRQ0,内核只做一件事:`inc` 一个 tick 计数。`uptime` 读开机秒数,`sleep <秒>` 用 `hlt` 等(空闲时不烧 CPU);**抢占式多任务就是在 IRQ0 里切栈**(见 §5「线程与调度」) |
-| **内核线程 + 抢占式轮转** | 6 个线程槽、每个线程 **20 ms 时间片**(`kernel/sched.asm`):IRQ0 里存 esp/CR3、轮转、换栈;`ps` 看线程表、`spawn` 起演示线程(alpha / beta 每秒各打一行)、`kill` 杀掉并把栈还给物理页池;要是被杀的那条正占着程序的地址空间,顺手把那套页目录 + 私有页表也收摊还回去(见 §5) |
-| **多 shell(4 条)** | 4 条 shell 各是一条内核线程,**Ctrl+←/→ 换键盘焦点**(在键盘中断里切,所以卡在程序里的那条也能被换走);`shell` 列出、`shell 3` 直接跳;每条 shell 有自己的行缓冲和当前目录,切换时没敲完的半行会跟着走;**每条 shell 各跑一个程序**(地址空间每线程一份);shell 线程本身杀不掉,但能 `kill` 掉它跑的程序(见 §5) |
-| **提示符样式** | **kao(颜文字,默认:黄色 `(・ω・)`,命令报错时变红 `(；ω；)`)** / **plain(朴素 `>`)** / **moe(萌,粉色的 `かいかーねる>`,报错也换成吐槽)** / **DOS(`C:\>`)** / **C64(`READY.`)**;`style` 命令现场换,也能在 `RC.CONF` 里写 `style = moe`(或 kao/plain/dos/c64)开机就生效 |
-| **ring 3 用户态** | 程序不再由内核 `call` 进去,而是 `iret` 到 **CPL=3**:内核运行时重建 GDT(0x1B 用户代码 / 0x23 用户数据 / 0x28 TSS)+ `ltr` 装 TSS(从 ring 3 掉回内核的栈只能从 TSS 取);程序页表项带 U/S 位,**内核的页它碰不到** —— 故意读内核内存会被页错误干掉、内核自己接着用(`run FAULT` 现场演示);程序结尾照旧 `ret`:内核在用户栈顶压了**弹床页**(0x17F000,三条指令 `int 0x30` 功能号 15 退出),所以现有程序一行都不用改(见 §5) |
-| **rc.conf 服务 / 事件库** | 挂盘里的 `/SYS/RC.CONF` 是**纯 `key=value`**(BSD / OpenRC 那种,不是 systemd 段):`hostname` / `boot_msg` / `autostart` / `on_crash` + `service_N`(程序、参数、启用开关)。`rc` 一条命令管起来:`rc list` 看服务、`rc get KEY` 取值、`rc start N` **把服务当程序跑**(借 `run` 那条路:ring 3 + 按需分页)、`rc reload` 重读刚写的配置;另有**事件账本**:开机 / 读配置 / 服务起停 / 程序跑完 / 程序崩了 / 线程被 kill / 换 shell,每种连 100 Hz 的 tick 一起记 16 条(`rc log`);`autostart=YES` 就是开机按配置跑服务,`on_crash=reboot` 则程序崩了直接重启(见 [docs/rc-conf.md](docs/rc-conf.md)) |
-| **拼音输入法** | 按 **Shift** 切中英;打 `shuang`,**屏幕最底两行浮出候选条**「1.双 2.爽 3.霜 …」+ 第二行拼音回显(不打断正在敲的命令行,选完字拼音原地换成汉字),**数字 1-9 或空格**选字、回车出候选、Esc 取消;一页 9 个、**`,` / `.` 翻页**(提示里有页码)。词表是盘上的 `/SYS/PINYIN.BIN`(6000 常用字,按词频排序,`tools/mkpinyin.py` 生成) |
-| **实时时钟(CMOS)** | 从 CMOS(`0x70`/`0x71`)读日期/时间/星期:等 UIP 清零 + **读两遍比对**(正好翻秒就重试,最多 3 遍)、BCD→二进制、12 小时制的 PM 位也认、世纪没有就按 20xx 猜;`date` 一条命令看时间,`date ymd` / `mdy` / `dmy` / `time` 换格式(见第 7 节) |
-| **PCI 总线枚举** | 开机扫 bus 0:`pci` 列出机器上所有设备(厂商:设备号 / 类别名 / 中断号),`pci 0:1.2` 看单台设备详情(类别、命令寄存器、六个 BAR 是内存还是 I/O、内存 BAR 多大);配置空间走 **机制 #1**(`0xCF8` 地址 / `0xCFC` 数据),多功能设备的"兄弟功能"也会一起扫出来 —— 这是 USB 的前置工作(见 [docs/pci.md](docs/pci.md)) |
-| **ATA 驱动** | 直接操作 `0x1F0~0x1F7` 的 PIO 读写硬盘(分块 + 每扇区等 DRQ + FLUSH CACHE),见 [docs/filesystem.md](docs/filesystem.md) |
-| **FAT16 / FAT32 文件系统** | 按 BPB 自动认 FAT16 还是 FAT32(`make test-hd32` 跑 88 MB 的 FAT32 镜像);挂载 / 找文件 / 读 / **写**(建目录项、分配簇、更新两份 FAT)/ `ls` 列目录 |
-| **子目录** | `ls DOCS`、`cat DOCS/NOTE.TXT`、`cd` / `mkdir` / `rmdir` / `rm`、路径里 `/` 和 `\` 都认;子目录里的程序 `run DOCS/HELLO.BIN` 和 `int 0x30` 的读写接口都跟着当前目录走;子目录满了会自动往簇链上接新簇 |
-| **/DEV 设备抽象层** | 「一切皆文件」的最小版:`DEV/` 开头的名字不查磁盘,改查内核设备表 —— `DEV/NULL`(黑洞)/`DEV/ZERO`(零)/`DEV/RANDOM`(伪随机)/`DEV/RTC`(实时时钟)/`DEV/CON`(写屏幕)/`DEV/DEVICES`(列设备);`cat`/`write` 和 `int 0x30` 的读写接口共用同一批 handler,C 程序 `fopen("DEV/RTC")` 直接能读(见 [docs/devices.md](docs/devices.md)) |
-| **管道(pipe)** | `A | B` 把 A 的屏幕输出接给 B 的 stdin(顺序执行,不需要并发):最多 4 段,缓冲从物理页池现借现还(64 KB/16 KB/4 KB 逐级降,页池不够就报错不崩);内建命令和 `run PROG` 都能当管道段;配 `WC` / `UPPER` / `GREP` / `HEAD` 四个 C 小工具,见 [docs/pipes.md](docs/pipes.md) |
-| **USB 大容量储存(只读裸盘)** | 插一个 U 盘(或 QEMU 的 `usb-storage`),`usbdisk` 一条命令就能看它是什么、读任意扇区、解 MBR 分区表:内核里是 UHCI 控制器 + **Bulk-Only Transport**(CBW/CSW)+ **SCSI 最小集**(INQUIRY / TEST UNIT READY / READ CAPACITY / READ(10) / REQUEST SENSE);只读、裸扇区,不接 FAT 也不写盘。`usbdisk` / `usbdisk read <lba>` / `usbdisk hexdump <lba>` / `usbdisk mbr` / `usbdisk sense`(见 [docs/usb-disk.md](docs/usb-disk.md)) |
-| **跑磁盘上的程序** | `run HELLO`:从磁盘读进来 → 给这个程序**建一套自己的页目录**(私有页,见下) → 切 CR3 → 执行(镜像超 384 KB 直接拒绝),程序用 `int 0x30` 调用内核(见 [docs/programs.md](docs/programs.md)) |
-| **程序接口 17 个功能** | 打印/颜色/收键 + 清屏、读写文件、定位光标、读键事件(方向键)、屏幕尺寸、程序参数、定位画字、**蜂鸣器(14 号 `beep`)**、**读 stdin(17 号 `j_pipe_read`,管道右半边用)** —— 够写全屏程序,还够唱一首 |
-| **组件:计算器** | `run CALC`:`+ - * /`、小数点、平方,自己实现定点小数(6 位小数),除零/溢出都会报错 |
-| **组件:文本编辑器** | `run EDIT [文件名]`:全屏编辑,可见光标(亮绿 `_`)、方向键/Home/End/Delete/PgUp/PgDn、`Ctrl-S` 存盘、`Ctrl-F` 查找(大小写不敏感、找完自动绕回开头,再按一次找下一个)、`Ctrl-Q` 退出;`Shift` 切换中/英输入法(中文下 a-z 打拼音、空格/回车出候选、1-9 选字、`,/.` 翻页、`Esc` 取消,和 shell 里同一份 `/SYS/PINYIN.BIN`);退格/Delete 按 UTF-8 整字符删,不会留半个字 |
-| **组件:系统内 C 编译器(TCC 移植)** | `run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o` 在系统里编译 C;系统头文件在 `/INCLUDE`(仓库 `tccinc/`,含 stdio/stdlib/string/ctype/stdint/limits/errno/time/unistd + TCC 自带 stdarg/stddef 等),`#include <stdio.h>` 可直接用;链接用 `-static -nostdlib` + `LIB/CRT_TCC.O`/`LIB/MINIC.O`,产物是内核 ELF loader 能跑的 ELF(见 [extensions/tcc/README.md](extensions/tcc/README.md)) |
-| **组件:蜂鸣器 + 文本谱播放器(不含示例谱,自备谱文件)** | `run PLAY MYSONG.TXT`:PC 喇叭按 FAT 上的**纯文本谱**唱歌(注释、音名 `C4`~`B5` 带 `#`、时值、tempo 都能改);`run PLAY --list` 只解析不出声、把谱子打到屏幕上(可测);内核那头就是 14 号 `beep`,忙等标定见 [kernel/speaker.asm](kernel/speaker.asm)(见 [docs/quickstart.md](docs/quickstart.md)) |
-| **键盘扩展键** | `0xE0` 前缀的方向键/Home/End/Del/PgUp/PgDn,还有 Ctrl 组合键(Ctrl-S / Ctrl-Q / Ctrl-F) |
-| **vi(STEVIE 移植)** | `run VI DOCS/NOTES.TXT`:公有领域的 vi 克隆(STEVIE 3.68,vim 的前身),约 10 900 行 C 一行没改,只把平台层换成 `int 0x30` —— 插入模式、方向键、`:w` 存盘、`:q` 退出(移植记在 [docs/vi.md](docs/vi.md)) |
-| **C 语言支持** | 普通 `gcc -m32` 就能编(`make cc-check`);自带 crt0 + 迷你 libc(malloc/printf/stdio)+ `kkernel.h`,程序照样是平铺二进制丢进 FAT16 跑(见 [docs/c-programs.md](docs/c-programs.md)) |
-| **图形模式** | 实模式 stub 里用 VBE 问出 **800×600×32 线性帧缓冲**模式,页表把帧缓冲映射进来,终端直接往显存画像素 |
-| **点阵字库** | GNU Unifont:内核里编了 416 字形保底,硬盘镜像上放**完整 42 112 个字形**(1.8 MB,含希腊字母/箭头/几何/符号等颜文字素材),启动时用 ATA 读进内存 |
-| 中文显示 | ✅ 一个汉字 16×16 直接画在帧缓冲上;文本是标准 **UTF-8**(四字节 emoji、坏字节替换符都处理了) |
-| 终端 | 会滚屏的终端(文本模式走 VGA 文本缓冲,图形模式走帧缓冲),支持 `\n` `\r` `\b` |
-| shell | `help` `echo` `clear` `info` `debug` `reboot` `ls` `cat` `write` `run` `date` `uptime` `sleep`,带退格的行编辑 |
-
-## 2. 快速开始
-
-需要 `nasm`、`qemu-system-i386`、`python3`:
-
-```bash
-# Debian/Ubuntu 别的发行版管不了 反正总不就是装个nasm qemu和py3
-sudo apt install nasm qemu-system-x86 python3
-
-make                    # 构建两个镜像:build/kkernel.img(软盘)+ build/kkernel-hd.img(硬盘)
-make run                # 软盘镜像,开窗口在 QEMU 里跑(自己敲键盘玩)
-make hd                 # 完整硬盘镜像:字库 + FAT16 + 示例程序(推荐用这个)
-
-# ★ 软盘版只保留"最小演示":能开机、能进 shell,但没有 FAT 盘 / 字库盘 / RC.CONF,
-#   ls、cat、run 这些都没有。开机第一屏会明说一句:
-#     floppy edition: minimal - use the hard disk image for the full system
-#   软盘这条线已经停止开发(不再加新功能),只在 `make test-fda` 里当"CHS 退回路径"的回归。
-#   开机那两行算是它的墓碑:一行说"完整功能请用硬盘版",一行是 `Goodbye Floppy disk`。
-#   它没有真的死掉 —— 每次 make test 都还会把这块镜像拉出来跑一遍,守那条最老的 BIOS 退路。
-make test               # 无头自动化测试:8 组,全过会打 ✅
-make clean              # 清掉 build/
-
-./tools/run.sh          # 启动脚本:自动构建 + 选"怎么挂盘"
-./tools/run.sh --hdd    #   把软盘镜像当硬盘挂 → 会走 LBA/EDD 那条路
-./tools/run.sh --hd     #   完整硬盘镜像(推荐:能 ls / cat / run)
-./tools/run.sh --div    #   开机就除零 → 直接看 panic 屏
-./tools/run.sh --gdb    #   开 gdb 调试端口(-s -S)
-./tools/run.sh --monitor #  把 QEMU monitor 接到终端(能 sendkey / xp 读显存)
-./tools/run.sh --dry-run #  只打印 qemu 命令行,不启动(排错用)
-QEMU_DISPLAY=none ./tools/run.sh   # 无窗口跑
-```
-
-在硬盘模式里值得敲一遍的:
-
-```
-> ls                    ← 列当前目录(根目录只有九个分类子目录)
-> cat DOCS/README.TXT   ← 读一个 UTF-8 文本文件(里面有中文)
-> run HELLO             ← 跑磁盘上的程序
-> write MY.TXT hello    ← 写文件(真的落到磁盘上)
-> cat MY.TXT            ← 再读回来
-> run                   ← 裸敲 run 会打印程序接口说明书
-> run CALC              ← 计算器:12.5*4=  7s(平方)  c(清零)  q(退出)
-> run EDIT              ← 编辑器:改 DOCS/NOTES.TXT,方向键移动,Ctrl-S 存盘,Ctrl-F 查找,Ctrl-Q 退出
-> run EDIT MY.TXT       ← 也可以指定文件(不存在就是新文件)
-> run VI DOCS/NOTES.TXT ← vi(STEVIE 移植):i 进插入模式,ESC 回普通模式,:w 存盘,:q 退出
-> run PLAY MYSONG.TXT   ← 蜂鸣器按文本谱唱歌(谱子自己写,音名/时值/tempo 都在 txt 里)
-> run PLAY --list MYSONG.TXT ← 只解析:把谱子打到屏幕上(不出声,改谱时拿它对答案)
-> run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o  ← 系统内编译(系统头文件在 /INCLUDE)
-> run TCC.BIN -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf
-> run tcc_inc.elf       ← 输出 TCC #include: include works
-> ls BIN                ← 列 /BIN 里的程序(目录显示成 <DIR>)
-> ls DOCS               ← 列 /DOCS 里的文档与演示文本
-> cat DOCS/NOTE.TXT     ← 路径里带目录也行(斜杠/反斜杠都认)
-> cd DOCS               ← 进目录,提示符变成 DOCS>
-> mkdir SUB              ← 建目录(自动写好 . 和 ..)
-> rmdir SUB              ← 删空目录(非空的会拒绝,不会把文件弄丢)
-> rm OLD.TXT             ← 删文件(目录要用 rmdir;它占的簇会还回盘上)
-> cd ..                  ← 回上一层;cd / 回根目录
-> run TEST/HELLO.BIN    ← 子目录里的程序照样能跑(其实 run HELLO 也行:/BIN 兜底)
-```
-
-QEMU 窗口里的常用键:`Ctrl+Alt+g` 放开鼠标键盘抓取,`Ctrl+Alt+2` 切到 monitor 控制台(`Ctrl+Alt+1` 切回来)。
-
-**想听 `run PLAY` 出声**,`make hd` 那条 QEMU 命令不够:QEMU 7 以后 PC 蜂鸣器要显式接一个音频后端才响,
-用这一条(要 PC 扬声器仿真 + 一个 audiodev,PA/pipewire 宿主用 `pa`;方波**没有音量控制**,想小声就在宿主
-混音器里把这条流单独调小 —— 下面命令里的 `out.stream-name=KKernel` 就是给它起个认得出的名字。
-注意 `-audiodev` 里**没有** `out.volume=` 这种参数,QEMU 会拒绝启动):
-
-```bash
-qemu-system-i386 -machine pcspk-audiodev=snd0 -audiodev pa,id=snd0,out.stream-name=KKernel \
-    -drive file=build/kkernel-hd.img,format=raw,if=ide,index=0 -boot c
-```
-
-没声音先试 `-audiodev none,id=snd0`(不出声但至少不报错)或者 `pulseaudio`/`pipewire` 的 `pa` 后端;
-VirtualBox 不仿真 PC 扬声器,那里是听不见的(记在 [docs/known-issues.md](docs/known-issues.md))。
-谱子怎么写、怎么改自己的歌:[docs/quickstart.md](docs/quickstart.md)。
-
-`make test` 的 8 组(每组都真的启动 QEMU、抓屏、断言屏幕内容):
-
-| 目标 | 测什么 |
-|---|---|
-| `test-fda` | 当**软盘**启动 → 走 CHS 退回路径 |
-| `test-hda` | 当**硬盘**启动 → 走 LBA/EDD 路径 |
-| `test-div` | 故意除零 → 0 号异常,panic 屏要出现 |
-| `test-pgfault` | shell 里敲 `debug fault` → 14 号页错误,CR2 要等于出错地址 |
-| `test-kbd` | 用 QEMU monitor 的 `sendkey` **真按键**,验证回显、Shift、回车、退格 |
-| `test-shell` | 敲 `help`/`info`/`page`/`echo`/`clear`,验证命令、滚屏、清屏、中文、UTF-8 边界 |
-| `test-hd-font` | 硬盘镜像:字库从磁盘读、`ls`/`cat`/`write`/`run`、**计算器的八组算式**、**编辑器的敲字/存盘/退出**,最后**离线解析镜像**证明字节真落盘 |
-| `test-usb` | QEMU 挂一个假 U 盘(`usb-storage`),断言设备识别 / 容量 / READ(10) 读扇区 / MBR 分区表 / REQUEST SENSE |
-
-最后那一项有两套独立的验证手段:一套看屏幕像素(把期望的文字用字库渲染成图案再去截图里找),
-一套在 QEMU 关掉之后**直接解析镜像文件的 FAT 分区**(FAT16/FAT32 都认,不信内核自己打印的"写成功了")。
-
-```bash
-make test-hd-font  # 单独跑某一组
-make div           # 构建"开机就除零"的镜像,自己开着 QEMU 看 panic 屏
-python3 tests/qemu_test.py build/kkernel-hd.img --hda --dump   # 只把屏幕打出来,不做断言
-```
-
-## 3. 源码地图
-
-```
-boot/boot.asm          引导扇区(512 字节内):探 LBA/CHS 读盘 → 跳 stub
-kernel/stub.asm        实模式 stub(搬到 0x500):问 VBE 要图形模式 → GDT → 保护模式
-kernel/start.asm       内核镜像入口:拼装 stub 之后的 32 位部分(顺序有讲究,见注释)
-kernel/kmain.asm       内核入口 + 终端驱动(滚屏、光标、十六进制/十进制打印)
-kernel/utf8.asm        UTF-8 解码(坏字节 → U+FFFD,防溢出/代理区都拦了)
-kernel/idt.asm         IDT、32 个异常入口、panic 屏,idt_install 负责装门
-kernel/paging.asm      页目录 + 页表 + 开分页 + 按需分页(缺页补页、程序私有空间、
-                       用户页 U/S 位、弹床页 / 用户栈页 / 参数页)
-kernel/tss.asm         ring 3 的地基:运行时重建 GDT(用户代码/数据段)+ TSS + ltr
-kernel/keyboard.asm    8259A 重映射、IRQ1 键盘中断、扫描码翻译、环形缓冲
-kernel/pit.asm         8254 定时器:通道 0 按 100 Hz 发 IRQ0,只加 tick 计数(uptime/sleep 靠它)
-kernel/rtc.asm         CMOS 实时时钟:等 UIP、读两遍比对、BCD/12 小时制换算、日期格式化(date 靠它)
-kernel/sched.asm       内核线程 + 抢占式轮转:TCB 表、20 ms 时间片、IRQ0 里换栈、spawn/kill 的栈管理(ps 靠它)
-kernel/pci.asm         PCI 总线枚举:配置机制 #1、扫 bus 0(含多功能设备的兄弟功能)、类别名表、BAR 类型与大小
-kernel/rc.asm          rc.conf 服务/事件库:读 /SYS/RC.CONF、就地拆 key=value、按配置跑服务(借 shell 的 run)、16 条事件账本(rc 靠它)
-kernel/ime.asm          拼音输入法:开机读 /SYS/PINYIN.BIN、按音节查候选、挑字塞进命令行(Shift 切换在 keyboard.asm)
-tools/mkpinyin.py       生成 PINYIN.BIN(wordfreq 挑常用字 + pypinyin 取读音;`make pinyin`)
-kernel/fbterm.asm      帧缓冲终端:自己画字(光标/换行/滚屏/颜色)
-kernel/vgafont.asm     文本模式终端分支 + 码位分发(图形模式走 fbterm)
-kernel/ata.asm         ATA(IDE)PIO 驱动:读扇区 + 写扇区 + FLUSH CACHE
-kernel/fontdisk.asm    启动时把完整字库从磁盘读进 0x200000(读不到就用内建子集)
-kernel/fat.asm         FAT16/FAT32:挂载(BPB 自动判)/找文件/读/写/删(rm/rmdir)/列目录/子目录
-kernel/dev.asm         /DEV 设备抽象层:设备表 + 名字解析 + 六个虚拟设备(devices.md)
-kernel/usbdisk.asm     USB 大容量储存:bulk 传输 + BOT + SCSI 只读裸扇区(usb-disk.md)
-kernel/api.asm         int 0x30 程序接口(打印字符串/数字/码位、设颜色、等按键)
-kernel/speaker.asm     PC 蜂鸣器:14 号 beep(PIT 通道 2 定音高 + 0x61 开关扬声器,毫秒是忙等估的)
-kernel/shell.asm       shell:行编辑、命令解析、各命令实现
-progs/HELLO.asm        示例程序(最简)      —— 编译成 HELLO.BIN 放进镜像
-progs/COUNT.asm        示例程序(打印/颜色/码位)
-progs/CALC.asm         组件:计算器(定点小数,自己算 ±2147.483647)
-progs/EDIT.asm         组件:全屏文本编辑器(方向键 + 存盘 + 打开)
-progs/TOUCH.asm        示例程序(按需分页演示:一页页碰内存再验证)
-progs/NOTES.TXT        放进镜像的示例文本(编辑器默认打开它)
-progs/JPKR.TXT         放进镜像的示例文本(日文/韩文显示演示,shell 里 cat DOCS/JPKR.TXT)
-progs/ZH.TXT           放进镜像的示例文本(中文/UTF-8 演示,shell 里 cat DOCS/ZH.TXT)
-progs/EN.TXT           放进镜像的示例文本(莎士比亚 Sonnet 18,cat DOCS/EN.TXT)
-progs/CHELLO.c         C 写的示例程序(printf / malloc / 参数 / 读文件)
-progs/PLAY.C           组件:文本谱播放器(读 FAT 上的谱子 → int 0x30 的 beep;--list 只解析;不含示例谱)
-include/kkernel.h        C 程序用的头:15 个 int 0x30 包装 + 颜色/键值常量
-lib/minic.c            迷你 libc(约 600 行:字符串/内存/printf/一点点 stdio)
-lib/crt0.asm           C 程序入口:清 BSS → main() → ret 回 shell
-lib/kkernel.ld           链接脚本:0x120000 + 平铺二进制 + BSS 边界符号
-extensions/vi/    公版 STEVIE(vi 克隆)的源码 + 我们写的 kkernel.c 后端(替换 nt.c)
-progs/README.TXT       也放进镜像(盘上在 /DOCS/README.TXT),shell 里 cat DOCS/README.TXT 能看(UTF-8 中文)
-tools/mkimg.py         拼镜像:boot(第 0 扇区)+ stub + kernel + 磁盘字库
-tools/mkfat.py         在镜像里造 FAT16 或 FAT32 分区(--fat32),并把文件/目录放进去
-tools/unifont2bin.py   Unifont .hex → KKF0 二进制字库 / VGA 字模 / 中文文案
-tools/mkfontsubset.py  从完整 .hex 里抽出要用的字形(生成入库的小子集)
-tools/text2alt.py      文字 → Alt 码位序列(查字库 / 直接打进 QEMU),见上面的"日文/韩文"
-tools/run.sh           QEMU 启动脚本(软盘/硬盘/完整硬盘/panic 演示/gdb/monitor/dry-run)
-tools/onekey_push.sh   一键 push:自动重试 + GH_TOKEN 环境变量(不落盘),GitHub 时通时不通时用
-tests/qemu_test.py     无头测试:HMP 抓屏 + sendkey 注入按键 + QMP 打码位 + 离线解析镜像
-tests/probe_disk.asm   探针:实测"软盘到底支不支持 LBA 读"(见第 6 节)
-```
-
-内核是**平坦二进制 + `%include`**,没有用链接器 —— 所有 `.asm` 在同一个翻译单元里,
-所以 `kernel/*.asm` 之间可以直接互相调用。这样简单,代价是符号名不能重复,
-而且**第一个被 include 的文件决定入口地址**(`kernel/start.asm` 里有注释说明)。
-
-内存布局(上半段写死,页池大小按机器内存自适应):
-
-```
-0x000000 - 0x0004FF   中断向量表 / BIOS 数据区
-0x001000              页目录                  (paging.asm,PD_ADDR)
-0x002000              页表:恒等 0-4 MiB        (PT_LOW)
-0x004000              页表:VBE 线性帧缓冲      (PT_LFB,按帧缓冲物理地址对齐)
-0x007C00              引导扇区(512 字节)
-0x010000 - 0x02FFFF   内核区(128 KiB = 256 扇区,实到约 70 KiB)
-0x090000              内核栈(往下长)
-0x0B8000              VGA 文本缓冲(80×25,每格 2 字节:字符 + 颜色)
-0x100000              FAT 扇区缓冲           (fat.asm 的 FAT_BUF)
-0x110000              cat 的文件缓冲         (shell.asm 的 FILE_BUF)
-0x120000 - 0x17FFFF   程序镜像窗口(384 KB,虚拟地址)    (shell.asm 的 PROG_ADDR;物理页每次运行都换,按需才给)
-0x180000 - 堆顶-1      堆窗口(malloc,虚拟):默认 128 MiB 机器约 2.1 MB;
-                      顶到 PINYIN 前/4 MiB 窗口内,大小运行时定(见下面"可变的三样")
-(字库 + 读描述块的临时缓冲:运行时放在恒等映射顶部 ident-2 MiB 的 2 MiB 槽里,
- 不再固定 0x200000;默认 128 MiB 机器是 0x7A00000 起、1.8 MB)
-0x3B0000 - 0x3BFFFF   PINYIN 拼音表(ime.asm,最多 60 KiB)
-0x3C0000 - 0x3C1FFF   USB 帧列表/QH/TD(usb.asm)
-0x3C1200 - 0x3C2FFF   USB bulk QH/TD + BOT/CBW/CSW/数据缓冲(usbdisk.asm)
-0x3D0000 - 0x3D1FFF   页池位图(8 KiB)          (pmem.asm,PMEM_BITMAP;最多记 64512 页 = 252 MiB)
-0x400000 - ident      物理页池(4 MiB ~ 恒等映射上限;上界按 RAM 自适应,最大 252 MiB)
-0xFD000000            VBE 线性帧缓冲(单独挂一张页表,映射到它所在的 4 MiB 窗口)
-```
-
-**可变的三样**(见 `kernel/kmain.asm` 的"内存布局"计算 + `kernel/paging.asm`):
-
-- **恒等映射范围** `ident`:开机 E820 探测出的可用内存 → 向下取整到 4 MiB,
-  夹在 [4 MiB, 256 MiB]。0-4 MiB 用固定的 PT_LOW;4 MiB 以上每 4 MiB 一张页表,
-  **页表页直接从页池拿** —— paging_init 在 pmem_init 之后跑,建表时还没开分页,
-  按物理地址写完、开分页后它们天然落在恒等映射里,同时被页池记账占住。
-- **字库位置**:恒等映射顶部 `ident-2 MiB` 的 2 MiB 槽(1.8 MB 放得下),读描述块的
-  临时缓冲在它前面一页。以前固定在 0x200000,阶段 2-B 起搬到这里 —— 好处是低端
-  0x200000-0x3AFFFF 让给了程序堆窗口。
-- **页池** `0x400000 ~ min(ident, 字库槽下界)`:池大小 ≈ ident - 6 MiB(最大 250 MiB)。
-  位图在 0x3D0000(8 KiB),一页一位。页池顶端必须让出字库槽,否则分配出去的物理页
-  会盖掉字形数据。所以 `-m 8` 这种小机器恒等只有 4 MiB、页池 0 页(只能跑内置命令,
-  开不了图形模式);`-m 9` 有 512 页,`-m 16` 有 1536 页,默认 128 MiB 的 QEMU 是
-  `ident=124 MiB`、页池 30207 页(约 118 MiB)。
-- **程序堆窗口**:`0x180000 ~ min(字库临时缓冲, 0x3B0000 PINYIN 起点)`,只占 4 MiB
-  以内那张私有页表。默认 128 MiB 机器是 560 页(约 2.2 MB);`-m 8` 只有 127 页(约 0.5 MB)。
-
-开机打印四行机器可读的布局(测试脚本解析它们做断言):
-
-```
-layout: ram=127M e820=6 ident=124M
-layout: pool=0x00400000-0x079FF000 pages=30207
-layout: img=0x00120000+96p heap=0x00180000+560p
-layout: tramp=0x0017F000 args=0x003AE000 stack=0x003AFFFC
-```
-
-内核里指针就是物理地址(恒等映射),写代码不用想 MMU;`ident` 以上没映射
-(踩了就吃 14 号页错误)。页池只从 0x400000 往上发,因为低 4 MiB 被上表这些
-固定区域占满了 —— 与其一条条列"这些不许用",不如整段划出去。
-
-**唯一的例外是跑程序的时候**:镜像窗口 + 堆窗口那些页(默认 96+560 页)在内核里照旧是恒等映射
-(所以 shell 能读能写),但在程序那套页表里它们是"不存在"的 —— 程序碰到哪页,
-缺页处理才从页池现拿一页(见第 5 节的按需分页)。
-
-## 4. 图形模式(VBE + 帧缓冲)
-
-文本模式那条路只能放 63 个汉字(一个汉字要占两个 8 像素宽的字符格),所以正经中文
-得进图形模式 —— 屏幕就是一块显存,画什么全由自己决定。
-
-```
-实模式 stub    int 0x10 AX=4F00/4F01 列模式 → AX=4F02 设成 800×600×32(带线性帧缓冲)
-               → 把 帧缓冲物理地址/宽/高/pitch/色深 写进 BOOTINFO(0x8000)
-分页           帧缓冲在 0xFD000000,不在恒等映射窗口(0~ident)里
-               → 按 4 MiB 对齐算页目录项,挂一张页表把它映射进来(不映射第一次写像素就吃页错误)
-帧缓冲终端     kernel/fbterm.asm:码位 → 二分查找字库 → 逐行取位 → 往显存写 4 字节像素
-               (颜色从文本模式的属性字节换算成 RGB;滚屏就是 memmove 整块显存往上 16 行)
-```
-
-坑:16×16 的汉字一行是**两个字节**,低地址那个才是左半边 —— 一开始我用 bit15 开始往左画,
-结果**汉字左右两半反了**(每个字看着像"对折过"的样子)。修法是 `rol ax, 8` 把两个字节换回来。
-
-## 5. 磁盘:字库、FAT16、跑程序
-
-磁盘之上还有一层很薄的「设备」抽象:`/DEV` 下的名字由内核设备表接管(见 [docs/devices.md](docs/devices.md))。
-(因为还没更新完)
-这一块单独写了一页:**[docs/filesystem.md](docs/filesystem.md)** —— 镜像的 LBA 地图、
-ATA PIO 的寄存器顺序和两个坑、磁盘字库怎么加载、FAT16 的字段和写文件流程、
-`mkfat.py` 怎么用、测试怎么用两条信道证明"字节真的落盘了"。
-
-想写程序的话看另一页:**[docs/programs.md](docs/programs.md)** —— `int 0x30` 的六个功能、
-为什么用中断而不是 `call` 内核函数、程序的内存/栈约定、怎么加进镜像。
-
-一句话版:
-
-```
-run HELLO      → fat_stat 看大小 → fat_read_file 先读进 0x120000(暂存)
-               → space_create 建一套空地址空间(页目录 + 页表两页,窗口里的页一页都不给)
-               → 切 CR3 → call 0x120000 → 程序碰到哪页,页错误才从暂存区补哪页
-               → 程序 ret 回 shell → 切回 CR3 → 补出来的页连页表一起还给页池
-程序里:         mov eax, 0 / mov esi, 字符串 / int 0x30   ← 打印一行
-```
-
-### 每个程序有自己的地址空间(而且是按需给的)
-
-跑程序之前,内核给它现搭一套页表(**见 [kernel/paging.asm](kernel/paging.asm)
-的 `space_create`**):
-
-```
-页目录   = 内核页目录的副本        (内核、IDT、VGA、字库、帧缓冲都还在)
-页表[0]  = PT_LOW 的副本,但 0x120000~0x1EFFFF 的 208 项**清成"不存在"**
-私有页   = 一页都不预先给 —— 程序碰到哪一页,14 号页错误才现补哪一页
-```
-
-所以:程序的**虚拟地址不变**(还是链接到 `0x120000`,程序自己不用改),
-**物理页每次运行都是新的一批**,而且**只有它真正走过的页才会拿到内存**:
-
-```
-> run HELLO.BIN
-running HELLO.BIN
-address space: CR3 = 0x00400000  (own page directory + demand paging)
-Hello from HELLO.BIN - I was loaded from the FAT16 disk!
-program returned to the shell
-address space destroyed: 3 page(s) back to the pool
-demand paging: 1 page(s) faulted in (image 1 + heap 0), first page 0x00402000
-```
-
-249 字节的程序**只要 1 页**(以前是把整个窗口全给它)。主动去踩内存的是
-[progs/TOUCH.asm](progs/TOUCH.asm),`run TOUCH` 会一页一页碰 32 页堆 + 一页 `.bss`,
-然后回头检查每一页都还是自己写进去的标记:
-
-```
-> run TOUCH.BIN
-  heap: touched 32 pages (4 KiB each), wrote 0xA5 into every one of them
-  pages that were NOT zero before my write: 0     ← 现给的页必须是干净零页
-  pages that did not read back what I wrote: 0     ← 每页都真的归自己
-  page beyond the file (bss at 0x17E000): was zero, as it should be
-demand paging: 34 page(s) faulted in (image 2 + heap 32), first page 0x00425000
-```
-
-补页的流程(都在 [kernel/paging.asm](kernel/paging.asm) 的 `page_fault_try_handle`
-和 [kernel/idt.asm](kernel/idt.asm) 的 `isr_common` 里):CR2 是出错地址 → 判断它
-落在镜像窗口还是堆窗口(窗口外就照旧红屏 panic)→ 从页池拿一页、清零 →
-镜像窗口里"文件之内"的部分从暂存区拷过来("文件之外"就是 `.bss`,留零页)→
-填页表 + `invlpg` → `iret` 回去**重执行那条指令**。程序完全感觉不到。
-
-几个老实交代的地方:
-
-- 没有 swap、没有页置换、没有写时复制:页一旦补进来就留到程序结束;
-- 窗口里的**空洞也会给页**(程序只是读一下 0x180000 附近的地址,也会拿到一页零页);
-- 暂时**不给程序自己长栈**:栈还是 shell 的栈(内核那套页表里);
-- 内核窗口继续恒等映射,所以 `int 0x30` 照旧能用 —— **不需要 ring 3**,
-  程序传给内核的指针也照旧解得开(那会儿用的就是程序这套页表)。
-
-### 程序跑在 ring 3:内核的内存它碰不到
-
-`RING3.BIN` 会直接问 CPU"我现在是谁"(`CS = 0x1B`、`CPL = 3`),`FAULT.BIN` 则故意去读内核内存 ——
-被内核抓住、打印原因、把这个程序干掉,机器继续跑:
-
-![ring 3:程序在 CPL=3 跑,摸内核内存会被干掉](docs/screenshot-ring3.png)
-
-程序从 `0x120000` 跑起来,但**不是内核 `call` 进去的** —— 内核用 `iret` 把它丢进用户态
-(CPL=3),它的代码段是 0x1B、栈段是 0x23。它自己能看到这件事:
-
-```
-> run RING3.BIN
-running RING3.BIN
-address space: CR3 = 0x00406000  (own page directory + demand paging)
-RING3.BIN: asking the CPU where I am running
-  CS  = 0x0000001B  (CPL = 3), SS = 0x00000023  ESP = 0x001EFFFC, [ESP] = 0x0019F000
-if CS is 0x001b and CPL is 3, this program is not the kernel any more.
-
-program returned to the shell
-```
-
-`[ESP]` 那个 `0x17F000` 是内核替它压进去的**弹床页**:程序最后一句 `ret` 会跳到那儿,
-弹床里就三条指令(`mov eax,15 / int 0x30 / jmp $`)—— 喊一声"我退出了"就回 shell。
-**现成程序一个都不用改**(C 程序的 crt0 也是 `ret`)。
-
-想去碰内核的地盘呢:
-
-```
-> run FAULT.BIN
-FAULT.BIN: now reading kernel memory at 0x00100000 ...
-
-program crashed: page fault at 0x00100000 (EIP 0x0012000C) -- that page belongs to the
-kernel, not to you
-
-program was killed, the kernel is fine
-```
-
-页表是**逐级**查权限的:内核恒等映射的那些页(0~ident)U/S=0,程序页才是 U/S=1,
-所以 `mov ebx,[0x100000]` 直接页错误;内核的处理是**把程序干掉、自己接着跑**
-(以前是 panic,现在是 `program was killed`)。用户态异常也不再是内核 panic:
-`isr_common` 先看错误码里的 CS(CPL),是 3 就交给 `prog_kill_from_fault`。
-
-程序自己那几块地(都在它自己的地址空间里,按需补页):
-
-| 地址 | 干什么 |
-| --- | --- |
-| `0x120000`-`0x17EFFF` | 程序镜像窗口(96 页;别拿 `0x17F000` 当数据缓冲——那是弹床页) |
-| `0x17F000` | 弹床页(单独映的 1 页:三条指令替程序喊"我退出") |
-| `0x180000`-`堆顶-1` | 堆窗口(`malloc` 从这儿长;大小看机器内存,默认约 2.1 MB) |
-| `堆顶-0x2000` | 参数页:内核里那份参数(0x11F000)对 ring 3 是"别人家的内存",装载器整块拷过来 |
-| `堆顶-0x1000` | 用户栈(栈顶 = 堆顶-4,那 4 字节是弹床地址) |
-
-### 线程与调度(内核线程 + 抢占式轮转)
-
-`kernel/sched.asm` 里 6 个线程槽,每槽是一个 **40 字节**的 TCB:esp / cr3 / 状态 /
-拿到过多少 tick / 被调度过几次 / 栈的物理页 / 名字 / 出生在哪条 shell 上。
-(原来是 32 字节,所以全仓都用 `shl 5` 当下标步长;加字段时改成了 `imul X, TCB_SIZE` ——
-见 §6.36。)**0 号线程永远是 shell 自己** ——
-它不是被谁创建的,而是开机时把当前上下文直接填进去。
-
-抢占点在 **IRQ0(PIT,100 Hz)**:`irq0_stub` 先发 EOI,然后判断调度器开没开,开了就把
-当前 esp 交给 `sched_pick` 决定下一个该跑谁,再 `mov esp, eax` 换栈,接着 `popad` +
-`iret` 就"回到"另一个线程里去了。**换栈这件事只能在中断入口这一层做**:`iret` 要从
-栈上弹 EIP/CS/EFLAGS,在普通函数里换完 esp 再 `ret` 是回不去的(理由见 §6.13)。
-
-新线程的"现场"由 `sched_spawn` 在它自己的栈上手工摆出来:按 `irq0_stub` 的格式摆好
-EFLAGS / CS / EIP / 错误码 / 向量号 / pushad 的八个寄存器,esp 指向这摞东西的最底下。
-于是它第一次被 `iret` 上去时,看起来就像"刚被中断打断过",函数体从头开始跑。
-
-局限(玩具级别的诚实说明):
-- 没有优先级、没有阻塞/唤醒原语,纯轮转;时间片固定 20 ms(2 个 tick)
-- 每个线程 2 页栈(8 KiB),`spawn` 时从物理页池要,`kill` 时还回去
-- `kill` 一条**正在跑程序**的线程时,会看它当时用的 cr3 是不是现在这套程序的:
-  是就把地址空间一并收摊(页目录 + 私有页表 + 已经按需补上的页全还回池子)
-- 内核不可重入的那些部分靠"大家都很老实"避开:线程各跑各的栈,但终端是全局状态,
-  两个线程一起打印、或者你正在敲命令时线程打印,屏幕上的字都会被插花 ——
-  看得见、不崩,输入缓冲区也不受影响(命令照常执行),只是显示乱。想打干净得先有锁
-- 还是**内核态**线程:没有 ring 3、没有 TSS、也还没做到"一个线程一套地址空间"
-
-自己试试:
-
-```
-> spawn            # 不带参数:第一次 alpha,第二次 beta
-spawned thread 4 (alpha)
-> spawn
-spawned thread 5 (beta)
-> ps
-ps: 6 alive / 6 slots, scheduled ticks 1169
-  [0] shell   ticks=893  runs=85
-  [1] shell2  ticks=790  runs=80
-  [2] shell3  ticks=700  runs=78
-  [3] shell4  ticks=690  runs=77
-  [4] alpha   ticks=170  runs=85
-  [5] beta    ticks=110  runs=56
-> kill 4
-killed thread 4 (alpha)
-```
-
-`ticks` 和 `runs` 都在涨,说明这几个线程是**真的轮流在 CPU 上跑**,而不是"登记了一下
-躺在那儿";`kill` 完再 `debug pmem`,空闲页数会回到开跑前的基线 —— 栈是借的,还得还。
-(基线数字随内存大小变:boot 常驻 19 页 + 恒等映射的页表页;4 条 shell 各占 2 页栈,
-0 号用的是开机栈,不占池子。)
-
-### 多 shell:卡死一条,还有三条
-
-4 条 shell 就是 4 条内核线程(0 号是开机那条,另外 3 条在 `kmain` 里 `spawn` 出来)。
-键盘归谁用一个 `sh_active` 记着,**Ctrl+← / Ctrl+→ 的切换是在键盘中断处理里直接做的** ——
-这点很关键:如果切换要靠"活动 shell 自己响应",那条正卡在 `run HANG` 里的 shell 就永远
-换不走了;放在中断里,谁来按键谁就能把键盘交给别人。
-
-每条 shell 有自己的行缓冲和当前目录,切换时:
-- 打一条 `--- shell N ---` 当分隔,再把提示符和**你没敲完的那半行**重新画出来
-- 半行输入跟着 shell 走:1 号敲一半 → 切到 2 号干点别的 → 切回来,那半行还在,回车就执行
-- **每条 shell 各跑一个程序**(地址空间那套状态现在每线程一份):一条 `run HANG` 卡着,
-  切到另一条 `run HELLO.BIN` 照样跑,互不打架
-- shell 线程本身**杀不掉**(`kill 0`~`kill 3` 不会拆线程):键盘挂在它们身上,杀了没人收键;
-  但 `kill <线程号>` 会停掉它正在跑的程序,连 ring 3 里的死循环也能被下一次时钟中断收走
-
-```
-> shell
-shells: 4
-(you are in shell 1)
-  [0] shell    <- keyboard here
-  [1] shell2
-  [2] shell3
-  [3] shell4
-Ctrl+Left / Ctrl+Right switches, or: shell <n>
-> shell 3
---- shell 3 ---
-3> 
-```
-
-想亲眼看"卡死也不影响别人":`run HANG`(开头报一行、**转 24 圈约 40~60 秒后自己退出**的
-演示程序),趁它占着这条 shell 的时候 `Ctrl+→` 逃到别的 shell,`echo` 照样有响应 —— 这就是
-多 shell 的意义。要提前收回卡住的那条:在别的 shell 里 `kill 0`(线程号见 `ps`),
-它会在下一次时钟中断时被内核收摊。
-
-> `run HANG` 为什么不是真死循环:演示程序要有始有终,测试套件才能接着用那条 shell。
-> 想试"永远回不来",把 `progs/HANG.asm` 的 `HANG_ROUNDS` 改大、或者删掉
-> `dec dword [rounds]` / `jnz .loop` 两行 —— 然后从另一条 shell `kill 0` 把它收掉。
-
-![4 条 shell 互相切换](docs/screenshot-shells.png)
-
-`shell` 列出来,`Ctrl+→` 切到 2 号敲命令,`3> date time` 是 3 号在跑;
-最后那两行是"半行命令"的演示:在 1 号敲了 `echo half-typed line survives` 没回车就跑掉了,
-切回来时它还在(提示符下面那行),回车就能执行。
-
-### 拼音输入法:Shift 切中英,打拼音选字
-
-按一下 **Shift** 切到中文(再按一下切回英文),然后打拼音:
-
-```
-> shuang
-（屏幕最底两行浮出候选条,命令行保持不动）
- 1.双 2.爽 3.霜 4.塽   1-9 pick  space pick first Esc cancel
- 拼音: shuang
-> 霜
-```
-
-选字之后,拼音被原地擦掉、换成汉字,命令行**不换行也不重画**,候选条(两行)直接消失。
-候选多于一页时,第一行右侧会显示页码,按 `,` / `.` 就地翻页重画候选条:
-
-```
-> xiang
-（底行:1.想 2.向 3.像 4.相 5.乡 6.项 7.象 8.香 9.响  ,/. page 1/4  Esc cancel）
-```
-(作者ps:日文韩文目前不会做 毕竟也不是我的母语 繁体中文倒是可以 但是免不了拼音了 仓颉注音我不行)
-数字 1-9 直接选**当前页**对应的候选、空格选当前页第 1 个、`,` / `.` 翻上一页 / 下一页
-(候选只有一页时提示里不显示页码)、Esc 取消;候选按**词频**排(最常用的在最前面)。
-数据在磁盘的 `/SYS/PINYIN.BIN`(6000 常用字、400 个音节,`ji` 这种音有 11 页),由
-`tools/mkpinyin.py` 用 wordfreq + pypinyin 生成;想换词表就跑 `make pinyin`(需要这两个 python 包)。
-盘上没有这个文件时输入法会自己安静地关掉,不影响其它功能。
-
-![拼音输入法](docs/screenshot-ime.png)
-
-### rc.conf:开机读配置、按配置跑服务
-
-`/SYS/RC.CONF` 就是一行行 `key=value`(BSD / OpenRC 那种写法,不是 systemd 的段)。
-开机时内核读它、把 `boot_msg` 打出来、按 `autostart` 决定要不要把启用的服务跑起来;
-`rc` 一条命令就能看配置、看服务、起服务、重读刚写下的文件,还有一本带 PIT tick 的
-事件账本。细节和全部 key 见 [docs/rc-conf.md](docs/rc-conf.md)。
-显示名默认 `KKernel`,可在 `RC.CONF` 里用 `osname = 你的名字` 自定义(开机打一行 `os: <名字>`)。
-
-![rc.conf 服务列表与事件账本](docs/screenshot-rc.png)
-
-### 提示符样式:一个 `style` 命令看腻就换
-
-天天盯着一样的 `>` 确实眼睛疼,所以提示符做成了可换的样式(0.14 版起**默认就是颜文字**):
-
-```
-(・ω・)> style
-prompt style: kao   (style plain|moe|dos|c64|kao 换样式,默认 kao;RC.CONF 里写 style = moe 开机生效)
-(・ω・)> cat nosuch.txt
-file not found
-(；ω；)> ls
-BIN  <DIR>
-LIB  <DIR>
-...
-(・ω・)>
-```
-
-| 样式 | 长什么样 |
-|---|---|
-| `kao`(默认) | 黄色 `(・ω・)>` / `(・ω・)docs>`;命令出错后脸变红 `(；ω；)`,下一次输入就恢复(ps:kawaii~) |
-| `plain` | `>` / `docs>` / `2>` |
-| `moe` | 粉色 `かいかーねる>`,文件找不到、命令不认识也换成吐槽文案 |
-| `dos` | `C:\>` / `C:\docs>` |
-| `c64` | `READY.`,一行一条命令,Commodore 64 BASIC 那味儿 |
-
-`RC.CONF` 里加一行 `style = moe`(或 `kao` / `plain` / `dos` / `c64`),开机就用那个样式(见 [docs/rc-conf.md](docs/rc-conf.md))。
-萌文案不是乱写的:字库里有半角片假名和 CJK;0.13 版又把希腊/标点/数学/箭头/几何/符号等范围补进字库,
-kaomoji 能用的素材多了一大把。
-
-![颜文字提示符](docs/screenshot-style-kao.png)
-
-![萌样式提示符](docs/screenshot-style-moe.png)
-
-## 6. 踩过的坑(这部分才是精华)
-
-### 6.1 软盘的 BIOS 不支持 LBA 扩展读
-
-最开始只写了 `int 0x13 AH=42h`(LBA 扩展读,一次读 8 个扇区),结果 QEMU 里直接 `DISK READ FAILED`。
-
-用 `tests/probe_disk.asm` 探针实测了三种读法(同一个镜像,分别当软盘和硬盘挂):
-
-| 读法 | 软盘 `-fda` | 硬盘 `-hda` |
-|---|---|---|
-| `AH=42h` LBA 读 8 扇区 | ❌ `CF=1 AH=01`(功能无效) | ✅ 成功,数据正确 |
-| `AH=02h` CHS 读 1 扇区 | ✅ 成功,数据正确 | ❌ `CF=1 AH=20`(几何不对) |
-| `AH=41h` EDD 支持探测 | `CF=1`(老实说"不支持") | `CF=0` |
-
-**结论**:软盘的 BIOS 压根不认 LBA 扩展读,只有硬盘认。所以正确做法是:
-
-1. 先问 `AH=41h` 支不支持(检查 `CF`、`BX=0xAA55`、`CX` 的 bit0)
-2. 支持 → 走 LBA,一次读 8 扇区
-3. 不支持 → 退回 CHS,**而且每次都要截断到"本磁道还剩几扇区"**(CHS 读不能跨磁道)
-
-`boot/boot.asm` 现在两条路都有,`make test-fda` / `make test-hda` 各测一条。
-这个探针留在 `tests/probe_disk.asm` 里 —— 你要是换个 BIOS 环境,先跑它。
-
-⚠️ 但**别只看 `AH=41h` 的答复**:有的 BIOS 对软盘也报"支持 EDD",真读起来跨磁道就失败。
-所以引导扇区现在是"**盘号 < 0x80 一律走 CHS**",不问它。这是 §6.33 那个坑的另一半。
-
-### 6.2 一次要 255 个扇区,只有第一个是真的
-
-读磁盘字库时,命令发出去状态也正常,但内存里**只有第一个扇区是数据,后面全是 0** ——
-屏幕上每个字都成了 missing glyph 的方框。
-
-原因:ATA 规范允许驱动器**只传一部分**,PIO 模式下每传一个扇区都得等一次 `DRQ`。
-改成分块(16 扇区一块)+ 每扇区都 `ata_wait_drq` 才读全。
-
-### 6.3 `mov al, 0xE0` 把 LBA 弄丢了
-
-选盘的字节要写进 `al`,而 LBA 正好在 `eax` 里 —— 低 8 位当场被覆盖,
-"读 LBA 0x1E0"变成"读 LBA 0x00"。教训是**看内存里的字节,别信"函数返回成功"**。
-
-### 6.4 `mov ax, 0x10` 把系统调用号冲掉了
-
-`int 0x30` 的入口要先把自己换到内核数据段(`mov ax, 0x10`)—— 而功能号正好在 `eax` 里。
-于是分发器看到的永远是 `0x10`,所有功能都匹配不上。修法是先把功能号存到 `ebp`。
-
-这类"低 16 位被顺手写掉"的坑出现了两次(6.3 和 6.4),都是同一个原因:
-**保护模式里段寄存器只有 16 位,而 `eax` 的低半截在别处有用。**
-
-### 6.5 程序加载地址选在了字库中间(最阴的一个)
-
-程序本来是加载到 `0x300000` 的 —— 离内核很远,看着挺顺眼。但完整字库是读到 `0x200000` 的,
-1.8 MB 一直铺到 `0x3BE600`,**`0x300000` 正好落在点阵数据中间**:
-程序一载入就把几个汉字的点阵覆盖掉了(249 字节的 `HELLO.BIN` 踩掉 U+782A~U+7832 九个汉字,
-"砰"会画成花屏)。
-
-阴在哪:**两个功能单独测都是对的** —— `run HELLO` 正常、中文也正常显示,
-只有"跑完程序之后再显示那几个特定的字"才看得出来,我一开始甚至怀疑是字库文件坏了。
-
-修法三件事:
-
-1. 加载地址挪到 `0x120000`(上面是 `FILE_BUF`,下面是字库,中间 896 KB 全是空的);
-2. `run` 先用 `fat_stat` 看目录项里的文件大小,太大直接拒绝,不让它读进来把字库盖掉
-   (当时按 `PROG_MAX_SIZE` = 896 KB 判;后来程序改用"私有镜像窗口",
-   实际上限变成 384 KiB(现在由镜像窗口决定)—— 见第 5 节);
-3. 测试里加了两道锁:一道**哨兵**(`run HELLO` 之后屏幕必须能正确画出 U+7830 砰,
-   它的点阵就在以前会被踩掉的那段里),一道**静态检查**(从源码里读出 `PROG_ADDR` /
-   `FONT_LOAD_ADDR` 和字库文件大小,算程序区和字库区有没有重叠)。
-   两道锁都实测过"改回旧地址就会红"。
-
-顺带记一个算错过的地方:字形记录的是**相对数据区**的偏移,所以字形地址是
-`字库基址 + data_off + off`,不是 `基址 + off` —— 漏掉 `data_off` 差了 482 KB,
-"哪几个字被踩掉"的结论会全错。**偏移量属于哪个基准,比偏移量本身重要。**
-
-### 6.6 panic 屏里 EFLAGS 多了个 bit16,不是 bug
-
-除零的 panic 屏打出 `EFLAGS = 0x00010046`,而开机时明明是 `0x00000046`,多出来的 `0x10000` 是 bit16(RF,Resume Flag)。
-这是 CPU 自己加的:**故障类异常会把 RF 压进异常帧**,这样 `iret` 回去重试那条指令时不会立刻又炸一次。
-我为了这个 `0x10046` 查了一轮(还先把它错看成了 bit8 的 TF),最后在 `idt.asm` 里写清楚了。
-
-### 6.7 同一行连续打印会被自己盖掉 / `div` 会冲掉颜色寄存器
-
-- 早期 VGA 驱动每次打印都"回到行首",导致同一行第二次 `print` 把第一次的内容盖了 ——
-  后来改成**只有换行才重新定位**。
-- 打印十进制时用 `div`,而 `div` 会把 `edx` 当余数输出 —— 而颜色正好存在 `dl` 里,
-  结果数字颜色全乱。改成**颜色存内存**,不放在寄存器里。
-
-### 6.8 VGA 文本模式只有 ASCII 字形
-
-屏幕上写中文会变成乱码(BIOS 自带字模只有 ASCII)。
-
-别想着"换个字模就能显示中文":VGA 文本模式一个字符格**只有 8 像素宽**
-(字模是 8×N 的点阵,高度可以用 CRTC 的 Maximum Scan Line 调到 16 甚至 32),
-而标准汉字是 **16×16** —— 8 像素宽的格子根本塞不下一个汉字,换字模也救不了。
-真要显示中文只有进图形模式自己画点阵(见第 4 节)。
-(文本模式那条路我也试到底了:字模塞进 VGA plane 2、汉字劈成两个字符格,
-寄存器细节写在 [font/README.md](font/README.md) 里,但上限只有 63 个字,所以默认走图形模式,
-那个实验仍可用 `make run-font` 跑。)
-
-### 6.9 `not` 不改标志位(页池分配器跳过了一整段空闲页)
-
-位图分配器找空闲页,第一版我这么写:
-
-```asm
-    mov eax, [esi + edx*4]
-    not eax                ; 0 位(空闲页)取反变成 1
-    jnz .found             ; ✗ 这个 ZF 是**上一条**指令留下的
-```
-
-`not` 和 `mov` 一样**不影响标志位**。于是 `jnz` 判断的是别人剩下的标志,
-结果全看运气:页池明明全空,`debug ptest` 第一次分配却拿到第 33 页(`0x00420000`),
-前面 32 页像"已被占用"一样被跳过。换成真正会设标志的指令就好:
-
-```asm
-    cmp eax, -1            ; 全 1 = 这个 dword 全占满
-    jne .found
-```
-
-坑点:`not` / `mov` / `lea` 不动标志位,后面别紧跟条件跳转。
-(`inc`/`dec` 只是**不改 CF**,ZF/SF 照改,所以 `inc edx` + `cmp` 那套是安全的。)
-
-### 6.10 "建空间"把"镜像多大"一起清了(程序跑的是整个窗口的零字节)
-
-按需分页第一版:CPU 一碰 0x120000 就红屏,报的却是
-
-```
-EXCEPTION 0E: page fault
-EIP = 0x00200008   CS = 0x00000008   EFLAGS = 0x00010203
-CR2 (faulting address) = 0x5CD90000
-```
-
-CR2 是个野地址(不是 0x120000),说明**第一次补页其实成功了**,程序跑起来了 ——
-只是跑的内容不对。把物理内存 dump 下来读 `space_*` 变量才看清:
-
-```
-space_img_bytes = 0x00000000     ← ✗ 镜像大小是 0
-space_pf_run    = 0x000000d0     ← 补了整个窗口(当时 208 页)一页不落
-pf_off          = 0x0007f000
-pf_len          = 0x00000000     ← 每页都算"文件之外",一句都没拷
-```
-
-`space_img_bytes` = 0 时,补页逻辑认为**整个窗口都是 `.bss`**,于是每一页都给零页:
-程序执行的是整个窗口的 0 字节(`add [eax], al` 一路乱跳),最后跳到 0x00200008 那种
-野地方 → 二次页错误 → 红屏。
-
-根因不是补页逻辑,是**调用顺序**:`cmd_run` 里先 `space_set_image`(写大小)、
-后 `space_create`(建空间),而 `space_create` 开头会把自己那堆状态清零 ——
-顺手把刚写进去的大小也清了。修法两条:create 里**不许清输入参数**
-`space_img_bytes`,调用顺序改成 create → set_image。教训:初始化函数"重置自己的状态"时,
-别把**别人刚给你的输入**一起重置 —— 这类症状(数据全是 0)和"逻辑写错"长得一模一样,
-最省事的查法是 dump 内存看变量,而不是盯着代码猜。
-
-### 6.11 `mov ebx, 10` 把刚解出来的数字冲掉了(sleep 2 睡了 10 秒)
-
-加定时器那天,`uptime` 一切正常,`sleep 2` 却报:
-
-```
-> sleep 2
-slept 10 s (1000 ticks)
-```
-
-2 秒变成了 10 秒 —— 说明解析出来的数字根本不是 2。看 `parse_dec` 的循环:
-
-```asm
-.next:
-    mov bl, [esi]
-    sub bl, '0'          ; ← 数字取到了,存在 bl
-    mov ebx, 10          ; ✗ bl 也是 ebx 的一部分,这一句把数字冲成了 10
-    mul ebx              ; eax = eax×10
-    movzx ebx, bl
-    add eax, ebx         ; 于是加的是 10
-```
-
-`mul ebx` 的乘数要用 ebx,而刚解出来的数字正好存在 bl 里 —— 一个字一个字敲进去的
-`2` 被乘数覆盖了,最后 `1 * 10 + 10` 那种算法得出了 10。修法是**先乘再回读字符**:
-
-```asm
-    mov ebx, 10
-    mul ebx
-    test edx, edx
-    jnz .bad
-    movzx ebx, byte [esi]   ; ← 回读原字符,不依赖"上一次读到的寄存器"
-    sub ebx, '0'
-    add eax, ebx
-```
-
-这已经是同一类错的**第二次**了(更早那次是 `mov ebx, [shell_len]` 覆盖了存首字节的 `bl`),
-所以教训记牢:在 x86 里**"al/ax/eax 是同一个寄存器"** —— 往 ebx 写值就会改 bl,
-往 eax 写值就会改 al。手上有"临时值"时,先想想下一条指令会不会顺手把它覆盖掉;
-能被覆盖的临时值,要么放别的寄存器,要么**从内存重新读一次**。
-
-### 6.12 测试台认不出"星期三"(OCR 的锅),还有 `-qmp` 必须带 `unix:`
-
-做 CMOS 时钟时撞上两个跟内核代码无关、但很费人的坑:
-
-- **抓屏 OCR 认不出中文星期**:`tests/qemu_test.py` 的 `screen_text()` 是拿字库点阵
-  去比对屏幕像素的,`date` 打的 `星期三` 会被认成 `??????`。所以测试套件里
-  **只断言 ASCII 部分**(时间戳、`RTC: BCD...`、格式参数),星期几得人眼看截图。
-- **QEMU 的 `-qmp` 参数必须写成 `unix:/path/to.sock`**:少写 `unix:` 前缀 QEMU 直接退出
-  (`'...' is not a valid char driver`)。`-monitor` 不用带前缀,`-qmp` 必须带 ——
-  排查时还顺手发现一个上次没杀干净的 QEMU 一直占着 `build/kkernel-hd.img`。
-
-### 6.13 换栈只能在中断入口做(设计时就得想清楚"换完从哪继续")
-
-做抢占时最危险的一步是"把 esp 换成另一个线程的栈"。如果让 `sched_pick` 自己在函数里换
-esp 再 `ret`,那就完蛋了:被弹出的返回地址是从**新栈**上取的,而那里躺着的是新线程的
-现场 —— 一 `ret` 就跳到别人的寄存器值上当代码跑。所以这里分工是死的:`sched_pick`
-只负责"下一个是谁"并把它**返回**,换 esp 的动作由 `irq0_stub` 这条中断入口自己做;
-入口这层没有 `ret`(而是 `popad` + `add esp,8` + `iret`),换完栈正好接着把新线程的现场
-弹回寄存器、`iret` 过去。
-一句话:esp 一改,栈上所有东西的含义就全变了 —— 谁改 esp,谁就必须负责"换完从哪继续"。
-
-### 6.14 把一个函数插进了"顺序落下"的代码路径中间(第一行输入被吞)
-
-`shell_readline` 和 `shell_readline_resume` 是**故意连着写的**:前者只清一下长度,然后
-顺序落进后者的循环体,共用一个函数体(前者是"新的一行",后者是"接着编辑原来那半行")。
-我后来把新写的 `shell_wait_key` 插在了这两段中间,编译一点问题没有 —— 但 `shell_readline`
-落到的地方从"读行循环"变成了"等一个键然后 `ret`",表现出来是:**第一条命令打得进屏幕、
-却不执行任何命令**(每个键都被当成"这一行读完了",字符全丢)。教训:往汇编里插函数时
-挑 `ret` / 注释块那种干净边界,别插进"上一个函数体靠 fall-through 接着往下走"的地方。
-
-### 6.15 非活动 shell 睡在 `kbd_getchar` 里会抢走"叫醒字节"
-
-换 shell 时,我是往键盘环形缓冲里塞一个 `0x00` 当闹钟,把睡在 `kbd_getchar` 内部的
-`hlt` 上的那条线程叫醒。问题是:**只有一条线程能拿到这个字节** —— 要是被另一条非活动
-shell 抢了,它就继续在里面等真正的按键,换回来时既不重画提示符、还会把本该给活动 shell
-的按键吃掉。改法是在 shell 这层自己包一个等键循环(`shell_wait_key`):只有"我是活动
-shell 而且缓冲区里真有键"时才调 `kbd_getchar`,否则 `hlt` 睡在**自己**的循环里(定时器
-一响就醒,顺便重查自己还是不是活动的)。
-
-### 6.16 测试别用固定 `sleep` 等屏幕:字是"画"出来的,不是瞬间出现的
-
-多 shell 落地之后,hd 套件突然多了 8 条失败:文件明明写进去了,`ls` 里却"看不到" `TEST.TXT`;
-`run` 的接口说明、`address space destroyed`、`demand paging: 34 page(s)` 也全都"消失"。
-代码一条没坏 —— 我把同一串命令在干净虚拟机上慢慢敲,全都对。
-
-真相在截图里:抓屏那一刻,`ls` 的**最后一行才画了一半**(末尾是半个 `CHELL…`),
-`TEST.TXT` 还在下面没轮到。内核往 VBE 帧缓冲画字走的是 MMIO,一屏要好几秒;而测试的
-`run()` 敲完命令只 `sleep(0.9)` 就抓屏断言。4 条 shell 线程和 100 Hz 定时器把 guest 拖慢
-一点,这 0.9 秒就不够用了。
-
-改法有两层:`run()` 敲完命令先等屏幕"静下来"(连续两次抓屏一模一样),断言则改用
-`wait_for("要看到的字")` 轮询到出现为止。教训:**测屏幕内容的用例,永远不要赌一个固定的
-等待时间** —— 要么等"屏幕不再变",要么等"某个字真的出现了"。
-
-### 6.17 页表是**逐级**查权限的:PD 那级忘了 U/S,程序第一条指令就死
-
-给程序页表项加了 `PAGE_USER` 还是不行,程序在 0x120000 就吃 `page fault at 0x00120000`
-(错误码 bit0=1 = "页在,但没你的份")。原因:权限不只看最后一级 PTE,**PD 那一项也算** ——
-`space_create` 里挂私有页表时 `or eax, PAGE_P|PAGE_RW` 少了 `PAGE_USER`。两级都加才对。
-
-### 6.18 缺页补页要**按页对齐**地拷
-
-镜像页缺页时从暂存区拷数据,原来是这样写的:`pf_off = 出错地址 - SPACE_IMG_VA`,
-然后从 `SPACE_IMG_VA + pf_off` 拷一整页。**顺序执行的程序永远看不出问题** ——
-它总是走到页边界才缺页,`pf_off` 正好是页首。直到 ring 3 出现"从页中间进代码"的
-`call`:第一次取指落在 `0x121C10`,于是把 `0x121C10` 往后的字节拷到了页首 ——
-整页错位,程序跑的是"别人家的字节"(现象是崩在一个莫名其妙的地址上)。
-正确的写法是先 `and eax, 0xFFFFF000` 再当偏移。
-
-### 6.19 `hlt` 是特权指令:演示程序自己先死了
-
-`HANG.BIN` 原来用 `hlt` 当"睡 10 ms"(ring 0 时没问题)。程序搬进 ring 3 之后,
-执行到 `hlt` 直接 #GP,被内核按"异常"处理掉 —— 演示"卡住一条 shell"的程序自己先崩了。
-改成空转忙等(`dec ecx / jnz`),反正定时器每 20 ms 抢占一次,别的 shell 照样能干活。
-
-### 6.20 内核指针不能交给 ring 3 程序
-
-API 12(取参数)以前返回内核里那个参数缓冲区 `0x11F004`。ring 0 时天经地义,
-ring 3 里程序一读就吃页错误(C 程序 `CHELLO.BIN` 崩在 `0x00012D72`,那正是内核里
-那个空串 `api_empty`)。修法:在程序自己的堆窗口里留一页当参数页,装载器把
-"魔数 + 参数字符串"整块拷进去,API 12 返回那儿的地址。**凡是返回指针的 API,
-都要问一句"这个地址在程序自己空间里吗"**。
-
-### 6.21 nasm 三个小坑(`-f bin` 写 ring 3 时踩的)
-
-- 对**标签**做 `&` / `>>` 会直接报 `` `&' operator may only be applied to scalar values ``
-  (`dd label` 可以,那只是把地址当数据写)—— GDT 里 TSS 描述符的 base 改成开机运行时回填。
-- `xxx.yyy:` 这种"带前缀的局部标签"会把**后面**的局部标签前缀改成 `xxx.yyy`,
-  于是一整片 `cmd_run.nomem` 都变成未定义。落点要用全局标签(`run_resume_kernel`)。
-- 单引号字符串里 `''` 不是转义(`'the kernel''s'` 会报 `comma expected`)。
-
-### 6.22 读配置的缓冲区压在了 FAT 的扇区缓冲里(读回来 0 字节)
-
-`rc_load` 得先把 `RC.CONF` 读进内存再解析。第一版图省事,挑了个看着"空着"的固定地址
-`0x10C000` —— 那地方**在 `FAT_BUF`(0x100000~0x10FFFF)里面**。`fat_read_file` 是一边读扇区
-一边往 `FAT_BUF` 拷、再复制到目的地的,目的地就在它自己那块缓冲里,于是内容被踩烂,
-解析出来 0 个 key。
-
-症状很能骗人:开机那次读得到 9 个 key(那时还没人动过 `FAT_BUF`),`write RC.CONF ...` 之后
-再 `rc reload` 就变成 `RC.CONF, 0 keys`。
-
-教训:内核里挑缓冲区要**先看内存布局注释**(`kernel/kmain.asm` 文件头那张表),
-别自己"看着空"就填;更稳的是干脆用内核自己的静态缓冲(`kernel/rc.asm` 里 `rc_buf times RC_MAX db 0`)。
-
-### 6.23 循环里 `push` 没配对 `pop`:`ret` 跳到了 `0x00000007`
-
-`rc list` 列完两个服务就 `KERNEL PANIC`,`EIP = 0x00000007`。原因:循环体里为了保住 `ecx`
-先 `push ecx`,列完这一项却直接 `jmp .loop` 回去 —— 每一项多压 4 字节,`popad` 从**错位**的
-栈上恢复寄存器,`ret` 自然飞到野地址。改成**循环下标放内存变量**(`rc_lst_i`),栈一个字节都不动,
-这类 bug 就绝迹了。
-
-顺带一条:`pushad` 里改返回值要写 `[esp + 28]`(eax 在 pushad 帧里的偏移),
-这种"约定"一定要写在函数注释里,不然下一个人照样踩。
-
-### 6.24 两个"看不见的约定":偷改寄存器 + `strip_name` 把第一个空格改 0
-
-一个早上抓到两个同类的坑,都出在"小工具函数"上:
-
-* `rc_streq_nocase`(比字符串)内部用 `bl` 存字符,却**没保住 ebx**。`rc_get` 拿 ebx 存
-  "要找的 key 指针",于是只有第 1 个 key 能查到 —— 症状是 `hostname` 有值,`autostart` /
-  `on_crash` 全显示"(没设)",`services 0 (0)`。
-* `rc` 的 `cmd_rc` 调了 `strip_name`(shell 里"去掉参数尾巴空格"的老函数)。它实际干的是
-  **把第一个空格改成 0** —— 那是给"只吃一个参数"的命令(`cat FILE`、`run PROG`)准备的,
-  于是 `rc get hostname` 里的 `hostname` 被吃掉、掉进了 `.bad_arg` 分支。
-
-教训:工具函数要么写清"我改哪些寄存器",要么进出门 `push`/`pop` 全包;
-调用别人写的老函数前,先把它的**注释和实现**都读一遍(名字描述的往往不是全部事实)。
-
-### 6.25 中断门会清 IF,而 `jmp` 不会替你恢复它
-
-程序是**走中断门**进内核的(`int 0x30`、14 号页错误都算),而 x86 的中断门这条硬件路径会
-**把 EFLAGS.IF 清 0**。程序退出后内核走的是 `jmp run_resume_kernel`(不是 `iret`),于是
-IF=0 一路回到了 shell —— 后果特别唬人:定时器(IRQ0)和键盘(IRQ1)的中断被 8259 挂着没人取
-(`info pic` 里 `pic0: irr=03 imr=fc isr=00`),shell 那句 `hlt` 一进去就永远等不到人叫醒它,
-整个系统看着像死机,但 CPU 好端端停在 `hlt`、PIC 掩码也是好的。
-排查招式:`info registers` 看 `EFL` 里有没有 `0x200`(`00000206` 有 = 中断开着,`00000097` 没有
-= 中断被关了),再 `info pic` 看 `irr` 有没有挂着 —— 两者一对就能分清"真死机"和"只是中断关了"。
-修法:`run_resume_kernel` 在换回内核页目录之后补一条 `sti`。
-
-### 6.26 配置空间读出来全是 0:忘了把 bit31 置 1
-
-PCI 的机制 #1 是"写地址(0xCF8)、读数据(0xCFC)",那个地址的 **bit31 必须是 1**,
-表示"这次访问要真的发出去"。忘了置 1 的话 CPU 根本不会发起配置周期,
-读回来的就是 0x00000000 —— 屏幕上表现为"每台设备都读成 0000:0000",而且不报错。
-先怀疑地址寄存器,再怀疑设备。
-
-### 6.27 只扫 func 0 会漏掉设备的"兄弟"
-
-一个 PCI 设备最多有 8 个功能(function)。ISA 桥(00:01.0)自己只是个桥,
-它的 **IDE 控制器(00:01.1)、USB 控制器(00:01.2)、电源管理(00:01.3)全是它的功能**。
-判断方法:读设备头部的 header type,bit7 = 1 说明是"多功能设备",
-这时候 func 1~7 都要扫。只扫 func 0 的话,你的机器上"看不到 IDE 也看不到 USB"。
-
-### 6.28 不存在的设备返回 0xFFFF,不是 0
-
-读取一个空槽位,配置空间返回 **0xFFFF**(厂商号 0xFFFF 是"没有设备"的约定),
-而不是 0。所以判断"这里有没有设备"要用 `cmp eax, 0xFFFFFFFF`。
-另外 0x00000000 是另一种情况:设备在、但寄存器就是 0。
-
-### 6.29 写命令寄存器要用 16 位写(status 是"写 1 清")
-
-命令寄存器(command)和状态寄存器(status)共用 offset 4:低 16 位是命令(读写)、
-高 16 位是状态(**写 1 才清**)。想开 Bus Master 就只写低 16 位(`out dx, ax`),
-用 32 位写会把高位的状态位全清掉 —— 那会把"设备报过什么错"这类信息擦掉。
-我们枚举时会给每台设备打开 I/O + MMIO + Bus Master,用的就是 16 位写。
-
-### 6.30 手写 push/pop 不配平:`ret` 飞到了 0x9208
-
-给 PCI 写十六进制打印时,我手写了三份 `pci_ph1/2/4`,其中一份最后**多 pop 了一个寄存器**,
-于是 `ret` 弹出来的是栈上的脏数据(0x9208)⇒ 开机就
-`*** KERNEL PANIC *** / EXCEPTION 0E: page fault / EIP = 0x00009208`。
-教训:**要么老老实实 pushad/popad,要么一个字节都别多动栈**(和 §6.23 是同一个坑的两种形状)。
-重写成一个 `pushad/popad` + `shr edx, cl` 的循环就再没出过事。
-
-### 6.31 QEMU 的 USB 键盘会把 `sendkey` 抢走(窗口看着像死了)
-
-两个连着的坑:
-1. `-device usb-kbd` 单独用会报 `No 'usb-bus' bus found for device 'usb-kbd'` ——
-   得先有 `-usb`(它顺手把机器自带的 PIIX3 UHCI 控制器挂到 00:01.2)。
-2. **一旦真插了 usb-kbd,QEMU 的 `sendkey` 就改投 USB 键盘** ⇒ 我们的 PS/2 驱动
-   一个键也收不到,测起来像"系统死了"。所以 Makefile 和测试台都只用 `-usb`
-   (要的就是那台 UHCI 控制器),不插 USB 键盘。
-
-### 6.32 I/O BAR 写全 1 量大小,会把整个配置空间搞挂
-
-"往 BAR 写全 1、读回来反推大小"是 PCI 的标准做法,但它在这台 QEMU 上只对**内存 BAR** 安全:
-拿 IDE 的 BAR4(I/O BAR)这么量一次,之后**所有**设备的配置空间都读成 0x0004 / 全 0,
-连它自己的大小都读成 62224 这种鬼数字(真值 16 字节)。
-所以 `kernel/pci.asm` 现在只量内存 BAR,I/O BAR 直接给基址 —— 反正 USB 驱动要的
-UHCI BAR4 就是个 I/O 基址(`0xC040`),地址够用,不用知道大小。
-
-### 6.33 软盘:EDD 跨磁道 + ISA DMA 跨 64 KiB(两个坑叠在一起)
-
-`make test-fda` 曾经整组全红:软盘镜像开机**屏幕全黑**,QEMU monitor 看 CPU 停在
-`EIP=0x7D78`(引导扇区那个 `halt16`)、`HLT=1`、还是实模式 —— 读盘失败、重试三次、停机。
-坑是**两个叠在一起**,而且各自都能单独要命:
-
-1. **软盘走了 EDD/LBA**:BIOS 嘴上说支持,但软盘的 EDD 读**跨磁道就失败**
-   (1.44 MB 每磁道 18 扇区,一次读 8 扇区很容易跨)⇒ 盘号 `< 0x80` 一律走 CHS。
-2. **ISA DMA 不能跨 64 KiB 物理边界**:软盘读盘走 DMA(硬盘的 EDD 不走,所以硬盘上一直
-   没问题)。目的地址 `0x1F200` 再读 4 KiB 就跨过 `0x20000`,BIOS 直接报错 ⇒ 每次读之前
-   把扇区数夹到"当前 64 KiB 页里还剩多少",见 `boot/boot.asm` 的 `read_chunk`。
-   还有一条:**别按固定次数循环** —— 实际读几个扇区由 BIOS 决定,得看 `dap_lba` 有没有
-   走到 `KERNEL_LBA + KERNEL_SECTS`。
-
-怎么确认它真的读全了:`make test-fda` 连跑 7 次全绿只是第一层;真正较真的是把客户机
-`0x10000` 起的 128 KiB 内核区用 QMP `pmemsave` dump 出来、跟镜像逐字节比 ——
-1485 个字节不同、分成 610 段、**最长一段才 14 字节**,没有一整扇区的差 ⇒ 差的全是内核
-运行时自己改的数据(`.bss`、shell 缓冲区),256 个扇区一个不少。
-
-### 6.34 测试抓屏:别用固定路径,也别在"画到一半"时断言
-
-两个测试台自己的坑,都表现为"偶发一条假失败":
-
-- 抓屏原来固定写 `build/_shot.ppm`。两轮测试(或者我和测试台)同时开着时,会**读到别人家的
-  屏幕** —— 硬盘那轮的「读盘方式」断言就偶发读到软盘屏幕上的 `boot disk: CHS fallback`。
-  现在默认路径带进程号(`/tmp/kkernel-shot-<pid>.ppm`)。
-- 开机那几十行是内核**一行一行往 VBE 帧缓冲上画**的(MMIO,一屏好几秒),而抓屏只等了 2 秒。
-  机器一忙就可能拍到画到一半的屏幕。现在先等最后一行出现(最多 10 秒)再逐条断言;
-  真失败时把屏幕 OCR 出来、存 `build/screen-fail.png`,不用再靠猜。
-- 同一个毛病在最简单的 `--shell` 分支上也咬了一口:`run()` 原来"敲完 sleep 0.7 秒"就断言,
-  `debug`(不带子命令)那行用法在忙一点的机器上就是画不完 ⇒ `make test-shell` 稳定假失败。
-  现在 `run()` 敲之前、敲之后都等屏幕静下来(连续两次抓屏一模一样)。
-  ⚠️ 这个分支里**不能**直接用外面那个 `wait_idle`:它是在 hd 模式那段才定义的,
-  软盘跑 `--shell` 时还没轮到 ⇒ `NameError`;分支里自己写一份最省心
-  (和 §6.x 的 `wait_for` 是同一个坑)。
-
-### 6.35 帧缓冲滚屏:格子对齐 + "别把慢当成坏"
-
-图形模式(VBE)下的终端是**自己往帧缓冲里画字**的,滚屏就是 `rep movsd` 整块往上搬 16 行。
-踩过两个坑:
-
-1. **600 像素 ÷ 16 = 37.5**:底边原来夹到 `600-16 = 584`,而 `584 % 16 = 8` —— 滚一次屏之后,
-   新写的每一行都比滚上去的旧行低 8 像素,"两代文字"叠在一起,整屏花掉。
-   现在先把高度按 16 对齐(`fb_height & ~15` → 592)再减一行,光标永远落在格子线上。
-2. **慢不等于坏**:往 VBE 帧缓冲写字在 QEMU 里是 MMIO,画满一屏 2 KB 中文要好几秒。
-   当时一半的"花屏"其实是测试台抓到了画到一半的屏幕(固定 sleep 不够)——
-   修对齐 + 修测试台的等待(§6.34)之后,同一批断言全绿。
-
-hd 套件里现在有专门的断言:2 KB 中文滚过几屏之后,再用 `uptime` 的输出当探针,
-确认屏幕还是"读得出来"的。
-
-### 6.36 把内存里的变量当函数 `call`,跳进了数据区
-
-给 `spawn` 加"记住这条线程出生在哪条 shell 上"的时候,我写了一句
-
-```asm
-call sched_cur          ; ✗ sched_cur 是 dd,不是函数
-```
-
-`sched_cur` 是**内核数据区里的一个 `dd`**(存着当前线程号),不是函数。
-于是 `call` 把返回地址压栈、跳进数据区,CPU 在那儿执行零字节,一路跑过
-`sched_live` / `sched_ticks`,最后在 `sched_cur` 自己的存储附近炸了:
-
-```
-*** KERNEL PANIC ***
-EXCEPTION 0E: page fault
-EIP = 0x0001D1BA   CS = 0x00000008   EFLAGS = 0x00010202
-CR2 (faulting address) = 0x38000004
-```
-
-**怎么定位的**(这招值得记住):`EIP = 0x1D1BA` 是**代码地址**,而内核里所有代码都在
-`0x10000` 之后 —— 拿 `nasm -l build/kernel.lst` 的列表一查,`0xD1B1` 那一行写的是
-
-```
-0xD1B1:   367 0000D1B1 00000000     <1> sched_cur       dd 0
-```
-
-也就是说 **EIP 落在 `sched_cur` 自己身上**:`call` 真的跳进了数据区。
-改成 `mov eax, [sched_cur]` 就好了。
-
-教训:**`call` / `jmp` 的目标必须是代码标签**;变量一律用 `[...]` 取值。
-还有一个同族的坑:同一个表达式写成 `call [mem]` 也不行 —— 那会跳到"那个变量**存的值**"
-所指的地址去,而它多半是个线程号(0/1/2),不是代码。
-
-### 6.37 TCB 从 32 字节变 40:全仓的 `shl 5` 都得改
-
-TCB 原来正好 32 字节,于是全仓拿 `shl X, 5` 当"×结构体大小"用(好写、好快)。
-这次要加一个字段(出生在哪条 shell 上),32 就不够了 —— 40 不是 2 的幂,
-所有下标计算都得变成 `imul X, TCB_SIZE`。
-
-踩过的地方:**改完忘了某一处 `shl`**,那处就会按 32 字节算下标,
-读出来的 esp/cr3/state 全是错位的(症状五花八门:`ps` 显示的线程号对不上、
-kill 杀错对象、甚至切栈切到别人家)。所以现在全仓统一用一个宏:
-
-```asm
-%define TCB_OFF(id) (((id) * TCB_SIZE))
-```
-
-**下次加字段只改 `TCB_SIZE` 一个地方**。真要偷懒也行:干脆别用 32 的倍数,
-40 这种"不是 2 的幂"其实更安全 —— `shl 5` 会立刻算错,错得响亮,而不是悄悄对一半。
-
-### 6.38 萌文案里的字形,得先去字库查一遍
-
-给提示符写萌文案时我第一版用的是标准 kaomoji:`(｡•́︿•̀｡)`,结果一上机全是方块。
-原因:字库(42112 个字形)里**半角片假名 `U+FF61-FF9F` 一个不缺**,`｡ ･ ﾟ ノ ｰ` 都有,
-但 `• U+2022`、`́ U+0301`、`̀ U+0300`、`︿ U+FE3F`、`ω U+03C9`、`∀ U+2200` 都没有;
-换了字库也用不了 —— 缺字形的地方只能显示替换符。
-
-所以写文案前先查一遍:
-
-```sh
-python3 - <<'EOF'
-import struct
-d = open("font/full-kkf.bin","rb").read()
-_, n, _hs = struct.unpack_from("<III", d, 4)
-want = "かいかーねる ﾟ ー ; ) ・ あれ"
-for ch in dict.fromkeys(want):
-    v = ord(ch); lo, hi = 0, n-1; ok = False
-    while lo <= hi:
-        mid = (lo+hi)//2; c = struct.unpack_from("<I", d, 16+mid*12)[0]
-        if c == v: ok = True; break
-        lo, hi = (mid+1, hi) if c < v else (lo, mid-1)
-    print(ch, hex(v), "有" if ok else "缺")
-EOF
-```
-
-另外:`style` 换样式会改提示符本身,**测试断言别依赖提示符里的非 ASCII 字符** ——
-测试台的 OCR 只认它字库里的字符,`かいかーねる` 在断言里永远是 `??????`,
-所以套件里只用 `C:\>` / `prompt style: dos` 这种纯 ASCII 的东西做断言。
-
-### 6.39 帧缓冲慢,是因为每画一个字就要碰一次显存
-
-`cat DOCS/README.TXT`(2 KB 中文)在 VBE 800x600 下要 5.7 秒。慢的根源不是"画字算法",
-而是**每画一个字符就往显存(MMIO)写 16 次**——显存写比内存慢得多。
-
-改法是给终端加一块"当前行"的行缓冲(`kernel/fbterm.asm`,13 页 = 53 KB,开机时从
-物理页池 `pmem_alloc_pages` 申请):
-
-- 画字只写这块 RAM,并记下脏段的左右边界 `[x0, x1)`
-- 到 `fb_newline` / 滚屏 / 退格,才 `fb_flush` 一次,把脏段整段搬进显存
-- 滚屏、清屏之后 `fb_lb_forget` 让缓冲失效,否则会把旧像素糊回干净屏幕
-- 分配不到页(或 pitch 超限)就 `fb_lb_base = 0`,自动退回逐字直写
-
-顺带两个坑:
-
-1. **睡下去的 `hlt` 前要 `call fb_flush`**,否则"没换行的半行字"(提示符之类)会
-   一直不显示——它还在 RAM 里,没等到换行没机会刷。
-2. **`pmem_init` 得在 `fb_init` 之前**:行缓冲要用页池,页池初始化又要趁还没开分页。
-
-改完同一时刻 A/B 实测:5.69 s → **0.90 s(约 6.3 倍)**,而改前/改后最终屏的
-sha256 **完全一致**——纯提速,一个像素都没变。教训:**先量再改;改完拿像素证明观感没变**。
-
-## 7. shell 命令
-
-```
-help          列出命令
-echo <text>   把文字打回来
-clear         清屏
-info          CR0/CR2/CR3/CR4、IDT 基址与限长、段寄存器、读盘方式
-debug <什么>  诊断/自检类命令都在这条下面(演示命令以前散着放,现在收起来了):
-  debug page <hex>   逐级走页表,查虚拟地址映射到哪(例:debug page 0x400000)
-  debug pmem         物理页池:总页数、已用、空闲、位图地址
-  debug pmap <va>    从页池拿一页,动态建页表映到虚拟地址(玩分页最直接的一条)
-  debug pumap <va>   解掉映射并把页还回池子(页表空了会一起回收)
-  debug ptest        自测:分配→建表→虚拟地址写/物理地址读→解映射→归还,查泄漏
-  debug fault        故意踩没映射的地址,看页错误 panic 屏
-reboot        重启(通过 8042 键盘控制器)
-ls            列当前目录(名字 + 字节数;硬盘模式才有;根目录下是八个分类子目录)
-cat <file>    把文件(UTF-8 文本)打出来,中文能直接看;
-              /DEV 下是虚拟设备:cat DEV/RTC 看时间、cat DEV/DEVICES 列设备
-write <f> <t> 写文件(创建或覆盖,真的落到磁盘上);
-              目标已存在时先问 R/D/O:R 改名、D(或 Esc)不写、O 覆盖;
-              /DEV 下:write DEV/CON hi 打到屏幕、write DEV/NULL 丢进黑洞
-cp <src> <dst> 复制文件(源读进 60 KiB 文件缓冲再写到目标);
-              目标写 DOCS/ 这样(以 / 收尾)或已存在的目录名 → 拷进该目录、名字不变;
-              落地文件已存在时也问 R/D/O(同上)
-mv <src> <dst> 改名/移动文件(实现是 复制+删源,FAT 目录项搬家;子目录、长文件名都支持);
-              目标已存在时同样问 R/D/O
-run <file>    给程序建一套独立地址空间(按需分页)再跑(名字不带点会自动补 .BIN;
-              裸敲 run 打印接口说明;跑完会报补了多少页:run TOUCH 最能看出来)
-A | B         管道(顺序执行,最多 4 段):A 的屏幕输出被内核吃进 64 KB 缓冲,
-              跑完 A 再把缓冲当 B 的 stdin(B 用 int 0x30 功能 17 读,见 docs/pipes.md);
-              例:cat DOCS/README.TXT | run WC / ls BIN | run GREP HELLO
-              管道工具:WC(行/词/字节)、UPPER(转大写)、GREP <子串>、HEAD [行数]
-usbdisk       只读裸盘 U 盘(USB 大容量储存):裸 usbdisk 看设备信息(INQUIRY/容量);
-              usbdisk read <lba> 读一个扇区打印 64B / hexdump <lba> 看完整 512B /
-              mbr 解分区表 / sense 读 SCSI 感应数据
-date [fmt]    读 CMOS 时钟:裸 date 打日期+时间+星期,加 ymd / mdy / dmy / time 换格式
-style [名字]  换提示符样式:kao(颜文字 (・ω・),报错变 (；ω；),默认)/ plain(朴素 >)/ moe(萌:かいかーねる>,报错带吐槽)/ dos(C:\>)/ c64(READY.);裸 style 看现在用的哪个
-pci [b:s.f]   PCI 总线枚举:裸 pci 列出总线上所有设备,加 0:1.2 这种地址看单台详情
-uptime        开机到现在多久(内含 tick 数,例:up 4 s (432 ticks at 100 Hz))
-sleep <秒>    用 hlt 睡这么多秒(空闲不烧 CPU;上限 3600 秒)
-ps            列出内核线程(编号 / 名字 / 拿到过多少 tick / 被调度过几次)
-spawn [who]   起一个演示线程(alpha / beta 每秒各打一行;不带参数就轮流起)
-kill <id>     杀掉一个线程,把它的栈还给物理页池(0~3 号是 shell 自己人,杀不掉)
-shell [n]     列出 4 条 shell(标出键盘现在归谁),或者 shell 3 直接跳过去;
-              随时 Ctrl+Left / Ctrl+Right 换成隔壁那条(卡死的 shell 也能被换走)
-rc [什么]     rc.conf(key=value 的服务/事件库,见 docs/rc-conf.md):
-  rc                概要:配置文件名、几个 key、hostname、autostart / on_crash
-  rc list           列出服务(编号 / 程序 / enabled-disabled / 参数)
-  rc get <key>      取一个 key 的值(key 不分大小写)
-  rc start <n>      把第 n 号服务当程序跑一遍(和 run 同一条路)
-  rc log            事件账本:开机/读配置/服务起停/程序跑完/崩了/kill/换 shell,各带 tick
-  rc reload         重新读磁盘上的 /SYS/RC.CONF(shell 里 write 过就能立刻生效)
-```
-
-`uptime` / `sleep` 的样子(定时器就是靠 100 Hz 的 IRQ0 数出来的):
-
-```
-> uptime
-up 4 s (432 ticks at 100 Hz)
-> sleep 2
-slept 2 s (200 ticks)
-> uptime
-up 13 s (1306 ticks at 100 Hz)
-```
-
-`date` 的样子(读的是 CMOS 里的真实时间;窗口版 QEMU 加了 `-rtc base=localtime`,所以跟你手腕上的表一致):
-
-```
-> date
-2026-10-07 11:03:36 星期三
-RTC: BCD, 24-hour mode (no timezone handling)
-> date ymd
-2026-10-07
-> date mdy
-10/07/2026
-> date dmy
-07/10/2026
-> date time
-11:03:42
-> date xxx
-date: unknown format, try ymd / mdy / dmy / time (got: xxx)
-```
-
-`debug page` / `debug pmap` 的输出示例(这就是分页在干的事):
-
-```
-> debug page 0x400000    ← 恒等映射:虚拟地址 = 物理地址
-virtual      = 0x00400000
-PDE index    = 0x00000001 [1] = 0x00003003  present + writable
-PTE index    = 0x00000000 [0] = 0x00400003  present
-physical     = 0x00400000
-> debug page 0x20000000  ← 恒等映射封顶(256 MiB)以外没映射
-virtual      = 0x20000000
-PDE index    = 0x00000080 [128] = 0x00000000  PDE not present -> would page-fault
-> debug pmap 0x8000000   ← 现建一张页表,拿页池里的物理页映上去
-mapped 0x08000000 -> physical 0x00400000  (page table created on demand; check with: debug page <va>)
-> debug page 0x8000000
-virtual      = 0x08000000
-PDE index    = 0x00000020 [32] = 0x00401003  present + writable
-PTE index    = 0x00000000 [0] = 0x00400003  present
-physical     = 0x00400000
-> debug pumap 0x8000000
-unmapped, gave back 0x00400000  (page returned to the pool; empty page table recycled)
-```
-
-键盘直接给字节;中文靠 **Shift 切拼音输入法**输入(候选条浮在屏幕最底两行,见 §5);
-也可以直接用 `cat` 看 UTF-8 文件:`cat DOCS/ZH.TXT` 是现成的演示。
-
-想在系统里自己编程序,可以跑 TCC(系统内 C 编译器):
-
-```
-> run TCC.BIN -c src/tcc_inc.c -o tcc_inc.o
-> run TCC.BIN -static -nostdlib tcc_inc.o lib/crt_tcc.o lib/minic.o -o tcc_inc.elf
-> run tcc_inc.elf        ← TCC #include: include works / sizeof(size_t)=4
-```
-
-系统头文件在镜像的 `/INCLUDE` 里(来自仓库 `tccinc/`),`#include <stdio.h>` / `<string.h>` 这些
-都能用;细节见 [extensions/tcc/README.md](extensions/tcc/README.md)。注意 TCC 按**后缀**认文件,
-命令行里写小写 `.c` / `.o`(FAT 查找大小写不敏感,但 TCC 拿到的是你敲的那个字符串)。
-
-## 8. 怎么改
-
-改完 `make` 一下,`./tools/run.sh --hd` 就能看到效果。
-
-### 8.1 加一个自己的程序(最推荐)
-
-```bash
-cp progs/HELLO.asm progs/MYPROG.asm     # 改吧
-make                                    # Makefile 会自动编 progs/*.asm
-python3 tools/mkfat.py build/kkernel-hd.img 6144 8 MYPROG.BIN=build/MYPROG.BIN
-make hd                                 # 或者在 Makefile 的 PROGS 里加一行,让 make hd 自动带上
-> run MYPROG
-```
-
-接口、约定、例子都在 **[docs/programs.md](docs/programs.md)**。
-
-### 8.2 写个全屏程序(计算器/编辑器就是这么来的)
-
-想要"自己清屏、自己排版"的程序,用第 6/9/10/11/12/13 号功能:
-清屏、定位、读键事件(方向键)、问屏幕尺寸、取参数、在指定位置画字。
-`progs/CALC.asm`(300 行)和 `progs/EDIT.asm`(400 行)就是照这个套路写的,
-三条踩过的经验写在 [docs/programs.md 第 6 节](docs/programs.md)。
-
-### 8.3 改开机那句话
-
-`kernel/kmain.asm` 最下面的数据区,`msg_title` 就是第一行:
-
-```asm
-msg_title   db 'KKernel - stage 5', 10, 0     ; 10 = 换行,0 = 字符串结束
-```
-
-中文也直接写(字符串是 UTF-8,图形模式下能显示;文本模式会成乱码,见 6.8)。
-
-### 8.4 加一条 shell 命令
-
-三处,都在 `kernel/shell.asm`:
-
-```asm
-; 1) 写处理函数(想打印就用 term_print,想读参数用 [cmd_arg])
-cmd_hi:
-    mov esi, msg_hi
-    call term_print
-    ret
-
-msg_hi db 'hi there', 10, 0                 ; 2) 加字符串
-
-; 3) 在命令表里登记(名字 + 处理函数)
-n_hi db 'hi', 0
-cmd_table:
-    dd n_hi, cmd_hi
-    ...
-```
-
-命令名匹配是**整词**比较(`str_eq`),所以 `page` 不会被 `pa` 之类误命中。
-
-### 8.5 往镜像里放个文件
-
-```bash
-python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \
-    DOCS/NOTES.TXT=my-notes.txt BIN/HELLO.BIN=build/HELLO.BIN
-make hd
-> cat DOCS/NOTES.TXT
-```
-
-参数含义、为什么是 6144、每簇几个扇区怎么选的,见
-[docs/filesystem.md 第 6 节](docs/filesystem.md)。
-
-### 8.6 改分页怎么映射
-
-`kernel/paging.asm` 顶部那两张页表是**开机固定**的;恒等映射 0~ident(最多 256 MiB),
-4 MiB 以上的页表页运行时从页池拿:
-
-```asm
-PD_ADDR     equ 0x1000     ; 页目录
-PT_LOW      equ 0x2000     ; 恒等 0-4 MiB
-PT_LFB      equ 0x4000     ; VBE 帧缓冲窗口
-; 4 MiB 以上的恒等页表:没有固定地址,运行时 pmem_alloc 一页一页拿
-```
-
-想玩"虚拟地址 ≠ 物理地址"不用改代码,shell 里现成有:
-
-```
-> debug pmap 0x8000000     ← 从页池拿一页(4 MiB 以上),现建页表映到 128 MiB 那个虚拟地址
-> debug page 0x8000000     ← 看 PDE/PTE:虚拟 0x08000000、物理 0x00400000
-> debug pumap 0x8000000    ← 解映射并把页还回去
-> debug ptest        ← 一个命令跑完整个流程(分配→建表→读写→归还),还会检查页池有没有泄漏
-```
-
-要加一个"固定的自定义映射",在 `paging_init` 末尾照 LFB 那段写就行;
-`paging_map(va, pa, flags)` 和 `paging_unmap(va)` 是内核里的动态接口
-(`kernel/paging.asm`,页表不够会自己找 `pmem_alloc` 要页)。想让它"映了但不许写",
-把 flags 里的 `PAGE_RW` 去掉,写它就会吃 13 号通用保护异常。
-
-想改"程序能用多大内存"看 `paging.asm` 顶部的 `SPACE_IMG_PAGES` / `SPACE_HEAP_PAGES`
-—— 镜像窗口是常量 96 页,堆窗口页数是运行时变量 `space_heap_pages`(参数页/栈顶
-`space_args_va`/`space_stack_va`/`space_user_stack_top` 也是运行时算的),建空间时一页都不给,
-是程序碰到才补。想知道它是怎么补的,从 `page_fault_try_handle` 看起;
-想关掉按需分页回到"一次给满",在 `space_create` 里把清页表那几行换成
-`paging_map` 逐页映上去就行(老版本就是这么写的,git 历史里能翻到)。
-`cmd_run` 里那几步一眼能认出来:建空间 → 写镜像大小 → 切 CR3 跑 → `space_destroy` 归还。
-
-### 8.7 让 panic 屏显示更多
-
-`kernel/idt.asm` 里 `isr_common` 就是那个"红屏 + 停机"。异常帧里的东西都在栈上:
-
-```
-[ebp+32]=向量号  [ebp+36]=错误码  [ebp+40]=EIP  [ebp+44]=CS  [ebp+48]=EFLAGS
-```
-
-想再打 `CR3`、`DS`、或者页表项,照着 `mov eax, cr2 / call term_print_hex` 那样加一行就行。
-
-### 8.8 用 C 写程序
-
-`make cc-check` 看看工具链在不在,然后往 `progs/` 里丢一个 `.c`,把名字加进
-`Makefile` 的 `C_PROGS`,再 `make hd`。接口、内存布局、迷你 libc 有什么没有什么,
-都在 [docs/c-programs.md](docs/c-programs.md);`progs/CHELLO.c` 是现成例子。
-
-### 8.9 想看汇编到底编成了什么
-
-```bash
-make lst        # 生成 build/boot.lst 和 build/kernel.lst(带机器码的反汇编)
-qemu ... -s -S  # 配合 gdb:target remote :1234(或 ./tools/run.sh --gdb)
-```
-
-### 8.10 推送到 GitHub(国内网络时通时不通)
-
-手动 `git push` 碰上 GitHub 抽风就得干等。用现成的脚本:
-
-```bash
-tools/onekey_push.sh --dry-run                       # 先看看要推什么
-GH_TOKEN=ghp_xxx tools/onekey_push.sh                # 带上 PAT 推(失败自动重试)
-tools/onekey_push.sh                                 # 配过 credential.helper / SSH 时直接推
-tools/onekey_push.sh --branch dev --retry 8 --sleep 15
-```
-
-token 只从环境变量 `GH_TOKEN` 读,**不写进 config、不落盘**。想长期免输入可以
-`git config --global credential.helper store`(明文存 `~/.git-credentials`),
-或者干脆每次拷进环境变量。
-
-## 9. 中文与字库(详见 font/README.md)
-
-中文**能正常显示**:图形模式下把 16×16 点阵直接 blit 到帧缓冲,`cat DOCS/ZH.TXT` 就能看到
-(演示文本放在镜像里;中文/日文/韩文/英文各一个 .TXT,不做成命令)。
-
-数据来源与生成方式见 [font/README.md](font/README.md):`font/` 目录里是 GNU Unifont 抽出的字形
-(入库的是 416 字形的 23 KB `.hex` 子集 + 二进制;完整 42 112 字形的 1.8 MB 字库**放在磁盘镜像里**,
-由 `tools/mkfontsubset.py` 生成)。**授权按 GPL-2+ 单独标注**(不并入仓库的 MIT)。
-
-**编码现状**:字符编号是标准 Unicode 码位,**内核文本也已经是标准 UTF-8** ——
-`term_print` 会先把 UTF-8 解成码位再画(见 `kernel/utf8.asm`),所以中文文案可以像普通字符串一样
-`db '你好,世界!', 0` 写进内核,程序里也一样;坏字节会画成替换字符 `�` 而不是卡死。
-细节(包括之前那套"码位数组"的历史)见 [docs/encoding.md](docs/encoding.md)。
-
-## 10. 下一步:该玩点啥
-
-**刚刚落地:PCI 总线枚举** —— `pci` 一条命令把机器上的设备全列出来(厂商:设备号、类别名、中断号),
-`pci 0:1.2` 看单台设备详情;QEMU 上正好一次看全:IDE、USB(UHCI)、显卡、网卡
-(见 [docs/pci.md](docs/pci.md))。**这是给 USB 铺的路** —— 想读 USB 键盘,得先知道
-USB 控制器在哪、它的寄存器窗口(那个 I/O BAR)开在哪儿。
-
-再往前是 **ring 3 用户态 + rc.conf 服务/事件库** —— 程序跑在 CPL=3,内核的页它碰不到,碰了就死、内核不慌
-(见 §5「程序跑在 ring 3」)。再往前是**多 shell**:4 条 shell 各是一条内核线程,
-`Ctrl+←/→` 在键盘中断里换焦点,一条卡在 `run HANG` 里时另一条照样能干活(见 §5「多 shell」)。
-再往前一步是内核线程 + 抢占式轮转(PIT 的 IRQ0 里存现场、换栈,`ps`/`spawn`/`kill`)
-和 `date`(读 CMOS 实时时钟)。
-
-往下可以挑的:
-- **闪烁光标**:现在光标常亮,有了 100 Hz 的 tick,在 `pit_irq` 里翻转一下就行(还没做)
-- **`settime`**:往 CMOS 写时间(得先关 NMI 位、还得避开时钟更新,见
-  [docs/known-issues.md](docs/known-issues.md) 第 8 节)
-- **每个线程一套地址空间**:ring 3 有了,但地址空间那套状态还是全局的(一次只让一条
-  shell 跑程序),`space_*` 得挂到线程上才能同时跑几个进程
-- **rc.conf 的下一层**:`RC.CONF`(key=value)已经能管「开机跑哪些程序」和事件账本了
-  (见 [docs/rc-conf.md](docs/rc-conf.md));还没有依赖关系(`after=` / `requires=`)、
-  没有 `stop`(服务是跑一遍就走的程序)、没有失败重试
-
-## 11. 还没做的(想练手就从这里挑)
-
-- **长文件名(VFAT)**:`rm` / `rmdir` / `mkdir` / 子目录现在都能用了,
-  但名字还是 8.3(短名);VFAT 长名是另一套目录项编码,值得单独做一轮
-- **程序里的删除**:`rm` 是 shell 命令,`mini-libc` 里还没有 `remove()`
-  (所以编辑器存盘只能覆盖同名文件,删不掉旧的)
-- ~~保护程序搞坏内核~~:已经做了(ring 3 + TSS + U/S 位,见 §5)—— 下一步是让内核窗口
-  彻底不出现在程序页目录里(现在还是拷一份内核页目录,只是 U/S=0)
-- **虚拟内存的下一层**:按需分页已经有了(碰到哪页才给哪页),但还没有
-  **页置换 / swap / 写时复制**,也**不给程序自己长栈**(栈还是内核那套);
-  窗口里的空洞也会给页(按访问给,不是按"真的要用"给)
-- **多 shell 的下一层**:现在**一次只让一条 shell 跑程序**(地址空间那套状态还是全局的),
-  被 `kill` 掉的线程也不会回收地址空间(见 [docs/known-issues.md](docs/known-issues.md) 第 9 节)。
-  想让 4 条 shell 同时跑程序,得把 `space_*` 挂到线程上,再给线程加"退出时清理"
-- **真并发管道**:现在是「先跑完 A 再喂 B」的顺序缓冲管道(见 [docs/pipes.md](docs/pipes.md)),
-  缓冲从页池借、跑完就还;要像 Unix 那样边写边读(流式大输出、`tail -f` 那种),
-  得先让调度器能同时跑多个 ring 3 程序(每任务一套地址空间)+ 管道的阻塞/唤醒原语
-- **调度器的下一层**:现在是纯轮转、没有优先级/阻塞唤醒/锁,线程共用一个地址空间,
-  也还是内核态;要往"真进程"走就得动 ring 3 + TSS + 每线程一套页目录(上面那条)
-- **闪烁光标**:有定时器就能做(现在光标是常亮的;`pit_irq` 里翻转一下就行)
-- **`sleep` 的更细粒度**:现在按秒睡(tick 粒度已经到 10 ms,只是 shell 只认整秒)
-- **ELF 加载**:现在程序是平铺二进制读到固定地址(没有段、没有重定位),也不会
-  按程序要多少给多少地长大;`malloc` 已经有了(迷你 libc 里那个),但堆就固定那么大
-- **USB**:PCI 枚举已经能看见 QEMU 的 UHCI 控制器(00:01.2,BAR4 = I/O `0xC040`)和一台
-  e1000 网卡了;按图上这条路走是 **UHCI 初始化 → EP0 控制传输 → HID 键盘 → EHCI + 大容量存储**
-  (为什么按这个顺序、每步会踩什么,写在 [docs/pci.md](docs/pci.md) 结尾)
-- **鼠标(IRQ12)**:PS/2 鼠标比键盘多几个坑(要发命令、读 3 字节包)
-- **`date` 只能读不能写 / 不知道时区**:没有 `settime`(往 CMOS 写得先关 NMI 位、
-  还得避开时钟更新,见 [docs/known-issues.md](docs/known-issues.md) 第 8 节);
-  打出来的就是 CMOS 里的原始数字,不做时区换算
-- **多软盘版(mfd)**:软盘这条线已经"退休"了,但真要复古到底,可以做成
-  **一张盘一个角色**的老式发行版(像 DOS 时代装个软件要"请插入第 2 张盘"):
-  1.44 MB 一张 = 2880 扇区,内核 128 KiB 就吃掉 256 扇区,预算得掐着算。
-  它是**在软盘版的基础上改**的(复用 `boot/boot.asm` 那条 CHS 读盘路径,不另起炉灶)。
-  盘的角色(标签写在每张盘的 0 号扇区里,和 `MFLP` 魔数、盘号一起):
-
-  | 盘 | 标签 | 放什么 | 现在有多大 |
-  |----|------|--------|-----------|
-  | 1 | `minimal system` | 引导扇区 + stub + 内核(含 416 字形内置子集),开机直接进 shell | 128 KiB |
-  | 2 | `disk read/write` | FAT12/16 读写 + 程序盘(HELLO/COUNT/CALC/TOUCH/EDIT/VI/PLAY)+ 演示文本(ZH/EN/JPKR)+ `RC.CONF` | ~110 KiB |
-  | 3 | `more characters (1/2)` | 完整字库 `full-kkf.bin` 的前一半(1 张软盘塞不下 1.8 MB) | ~893 KiB |
-  | 4 | `more characters (2/2)` | 完整字库的后一半 | ~893 KiB |
-  | 5 | `add-ons` | 以后加的东西(播放器/游戏/演示程序),也可以继续往后编号 | 余量 |
-
-  难点不在读盘(ATA/CHS 那套现成的),在**换盘**:提示"请插入第 2 张盘"之后
-  要能发现介质已经换了 —— BIOS `INT 13h AH=16h` 的换盘检测不可靠,通常得靠
-  "读 0 号扇区、验 `MFLP` 魔数和盘号"这种土办法;换错了要提示"这张是
-  `more characters (2/2)`,不是我要的"。`make mfd` 一次生成 disk1..5 五张
-  镜像,QEMU 里可以用 monitor 的 `change floppy0` 手动换盘来试
-- **x86_64(长模式)**:现在是 32 位保护模式,全部 12.7k 行汇编都是 32 位的。
-  上 64 位不是"把寄存器改宽"就行,是一次**重写**:PAE + 4 级页表(PML4/PDPT/PD/PT)、
-  长模式 GDT/TSS + IST、IDT 门格式、`pusha/popa` 没有了、调用约定换成
-  SysV(前 6 个参数走 rdi/rsi/rdx/rcx/r8/r9)、结构体尺寸翻倍(TCB/BOOTINFO/目录项指针)、
-  程序和 libc 也得重新编成 64 位。建议**不要就地改**,另开一棵树(分支或新目录)
-  按里程碑往上爬:①引导进长模式并打印 → ②中断/键盘 → ③分页 + 堆 → ④FAT16 读
-  → ⑤ring 3 → ⑥调度器。老树留着当"能跑的演示",新树慢慢追
-- **从磁盘读内核**:现在内核还是引导扇区按固定 LBA 读的,没有"从文件系统加载内核"
-
-## 12. 许可
-
-GPL-3.0 —— 随便用、随便改，**改完/分发也得保持开源**(见 [LICENSE](LICENSE))。
-Copyright (c) 2026 kai030226
-`font/` 目录里的字形数据来自 GNU Unifont,按 **GPL-2+** 单独授权(见 [font/LICENSE](font/LICENSE))。
-
-要是这个仓库帮你搞懂了保护模式、分页或者文件系统,那就够了。
-
-
-**ps:并非如此,这个readme是AI帮忙写的 本人很懒 只加了这一句话 README的目的是AI瞎编的 我也懒得管了 凑合着看吧!写的比我好(bushi) 至少真东西不是瞎编的 有bug请提pr和邮箱lkx2025awa@outlook.com(-w-) **
+**KKernel** —— *Kai + Kernel*。一个初中生从引导扇区开始写的操作系统，仍在持续长大。

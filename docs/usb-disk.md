@@ -42,7 +42,7 @@ sense: rc=0x70 key=0x00 asc=0x00 ascq=0x00
 - **一次只认一个 USB 设备,而且要插在第一个枚举到的位置**:`usb_init` 找到第一个设备就停;
   如果先插的是 USB 键盘,`usbdisk` 会报
   `no USB mass storage device (first USB device must be the disk)`。要同时用键盘 + U 盘,
-  得先把「多设备枚举」补上(见 README §11)。
+  得先把「多设备枚举」补上(见 [路线图](roadmap.md))。
 - 全速设备跑在 12 Mbit/s(足够读小 U 盘),大容量盘能认但读大文件会慢。
 - LUN 固定 0、单接口、无热插拔(开机后拔插不重新枚举)。
 
