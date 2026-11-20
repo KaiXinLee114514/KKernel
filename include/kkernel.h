@@ -213,6 +213,71 @@ static inline int j_pipe_read(char *buf, int max)
     return n;
 }
 
+/* 信号三元组 <权限类>:<动作>:<级别> 的编码助手(super=0/system=1/user=2;
+ * 动作 kill=1/term=2/stop=3/cont=4/intr=5/usr=6;级别 0 最高、3 提示级) */
+#define KK_SIG(class, action, level) \
+    ((((class) & 0xFF) << 24) | (((action) & 0xFF) << 16) | ((level) & 0xFFFF))
+
+/* 18:fork() —— 复制当前进程(写时复制)。
+ *     父进程返回子进程 pid(>=1),子进程返回 0;失败返回 -1。
+ *     子进程从 int 0x30 的下一条指令继续,和父进程长得一模一样。 */
+static inline int j_fork(void)
+{
+    int r;
+    KK_SYSCALL0(18, r);
+    return r;
+}
+
+/* 19:wait(pid) —— 等一个僵尸子进程并收回它的槽,返回退出码。
+ *     pid = -1 表示任意子进程;没有可收的子进程时返回 -1。
+ *     (内核不等,由调用者自己让出 CPU:shell 命令和测试程序会 sleep 着轮询) */
+static inline int j_wait(int pid)
+{
+    int r;
+    __asm__ volatile("int $0x30" : "=a"(r)
+                     : "a"(19), "b"(pid)
+                     : "memory");
+    return r;
+}
+
+/* 20:exit(code) —— 子进程退出:变成僵尸,退出码留给父进程 wait;不返回 */
+static inline void j_exit_code(int code)
+{
+    __asm__ volatile("int $0x30" : : "a"(20), "b"(code) : "memory");
+    for (;;)
+        ;
+}
+
+/* 21:getpid() —— 当前进程号(1..16;shell 线程是 1..4) */
+static inline int j_getpid(void)
+{
+    int r;
+    KK_SYSCALL0(21, r);
+    return r;
+}
+
+/* 22:signal_send(pid, sig) —— 发一个信号(sig 用 KK_SIG 拼),0 成功 / -1 失败。
+ *     本阶段不做发送方权限校验:super/system/user 只是编码。 */
+static inline int j_signal_send(int pid, int sig)
+{
+    int r;
+    __asm__ volatile("int $0x30" : "=a"(r)
+                     : "a"(22), "b"(pid), "c"(sig)
+                     : "memory");
+    return r;
+}
+
+/* 23:signal_block(mask) —— 设置当前进程的屏蔽位图(bit = 动作号),返回旧位图。
+ *     级别 2/3 的信号被屏蔽后只留在 pending 里;级别 0/1 不可屏蔽。 */
+static inline int j_signal_block(int mask)
+{
+    int r;
+    __asm__ volatile("int $0x30" : "=a"(r)
+                     : "a"(23), "b"(mask)
+                     : "memory");
+    return r;
+}
+
 /* 13:在指定位置画一串字(不滚屏、不动光标)→ 占了几格 */
 static inline int j_puts_at(const char *s, int row, int col, int maxcells)
 {

@@ -46,6 +46,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "rc.asm"                        ; rc.conf 配置 + 事件账本(控制程序事件)
 %include "shell.asm"
 %include "ime.asm"                     ; shell
+%include "process.asm"                  ; 进程/信号(shell 的 ps/fork/wait/kill 要用它的符号)
 
 ; 内核区补到 128 KiB(256 扇区,和 tools/mkimg.py 的 KERNEL_SECTS 一致)——
 ; 引导扇区本来就读 256 个扇区,所以这里只是把文件补够,顺便当"超出就报错"的尺子。

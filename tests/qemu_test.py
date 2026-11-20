@@ -693,12 +693,13 @@ def main() -> int:
     fat32_mode = "--fat32" in argv          # 同一个内核,但分区是 FAT32(镜像得开大)
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
     mine_mode = "--mine" in argv            # 扫雷(BIN/MINE.BIN):菜单/棋盘/光标/旗子/退出
+    proc_mode = "--proc" in argv            # 进程地基:ps/fork/wait/exit/kill/信号三元组
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk", "--mine")]
+                         "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -1053,6 +1054,146 @@ def main() -> int:
                 shot.save("build/screen-fail.png")
                 print("── 失败时的屏幕(OCR,存了 build/screen-fail.png)──")
                 for i, line in enumerate(m_screen_text().splitlines()[:25]):
+                    print(f"   {i:2d}| {line}")
+            return rc
+
+        if proc_mode:
+            # ---- 进程地基:进程表 / fork / wait / exit / kill / 信号三元组 ----
+            results = []
+
+            def wait_idle(max_wait=12.0):
+                """等屏幕不再变化(往 VBE 里画字是 MMIO,慢)。"""
+                last = None
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < max_wait:
+                    blob = mon.screendump().tobytes()
+                    if blob == last:
+                        return
+                    last = blob
+                    time.sleep(0.3)
+
+            def run(line, wait=1.0, idle=True):
+                wait_idle(12.0)
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                if idle:
+                    wait_idle(12.0)
+                else:
+                    wait_idle(3.0)
+                rescan()
+
+            def wait_for(text, timeout=20.0, step=0.3):
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < timeout:
+                    rescan()
+                    if has(text):
+                        return True
+                    time.sleep(step)
+                return False
+
+            def last_started_pid():
+                """从屏幕上刚打出的 'fork: child pid N started' 里取 pid。
+
+                进程槽是复用的(收尸后下一个 fork 又拿最小空槽),所以 pid
+                不一定递增 —— 断言要用"这一次到底起了谁"。
+                """
+                rescan()
+                txt = "\n".join(screen_text(shot, glyphs))
+                found = re.findall(r"fork: child pid (\d+) started", txt)
+                return int(found[-1]) if found else None
+
+            # ---- 1. ps:进程表里能看到 shell 自己(PID 1,PPID 0)----
+            run("ps", wait=0.8)
+            results.append(("ps 打印进程表(shell 是 pid 1 / ppid 0 / RUN)",
+                            has("ps: ") and has("16 slots")
+                            and has("pid 1 ppid 0 RUN"),
+                            "ps: N alive / 16 slots, ... 然后 pid 1 ppid 0 RUN shell"))
+
+            # ---- 2. fork:子进程睡 100 tick 后 exit(7),父进程 wait 拿回退出码 ----
+            run("fork", wait=1.5, idle=False)
+            ok = wait_for("wait: child pid ", 30.0) and wait_for("exited with code 7", 5.0)
+            results.append(("fork 起子进程,wait 收到退出码 7",
+                            ok and has("fork: child pid "),
+                            "fork: child pid N started / wait: child pid N exited with code 7"))
+
+            # ---- 3. fork nowait:子进程留着,退出后应该是 ZOMBIE 等父进程收尸 ----
+            run("fork nowait", wait=1.2, idle=False)
+            pid = last_started_pid()
+            results.append(("fork nowait 立刻返回,子进程进进程表",
+                            pid is not None,
+                            "fork: child pid N started"))
+            time.sleep(7.5)                     # 子进程睡 600 tick(约 6 秒)后退出
+            run("ps", wait=0.8)
+            results.append(("子进程退出后是 ZOMBIE,等父进程 wait",
+                            pid is not None and has(f"pid {pid} ppid 1 ZOMBIE"),
+                            f"pid {pid} ppid 1 ZOMBIE demo"))
+
+            # ---- 4. wait 收尸;没有僵尸时 wait 要明确说 no zombie child ----
+            run(f"wait {pid}", wait=0.8)
+            results.append((f"wait {pid} 收尸并拿回退出码",
+                            has(f"wait: child pid {pid} exited with code 7"),
+                            f"wait: child pid {pid} exited with code 7"))
+            run("wait", wait=0.8)
+            results.append(("没有僵尸子进程时 wait 报 no zombie child",
+                            has("wait: no zombie child"),
+                            "wait: no zombie child"))
+
+            # ---- 5. kill 用默认的 super:kill:0:先解析三元组,再真的终止 ----
+            # 用 HANG.BIN(会跑约 20 秒)当靶子:demo 子进程只活 6 秒,
+            # 敲命令+抓屏的开销就可能超时,靶子必须活得比测试步骤久。
+            run("fork nowait HANG.BIN", wait=1.5, idle=False)
+            pid = last_started_pid()
+            results.append(("fork nowait <程序> 起子进程并 exec(靶子 HANG.BIN)",
+                            pid is not None,
+                            "fork: child pid N started"))
+            run(f"kill {pid} super:kill:0", wait=1.0)
+            results.append(("kill 解析 super:kill:0(class 0 / action 1 / level 0)",
+                            has("kill: signal super:kill:0")
+                            and has("(class 0, action 1, level 0)")
+                            and has(f"kill: pid {pid} signalled"),
+                            "kill: signal super:kill:0 (class 0, action 1, level 0) / kill: pid N signalled"))
+            run("ps", wait=0.8)
+            results.append(("被 kill 的子进程变成 ZOMBIE,不是凭空消失",
+                            has(f"pid {pid} ppid 1 ZOMBIE"),
+                            f"pid {pid} ppid 1 ZOMBIE demo"))
+            run(f"wait {pid}", wait=0.8)
+            results.append(("被 kill 的退出码是 128+9=137",
+                            has(f"wait: child pid {pid} exited with code 137"),
+                            f"wait: child pid {pid} exited with code 137"))
+
+            # ---- 6. 用户级信号 user:term:2 的解析(class 2 / action 2 / level 2)----
+            run("fork nowait HANG.BIN", wait=1.5, idle=False)
+            pid = last_started_pid()
+            results.append(("fork 一个子进程给用户级信号用",
+                            pid is not None,
+                            "fork: child pid N started"))
+            run(f"kill {pid} user:term:2", wait=1.0)
+            results.append(("kill 解析 user:term:2(class 2 / action 2 / level 2)",
+                            has("kill: signal user:term:2")
+                            and has("(class 2, action 2, level 2)")
+                            and has(f"kill: pid {pid} signalled"),
+                            "kill: signal user:term:2 (class 2, action 2, level 2) / kill: pid N signalled"))
+            run(f"wait {pid}", wait=0.8)
+            results.append(("term 的默认动作终止进程,父进程拿回 137",
+                            has(f"wait: child pid {pid} exited with code 137"),
+                            f"wait: child pid {pid} exited with code 137"))
+
+            # ---- 7. 真·ring3 fork:FORK.BIN 自己 fork、写共享页、wait、exit ----
+            run("run FORK.BIN", wait=2.0, idle=False)
+            ok = wait_for("forktest: PASS", 35.0)
+            results.append(("FORK.BIN:ring3 fork/写时复制/wait/exit 全通",
+                            ok, "forktest: PASS pid=1 child=N code=7 shared0=0"))
+            if ok:
+                results.append(("子进程写共享页没有影响父进程(COW 生效)",
+                                has("code=7 shared0=0"),
+                                "parent ... code=7 shared0=0(子进程写的是自己那份)"))
+
+            rc = report(results)
+            if rc:
+                shot.save("build/screen-fail.png")
+                print("── 失败时的屏幕(OCR,存了 build/screen-fail.png)──")
+                for i, line in enumerate(screen_text(shot, glyphs)[:25]):
                     print(f"   {i:2d}| {line}")
             return rc
 
@@ -1785,7 +1926,7 @@ def main() -> int:
                 rescan()
 
             def ps_rows(tries=3):
-                """抓 ps:[编号] 名字 ticks=N。被线程插花了就 clear 重来。"""
+                """抓 "pid N ppid M RUN alpha ticks=T"。被线程插花了就 clear 重来。"""
                 got, head = [], False
                 for _ in range(tries):
                     raw_cmd("clear", 0.4)
@@ -1800,10 +1941,11 @@ def main() -> int:
                         rescan()
                         txt = ("\n".join(screen_text(shot, glyphs)) if graphics
                                else "\n".join(mon.screen()))
-                        rows = re.findall(r"\[(\d)\] (alpha|beta)\s+ticks=(\d+)", txt)
+                        rows = re.findall(
+                            r"pid (\d+) ppid \d+ (?:RUN|ZOMBIE|STOP) (alpha|beta)\s+ticks=(\d+)", txt)
                         if len(rows) > len(got):
                             got = rows
-                        if "alive / 6 slots" in txt:
+                        if "alive / 16 slots" in txt:
                             head = True
                         if len(got) >= 2 and head:
                             return got, head
@@ -1812,17 +1954,18 @@ def main() -> int:
             rows, header_ok = ps_rows()
             ids = sorted(int(i) for i, _, _ in rows)
             ticks = [int(t) for _, _, t in rows]
+            # 四条 shell=pid 1..4,演示线程拿空槽 4/5 → pid 5/6(PID = 槽号 + 1)
             results.append(("ps 里两个线程都在拿 tick",
-                            len(rows) >= 2 and ids == [4, 5] and all(t > 0 for t in ticks),
-                            f"ps 表头 alive/6 slots={header_ok},alpha/beta 行与 ticks:{rows}"))
+                            len(rows) >= 2 and ids == [5, 6] and all(t > 0 for t in ticks),
+                            f"ps 表头 alive/16 slots={header_ok},alpha/beta 行与 ticks:{rows}"))
 
-            run("kill 4", wait=0.6)
-            run("kill 5", wait=0.8)
+            run("kill 5", wait=0.6)
+            run("kill 6", wait=0.8)
             time.sleep(0.5)
             run("clear")
             run("ps", wait=1.0)
             results.append(("kill 之后只剩 shell",
-                            has("4 alive / 6 slots") and not has("alpha"),
+                            has("4 alive / 16 slots") and not has("alpha"),
                             "两个演示线程都杀掉了,ps 里只剩 4 条 shell"))
             run("kill 0", wait=0.8)
             results.append(("kill 0 被拒", has("cannot kill"),

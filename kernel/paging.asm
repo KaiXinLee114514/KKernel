@@ -42,6 +42,8 @@ PT_LFB      equ 0x4000                 ; 页表:给 VBE 线性帧缓冲用
 PAGE_P      equ 1                      ; bit0 present
 PAGE_RW     equ 2                      ; bit1 writable
 PAGE_USER   equ 4                      ; bit2 ring 3 也能碰(U/S)。内核页故意不设这一位
+PAGE_COW    equ 0x200                  ; bit9 写时复制:页是只读的,写它要复制一份
+                                       ;   (bit9 是 CPU 不用的软件位)
 
 ; 注意:帧缓冲地址用 kmain.asm 里的 fb_phys 变量(内核启动时从 BOOTINFO 抄过来的)
 
@@ -139,7 +141,9 @@ paging_init:
     mov eax, PD_ADDR
     mov cr3, eax
     mov eax, cr0
-    or  eax, 0x80000000                ; CR0.PG = 1
+    or  eax, 0x80010000                ; CR0.PG = 1,CR0.WP = 1
+                                       ;   WP:内核(ring0)写只读页也触发页错误 ——
+                                       ;   COW 缺页处理靠它,不然内核写会绕过
     mov cr0, eax
 
     popad
@@ -484,6 +488,27 @@ page_fault_try_handle:
     mov eax, cr2
     mov [pf_va], eax
 
+    ; ---- COW:写一个"存在但只读且带 PAGE_COW"的页 → 复制一份再用 ----
+    ;  错误码 bit0=1(present)且 bit1=1(write)才可能是 COW;
+    ;  idt.asm 在 call 之前把错误码放进了 ecx。
+    mov eax, ecx
+    mov [pf_err], eax
+    and eax, 3
+    cmp eax, 3
+    jne .classify
+    mov eax, [pf_va]
+    shr eax, 12
+    and eax, 0x3FF
+    mov edi, [pf_space]
+    mov edi, [edi + TCB_SP_PT]
+    mov eax, [edi + eax * 4]
+    test eax, PAGE_P
+    jz .classify
+    test eax, PAGE_COW
+    jnz .cow
+.classify:
+    mov eax, [pf_va]                    ; COW 判定用掉了 eax,这里恢复成出错地址
+
     ; ---- 这个地址落在哪个窗口?(窗口外 = 真错误)----
     mov ebx, eax
     sub ebx, SPACE_IMG_VA
@@ -502,6 +527,50 @@ page_fault_try_handle:
     jmp .check_pte
 .heap:
     mov byte [pf_is_img], 0
+    jmp .check_pte
+
+.cow:
+    ; ---- 1) 记下旧页,拿一页新的,整页复制 ----
+    and eax, 0xFFFFF000
+    mov [pf_old_pa], eax
+    mov ecx, 1
+    call pmem_alloc_pages
+    test eax, eax
+    jz .cow_oom
+    mov [pf_new_pa], eax
+    mov esi, [pf_old_pa]
+    mov edi, eax
+    mov ecx, 1024
+    rep movsd
+    ; ---- 2) 本进程的 PTE 换成新页:可写、去掉 COW ----
+    mov eax, [pf_va]
+    shr eax, 12
+    and eax, 0x3FF
+    mov edi, [pf_space]
+    mov edi, [edi + TCB_SP_PT]
+    mov edx, [pf_new_pa]
+    or  edx, PAGE_P | PAGE_RW | PAGE_USER
+    mov [edi + eax * 4], edx
+    mov eax, [pf_va]
+    invlpg [eax]
+    ; ---- 3) 旧页少一个引用者(归零才真的还给页池)----
+    mov eax, [pf_old_pa]
+    call pmem_free
+    ; ---- 4) 记账:这页算 COW 复制,不算"按需补页" ----
+    mov edi, [pf_space]
+    inc dword [edi + TCB_PFCOW]
+    mov dword [pf_ret], 1
+    popad
+    mov eax, [pf_ret]
+    ret
+.cow_oom:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_cow_oom
+    call term_print
+    popad
+    mov eax, 0
+    ret
 
 .check_pte:
     ; 这一项要是已经"存在",说明不是缺页(比如写只读页)→ 别乱补,交给 panic
@@ -893,6 +962,9 @@ pf_len         dd 0                    ; 要从暂存区拷多少字节
 pf_ret         dd 0                    ; page_fault_try_handle 的返回值
 pf_is_img      db 0                    ; 出错的是镜像窗口(1)还是堆窗口(0)
 msg_pf_oom     db 'out of physical pages while faulting in a page', 10, 0
+msg_cow_oom     db 'cow: out of memory (page still shared)', 13, 10, 0
+pf_err          dd 0
+pf_old_pa       dd 0
 
 sup_va         dd 0                    ; space_user_page:要映的虚拟地址
 sup_pa         dd 0                    ; space_user_page:拿到的物理页

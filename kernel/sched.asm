@@ -30,8 +30,8 @@
 ;    · 杀不掉"正在跑的线程"(0 号 = shell 自己):它还在用那条栈
 ; ============================================================================
 
-SCHED_MAX         equ 6                 ; 最多几个线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 112               ; 每个 TCB 112 字节(见 /4、imul 的用法)
+SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
+TCB_SIZE          equ 132               ; 每个 TCB 132 字节(见 /4、imul 的用法)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -66,13 +66,23 @@ TCB_SP_STAGE_PA   equ 100               ; 镜像暂存区(物理地址;按需分
 TCB_SP_STAGE_PAGES equ 104              ; 暂存区占几页
 TCB_SP_KILLREQ    equ 108               ; 1 = 别的 shell 要求干掉这条线程上的程序
                                         ;     (IRQ0 在 ring3 现场上收摊,见 pit.asm)
+
+; ---- 进程/信号地基:PCB 直接内嵌在 TCB 里(见 docs/process-signal-design.md)----
+;  pid = 槽号 + 1,所以 PID 1..16;父进程号 0 表示「没有父进程」(shell 主线程)。
+TCB_PARENT        equ 112               ; 父进程 pid(0 = 壳/孤儿)
+TCB_EXITCODE      equ 116               ; 退出码(是不是有效看 STATE 是否为 ST_ZOMBIE)
+TCB_PENDING       equ 120               ; 待投递信号位图(bit = 动作号)
+TCB_BLOCKED       equ 124               ; 被屏蔽信号位图(bit = 动作号)
+TCB_PFCOW         equ 128               ; 这趟运行里 COW 缺页复制了几页
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))
 
 ST_EMPTY          equ 0                 ; 空槽
-ST_ALIVE          equ 1                 ; 活着
+ST_ALIVE          equ 1                 ; 活着(RUN:可被调度)
 ST_DEAD           equ 2                 ; (留着)已经死掉的
+ST_ZOMBIE         equ 3                 ; 已退出,等父进程 wait 收尸
+ST_STOPPED        equ 4                 ; 被信号暂停(调度器跳过)
 
 SCHED_STACK_PAGES equ 2                 ; 每个线程 8 KiB 栈,从物理页池拿
 SLICE_TICKS       equ 2                 ; 一次跑 2 个 tick(20 ms)就换人
@@ -280,6 +290,23 @@ sched_spawn:
     mov [edx + TCB_STACK], eax
     mov eax, [spawn_name]
     mov [edx + TCB_NAME], eax
+    ; 地址空间状态从"没有"开始 —— 空槽可能还留着上一个死者的页目录/计数。
+    ; 布局四字段(HEAPPAGES/ARGSVA/STACKVA/STACKTOP)下面马上覆盖,这里一并清掉。
+    mov dword [edx + TCB_SP_PD], 0
+    mov dword [edx + TCB_SP_PT], 0
+    mov dword [edx + TCB_SP_LIVE], 0
+    mov dword [edx + TCB_SP_PAGES], 0
+    mov dword [edx + TCB_SP_IMGBYTES], 0
+    mov dword [edx + TCB_SP_PFRUN], 0
+    mov dword [edx + TCB_SP_PFIMG], 0
+    mov dword [edx + TCB_SP_PFHEAP], 0
+    mov dword [edx + TCB_SP_FIRSTPA], 0
+    mov dword [edx + TCB_SP_RUNSTAT], 0
+    mov dword [edx + TCB_SP_FREED], 0
+    mov dword [edx + TCB_SP_STAGE_PA], 0
+    mov dword [edx + TCB_SP_STAGE_PAGES], 0
+    mov dword [edx + TCB_SP_RUNNING], 0
+    mov dword [edx + TCB_SP_KILLREQ], 0
     ; 地址空间布局跟造它的线程一样(全局模板在 kmain 里算好就没再变过)
     mov eax, [space_heap_pages]
     mov [edx + TCB_SP_HEAPPAGES], eax
@@ -289,6 +316,16 @@ sched_spawn:
     mov [edx + TCB_SP_STACKVA], eax
     mov eax, [space_user_stack_top]
     mov [edx + TCB_SP_STACKTOP], eax
+    ; 进程/信号字段:空槽可能留着上一个死者的值,必须清干净
+    mov dword [edx + TCB_PARENT], 0
+    mov dword [edx + TCB_EXITCODE], 0
+    mov dword [edx + TCB_PENDING], 0
+    mov dword [edx + TCB_BLOCKED], 0
+    mov dword [edx + TCB_PFCOW], 0
+    ; 内核线程没有 ring3 程序,但给一个有效的 esp0 顶(真跑程序时 exec 会覆盖)
+    mov eax, [spawn_stack]
+    add eax, SCHED_STACK_PAGES * 4096
+    mov [edx + TCB_SP_RUNESP], eax
     inc dword [sched_live]
     mov eax, [spawn_slot]                ; 返回线程号
     clc
@@ -446,6 +483,48 @@ demo_a          dd 0                    ; alpha 数到几
 demo_b          dd 0                    ; beta 数到几
 
 kill_space      times TCB_SIZE db 0     ; 上一次 sched_kill 杀掉的线程的 TCB 快照
+
+; ---------------------------------------------------------------------------
+;  sched_abandon_current:当前线程不要了(退出/被杀),直接换到下一条 ALIVE 线程
+;
+;  和 sched_pick 的区别:这条线程的现场**不用保存**(它已经死了),
+;  所以不写 [sched_save_esp],直接挑人、换 CR3、把对方的现场 popad/iret 回来。
+;  调用前必须已经把当前 TCB 标成 ST_ZOMBIE(否则会又挑回自己)。
+; ---------------------------------------------------------------------------
+sched_abandon_current:
+    cli
+    mov ecx, SCHED_MAX
+    mov edx, [sched_cur]
+.scan:
+    inc edx
+    cmp edx, SCHED_MAX
+    jb .no_wrap
+    xor edx, edx
+.no_wrap:
+    mov esi, edx
+    imul esi, TCB_SIZE
+    add esi, tcb_table
+    cmp dword [esi + TCB_STATE], ST_ALIVE
+    je .found
+    dec ecx
+    jnz .scan
+    ; 一个 ALIVE 线程都没有了 —— 只能睡死(理论上 shell 主线程不会退)
+    sti
+.hang:
+    hlt
+    jmp .hang
+.found:
+    mov [sched_cur], edx
+    mov [space_cur], esi
+    mov eax, [esi + TCB_CR3]
+    mov cr3, eax
+    mov eax, [esi + TCB_SP_RUNESP]
+    mov [tss_blk + TSS_ESP0], eax
+    inc dword [esi + TCB_RUNS]
+    mov esp, [esi + TCB_ESP]
+    popad
+    add esp, 8
+    iret
 
 ; ---------------------------------------------------------------------------
 ;  sched_kill_space:上一次 sched_kill 杀掉的线程的地址空间快照

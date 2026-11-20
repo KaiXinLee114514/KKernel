@@ -78,10 +78,11 @@ C_CFLAGS    := -m32 -std=gnu89 -ffreestanding -fno-pic -fno-stack-protector \
 C_LD        := ld -m elf_i386 -T lib/kkernel.ld
 CRT0_OBJ    := $(BUILD)/crt0.o
 MINIC_OBJ   := $(BUILD)/minic.o
-CRT_TCC_OBJ := $(BUILD)/crt_tcc.o      # TCC 链接 ELF 用的最小 crt(见 lib/crt_tcc.asm)
+# TCC 链接 ELF 用的最小 crt(见 lib/crt_tcc.asm)
+CRT_TCC_OBJ := $(BUILD)/crt_tcc.o
 ifeq ($(CC_OK),yes)
 C_PROGS     := CHELLO.BIN PLAY.BIN RNGTEST.BIN P2TEST.BIN FPU.BIN FCALC.BIN ECHO.BIN MEMTEST.BIN IOTEST.BIN \
-               WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN
+               WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN FORK.BIN
 else
 C_PROGS     :=
 endif
@@ -116,7 +117,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -359,7 +360,7 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -373,6 +374,12 @@ test-fda: $(IMG)
 test-hda: $(IMG)
 	@echo "── 作为硬盘启动(BIOS 有 LBA,应走 EDD)──"
 	python3 -u tests/qemu_test.py $(IMG) --hda
+
+# 进程地基自测:ps / fork / wait / exit / kill / 三元组信号 / FIFO 的 fork+COW
+test-proc: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── 进程:fork/COW/wait/exit/ps/kill --proc ──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --proc
 
 # 扫雷:PROGS 在 /BIN 里,测试只读盘,不 -B 重建(那会把整盘重做一遍)
 test-mine: $(HDIMG)

@@ -1149,6 +1149,34 @@ str_eq:
     pop esi
     ret
 
+; ---------------------------------------------------------------------------
+;  str_prefix:esi 指向的字符串是否以 edx(以 0 结尾)为前缀
+;    出:eax = 1/0
+;  给 "fork nowait ..." 这种可选词用:str_eq 要求整词相等,它不认后面的参数。
+; ---------------------------------------------------------------------------
+str_prefix:
+    push esi
+    push edi
+    mov edi, edx
+.loop:
+    mov al, [edi]
+    test al, al
+    jz .yes
+    cmp al, [esi]
+    jne .no
+    inc esi
+    inc edi
+    jmp .loop
+.yes:
+    mov eax, 1
+    jmp .out
+.no:
+    xor eax, eax
+.out:
+    pop edi
+    pop esi
+    ret
+
 ; ===========================================================================
 ;  各个命令
 ; ===========================================================================
@@ -3528,20 +3556,42 @@ cmd_ps:
     jae .done
     imul eax, TCB_SIZE
     add eax, tcb_table
-    cmp dword [eax + TCB_STATE], ST_EMPTY
+    mov edx, eax
+    cmp dword [edx + TCB_STATE], ST_EMPTY
     je .skip
 
-    mov esi, msg_ps_id
+    ; ---- pid ----
+    mov esi, msg_ps_pid
     call term_print
     mov eax, [ps_i]
+    inc eax
     call term_print_dec
-    mov esi, msg_ps_name
+    ; ---- 父 pid ----
+    mov esi, msg_ps_ppid
+    call term_print
+    mov eax, [ps_i]
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    mov eax, [eax + TCB_PARENT]
+    call term_print_dec
+    ; ---- 状态 ----
+    mov esi, msg_ps_space
+    call term_print
+    mov eax, [ps_i]
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    mov eax, [eax + TCB_STATE]
+    call process_status_name
+    call term_print
+    ; ---- 名字 ----
+    mov esi, msg_ps_space
     call term_print
     mov eax, [ps_i]
     imul eax, TCB_SIZE
     add eax, tcb_table
     mov esi, [eax + TCB_NAME]
     call term_print
+    ; ---- ticks / runs ----
     mov esi, msg_ps_ticks
     call term_print
     mov eax, [ps_i]
@@ -3556,7 +3606,7 @@ cmd_ps:
     add eax, tcb_table
     mov eax, [eax + TCB_RUNS]
     call term_print_dec
-    ; 正在跑 ring 3 程序的线程标一下,一眼能看出哪条 shell 被占着
+    ; 正在跑 ring 3 程序的线程标一下
     mov eax, [ps_i]
     imul eax, TCB_SIZE
     add eax, tcb_table
@@ -3571,6 +3621,190 @@ cmd_ps:
     inc dword [ps_i]
     jmp .next
 .done:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  cmd_fork:起一个子进程(父进程是当前 shell)
+;    fork                内核演示子进程:睡 100 tick,带退出码 7 走,父进程等它
+;    fork nowait         同上,但命令立刻返回(留给 ps / kill 观察)
+;    fork <程序>         子进程 exec 这个程序,父进程等它退出
+;    fork nowait <程序>  同上,不等
+;
+;  和 spawn 的区别:spawn 起的是"兄弟线程",fork 起的是"孩子"——
+;  TCB_PARENT 指向父 pid,退出后不会立刻消失,而是变 ZOMBIE 等父进程 wait
+;  收走退出码和槽。fork <程序> 的子进程会先 exec 再进 ring 3,用的是它自己
+;  新建的地址空间(父进程的地址空间一点没动)。
+; ---------------------------------------------------------------------------
+cmd_fork:
+    pushad
+    mov dword [fork_nowait], 0
+    mov dword [fork_prog], 0
+    mov esi, [cmd_arg]
+.skip:
+    cmp byte [esi], ' '
+    jne .args
+    inc esi
+    jmp .skip
+.args:
+    cmp byte [esi], 0
+    je .demo
+    mov edx, n_nowait
+    call str_prefix
+    test eax, eax
+    jz .prog
+    mov dword [fork_nowait], 1
+    add esi, 6
+.skip2:
+    cmp byte [esi], ' '
+    jne .args2
+    inc esi
+    jmp .skip2
+.args2:
+    cmp byte [esi], 0
+    je .demo
+.prog:
+    mov [fork_prog], esi
+    ; 名字抄进自己的缓冲区:子进程可能在这条命令返回之后才真正 exec,
+    ; 而 shell 的命令行缓冲区会被下一条命令覆盖。
+    mov esi, [fork_prog]
+    mov edi, fork_name
+    mov ecx, 60
+.copy_name:
+    lodsb
+    test al, al
+    jz .name_done
+    stosb
+    dec ecx
+    jnz .copy_name
+.name_done:
+    mov byte [edi], 0
+    mov dword [proc_exec_name], fork_name
+    mov eax, proc_exec_child
+    mov ebx, nm_exec
+    call process_spawn_kernel
+    jc .full
+    mov [fork_child], eax
+    mov esi, msg_fork_pid
+    jmp .report
+.demo:
+    mov eax, proc_demo_child
+    mov ebx, nm_demo
+    call process_spawn_kernel
+    jc .full
+    mov [fork_child], eax
+    mov esi, msg_fork_pid
+.report:
+    mov al, COL_OK
+    call term_set_color
+    call term_print
+    mov eax, [fork_child]
+    inc eax
+    call term_print_dec
+    mov esi, msg_fork_started
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    cmp dword [fork_nowait], 0
+    jne .done
+
+    ; ---- 父进程等这个娃:没变成僵尸就睡一小会儿再看 ----
+    mov dword [fork_tries], 3000
+.wait_loop:
+    mov eax, [fork_child]
+    inc eax
+    call process_wait
+    cmp eax, -1
+    jne .reaped
+    mov ecx, 5
+    call pit_wait_ticks
+    dec dword [fork_tries]
+    jnz .wait_loop
+    mov esi, msg_fork_timeout
+    jmp .print_line
+.reaped:
+    mov [fork_code], eax
+    mov esi, msg_wait_pid
+    call term_print
+    mov eax, [proc_last_child]
+    call term_print_dec
+    mov esi, msg_wait_code
+    call term_print
+    mov eax, [fork_code]
+    call term_print_dec
+    mov esi, msg_line_end
+.print_line:
+    call term_print
+.done:
+    popad
+    ret
+.full:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_fork_full
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  cmd_wait:回收任意一个僵尸子进程(或者 wait <pid> 指定一个)
+;  退出码由子进程 exit(code) 或"被信号杀死"(128+9)决定。
+; ---------------------------------------------------------------------------
+cmd_wait:
+    pushad
+    mov esi, [cmd_arg]
+.skp:
+    cmp byte [esi], ' '
+    jne .arg
+    inc esi
+    jmp .skp
+.arg:
+    cmp byte [esi], 0
+    je .any
+    call parse_dec
+    jc .usage
+    jmp .do
+.any:
+    mov eax, -1
+.do:
+    call process_wait
+    cmp eax, -1
+    je .none
+    mov [fork_code], eax
+    mov al, COL_OK
+    call term_set_color
+    mov esi, msg_wait_pid
+    call term_print
+    mov eax, [proc_last_child]
+    call term_print_dec
+    mov esi, msg_wait_code
+    call term_print
+    mov eax, [fork_code]
+    call term_print_dec
+    mov esi, msg_line_end
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+.none:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_wait_none
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+.usage:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_wait_usage
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
     popad
     ret
 
@@ -3679,86 +3913,123 @@ cmd_kill:
     call parse_dec
     jc .usage
     mov [kill_id], eax
-    cmp eax, [sched_cur]
-    je .self                             ; 正用它敲命令,不能杀
-    cmp eax, SCHED_MAX
-    jae .none
-    mov ebx, eax
-    imul ebx, TCB_SIZE
-    add ebx, tcb_table
-    cmp dword [ebx + TCB_STATE], ST_ALIVE
-    jne .none
-    cmp eax, SH_MAX
-    jb .kill_prog                        ; shell 线程:只杀它跑的程序
 
-    ; ---- 普通内核线程:连线程带地址空间一起收 ----
+    ; ---- 找信号参数:pid 后面还有东西就当 "<权限类>:<动作>:<级别>" ----
+    mov esi, [cmd_arg]
+.skp:
+    cmp byte [esi], ' '
+    jne .digits
+    inc esi
+    jmp .skp
+.digits:
+    cmp byte [esi], '0'
+    jb .digits_done
+    cmp byte [esi], '9'
+    ja .digits_done
+    inc esi
+    jmp .digits
+.digits_done:
+.skp2:
+    cmp byte [esi], ' '
+    jne .sig
+    inc esi
+    jmp .skp2
+.sig:
+    cmp byte [esi], 0
+    je .default_sig
+    call signal_parse
+    jc .usage
+    jmp .have_sig
+.default_sig:
+    ; 没写信号 = super:kill:0(高 8 位权限类 0,中 8 位动作 kill=1,低 16 位级别 0)
+    mov eax, 0x00010000
+    xor ebx, ebx
+    mov ecx, 1
+    xor edx, edx
+.have_sig:
+    mov [ks_sig], eax
+    mov [ks_class], ebx
+    mov [ks_action], ecx
+    mov [ks_level], edx
+
+    ; ---- 目标检查 ----
     mov eax, [kill_id]
-    call sched_name
-    mov [kill_name], esi                  ; 名字先记下来(杀完槽就空了)
-    mov eax, [kill_id]
-    call sched_kill
-    jc .none
-    ; ★ sched_kill 把被杀线程的整块 TCB 抄进了 kill_space(清槽之前),
-    ;   这里照着快照把它的页目录 / 私有页表 / 镜像暂存区收摊 ——
-    ;   否则反复 run 再 kill,`debug pmem` 的空闲页数会一路往下掉。
-    call sched_kill_space
     test eax, eax
-    jz .after_clean
-    mov edi, eax
-    call space_destroy_at              ; eax = 还回去的页数
-    mov [kill_freed], eax
-    mov al, COL_NORMAL
-    call term_set_color
-    mov esi, msg_kill_pages1
-    call term_print
-    mov eax, [kill_freed]
-    call term_print_dec
-    mov esi, msg_kill_pages2
-    call term_print
-.after_clean:
-    mov al, COL_OK
-    call term_set_color
-    mov esi, msg_kill_ok
-    call term_print
+    jz .pid0
+    cmp eax, SCHED_MAX
+    ja .none
+    dec eax
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    cmp dword [eax + TCB_STATE], ST_EMPTY
+    je .none
+    cmp dword [eax + TCB_STATE], ST_ZOMBIE
+    je .zombie
     mov eax, [kill_id]
-    call term_print_dec
-    mov esi, msg_kill_lp
-    call term_print
-    mov esi, [kill_name]
-    call term_print
-    mov esi, msg_kill_rp
-    call term_print
-    mov al, COL_NORMAL
-    call term_set_color
-    popad
-    ret
+    mov ebx, [sched_cur]
+    inc ebx
+    cmp eax, ebx
+    je .self
 
-    ; ---- shell 线程:它没在跑程序就没什么可杀的 ----
-.kill_prog:
-    cmp dword [ebx + TCB_SP_RUNNING], 0
-    je .is_shell
-    cmp dword [ebx + TCB_SP_RUNESP], 0
-    je .is_shell
-    cmp dword [ebx + TCB_SP_RUNSTAT], 0
-    jne .is_shell                        ; 已经在收摊了
-    mov dword [ebx + TCB_SP_KILLREQ], 1  ; 它自己的下一次 IRQ0 会捡这个标记
+    ; ---- 把解析结果打出来:权限类 / 动作 / 级别 ----
+    mov esi, msg_kill_sig
+    call term_print
+    mov eax, [ks_class]
+    mov esi, [sig_class_strs + eax * 4]
+    call term_print
+    mov al, ':'
+    call term_putc
+    mov eax, [ks_action]
+    mov esi, [sig_action_strs + eax * 4]
+    call term_print
+    mov al, ':'
+    call term_putc
+    mov eax, [ks_level]
+    call term_print_dec
+    mov esi, msg_kill_sig2
+    call term_print
+    mov eax, [ks_class]
+    call term_print_dec
+    mov esi, msg_kill_sig3
+    call term_print
+    mov eax, [ks_action]
+    call term_print_dec
+    mov esi, msg_kill_sig4
+    call term_print
+    mov eax, [ks_level]
+    call term_print_dec
+    mov esi, msg_kill_sig5
+    call term_print
+
+    ; ---- 发送(默认动作由 process_signal_send 执行)----
+    mov eax, [kill_id]
+    mov ebx, [ks_sig]
+    call process_signal_send
+    test eax, eax
+    jz .sent
+    mov esi, msg_kill_shell              ; 最常见:shell 线程没在跑程序
+    jmp .err
+.sent:
     mov al, COL_OK
     call term_set_color
-    mov esi, msg_kill_prog1
+    mov esi, msg_kill_done
     call term_print
     mov eax, [kill_id]
     call term_print_dec
-    mov esi, msg_kill_prog2
+    mov esi, msg_kill_done2
     call term_print
     mov al, COL_NORMAL
     call term_set_color
     popad
     ret
+.zombie:
+    mov esi, msg_kill_zombie
+    jmp .err
 .self:
     mov esi, msg_kill_self
     jmp .err
-.is_shell:
-    mov esi, msg_kill_shell
+.pid0:
+    mov esi, msg_kill_pid0
     jmp .err
 .none:
     mov esi, msg_kill_none
@@ -3916,6 +4187,9 @@ n_usb    db 'usb', 0
 n_usbdisk db 'usbdisk', 0
 n_shell  db 'shell', 0
 n_ps     db 'ps', 0
+n_fork   db 'fork', 0
+n_wait   db 'wait', 0
+n_nowait db 'nowait', 0
 n_spawn  db 'spawn', 0
 n_kill   db 'kill', 0
 n_rc     db 'rc', 0
@@ -4056,6 +4330,8 @@ cmd_table:
     dd n_usbdisk, cmd_usbdisk
     dd n_shell,  cmd_shell
     dd n_ps,     cmd_ps
+    dd n_fork,   cmd_fork
+    dd n_wait,   cmd_wait
     dd n_spawn,  cmd_spawn
     dd n_kill,   cmd_kill
     dd n_rc,     cmd_rc
@@ -4070,6 +4346,16 @@ cwd_str         times 64 db 0          ; 当前目录(cd 用,空 = 根)
 saved_dir       dd 0                   ; 命令借用目录时的"还回去"的值
 dbg_arg         dd 0                   ; debug 子命令后面那截参数的指针
 ps_i            dd 0                   ; ps 的循环下标(调用会碰寄存器,只能放内存)
+fork_nowait     dd 0                   ; fork 命令:1 = 不等子进程
+fork_prog       dd 0                   ; fork 命令:参数里的程序名指针
+fork_child      dd 0                   ; 刚 fork 出来的槽号
+fork_code       dd 0                   ; wait 收到的退出码
+fork_tries      dd 0                   ; fork 等子进程的上限(5 tick 一轮)
+fork_name       times 64 db 0          ; 程序名副本(子进程 exec 时来拿)
+ks_sig          dd 0                   ; kill 解析出的 signal_t
+ks_class        dd 0
+ks_action       dd 0
+ks_level        dd 0
 spawn_id        dd 0                   ; 刚起的线程号
 kill_id         dd 0                   ; 要杀的线程号
 kill_name       dd 0                   ; 杀之前先记下的名字
@@ -4129,7 +4415,7 @@ msg_shell_active db '   <- keyboard here', 0
 msg_shell_hint  db 'Ctrl+Left / Ctrl+Right switches, or: shell <n>', 10, 0
 msg_shell_same  db 'already here', 10, 0
 msg_shell_usage db 'usage: shell [1-4]  (no argument = list them)', 10, 0
-msg_kill_shell  db 'kill: cannot kill a shell thread itself (the keyboard lives on them)', 10, 0
+msg_kill_shell  db 'kill: cannot signal a shell thread (it runs no program, or the pid is wrong)', 10, 0
 msg_ps_head    db 'ps: ', 0
 msg_ps_head2   db ' alive / ', 0
 msg_ps_head3   db ' slots, scheduled ticks ', 0
@@ -4139,22 +4425,35 @@ msg_ps_name    db '] ', 0
 msg_ps_ticks   db '  ticks=', 0
 msg_ps_runs    db '  runs=', 0
 msg_ps_prog    db '  *prog', 0            ; 这条线程正在跑 ring3 程序
+msg_ps_pid     db '  pid ', 0
+msg_ps_ppid    db ' ppid ', 0
+msg_ps_space   db ' ', 0
+msg_fork_pid   db 'fork: child pid ', 0
+msg_fork_started db ' started', 10, 0
+msg_fork_full  db 'fork: no free process slot / out of memory', 10, 0
+msg_fork_timeout db 'fork: child did not exit yet, gave up waiting', 10, 0
+msg_wait_pid   db 'wait: child pid ', 0
+msg_wait_code  db ' exited with code ', 0
+msg_wait_none  db 'wait: no zombie child', 10, 0
+msg_wait_usage db 'usage: wait [pid]', 10, 0
+msg_line_end   db 10, 0
 msg_spawn_ok   db 'spawned thread ', 0
 msg_spawn_lp   db ' (', 0
 msg_spawn_rp   db ')', 10, 0
 msg_spawn_full db 'spawn: no free thread slot / out of physical pages', 10, 0
 msg_spawn_usage db 'usage: spawn [alpha|beta]  (no arg = alpha, then beta)', 10, 0
-msg_kill_ok    db 'killed thread ', 0
-msg_kill_lp    db ' (', 0
-msg_kill_rp    db ')', 10, 0
+msg_kill_sig   db 'kill: signal ', 0
+msg_kill_sig2  db ' (class ', 0
+msg_kill_sig3  db ', action ', 0
+msg_kill_sig4  db ', level ', 0
+msg_kill_sig5  db ')', 10, 0
+msg_kill_done  db 'kill: pid ', 0
+msg_kill_done2 db ' signalled', 10, 0
 msg_kill_self  db 'kill: cannot kill the shell you are typing on', 10, 0
-msg_kill_prog1 db 'kill: thread ', 0
-msg_kill_prog2 db ' is running a program; it will be stopped on its next tick', 10, 0
-msg_kill_none  db 'kill: no such thread', 10, 0
-msg_kill_usage db 'usage: kill <id>  (get ids from ps)', 10, 0
-; kill 掉一个正在跑程序的线程时,顺手把它那套地址空间收摊(页还回物理页池)
-msg_kill_pages1 db '  (its address space: ', 0
-msg_kill_pages2 db ' pages back to the pool)', 10, 0
+msg_kill_none  db 'kill: no such process', 10, 0
+msg_kill_pid0  db 'kill: cannot kill pid 0 (pids start at 1; see ps)', 10, 0
+msg_kill_zombie db 'kill: that process is already a zombie (use wait)', 10, 0
+msg_kill_usage db 'usage: kill <pid> [<class>:<action>:<level>]  e.g. kill 5 super:kill:0', 10, 0
 
 msg_help db \
     'help          show this list', 10, \
@@ -4169,9 +4468,11 @@ msg_help db \
     'pci [b:s.f]   list the PCI devices on bus 0, or show one in detail', 10, \
     'usb           UHCI controller / ports / USB keyboard status', 10, \
     'usbdisk       USB mass storage (read-only): info / read <lba> / hexdump <lba> / mbr / sense', 10, \
-    'ps            list threads (id / name / ticks / runs / *prog = has a program)', 10, \
+    'ps            list processes (pid / ppid / state / name / ticks / runs)', 10, \
+    'fork [nowait] [prog]  fork a child (demo child, or run a program in the child)', 10, \
+    'wait [pid]    reap a zombie child and print its exit code', 10, \
     'spawn [who]   start a demo kernel thread (no arg = alpha, then beta)', 10, \
-    'kill <id>     kill a thread, or stop the program a shell is running', 10, \
+    'kill <pid> [class:action:level]  signal a process (default super:kill:0)', 10, \
     'shell [n]     list the 4 shells, or jump to one (Ctrl+Left / Ctrl+Right)', 10, \
     'rc <what>     rc.conf: list / get KEY / start N / log / reload (event log)', 10, \
     'reboot        restart the machine', 10, \
@@ -4415,6 +4716,18 @@ empty_idt  dw 0
 ; ---------------------------------------------------------------------------
 run_resume_kernel:
     call space_deactivate               ; 关按需分页 + 换回内核页目录
+    ; fork 出来的子进程没有"回 shell"这回事:它的退出码留给父进程 wait,
+    ; 自己转成僵尸。崩溃(prog_kill_from_fault 置了 RUNSTAT)按 128+9 记。
+    mov edx, [space_cur]
+    cmp dword [edx + TCB_PARENT], 0
+    je .to_shell
+    mov eax, 0
+    cmp dword [edx + TCB_SP_RUNSTAT], 0
+    je .child_exit
+    mov eax, 128 + 9
+.child_exit:
+    call process_exit
+.to_shell:
     ; ★ 必须补这一句:程序是**走中断门**进来的(int 0x30、或者 14 号页错误),
     ;   中断门硬件会把 IF 清 0;而这条返回路是 `jmp` 不是 `iret`,没人替我们恢复 IF。
     ;   不补的话,shell 回来以后 IF=0:定时器和键盘的中断全被压着(8259 那边 irr=03 挂着、

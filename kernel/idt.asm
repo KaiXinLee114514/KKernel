@@ -178,6 +178,7 @@ isr_common:
     ; 没有程序在跑、或者地址不在程序窗口里 → 返回 0,照旧走下面的 panic。
     cmp dword [ebp + 32], 14
     jne .no_demand
+    mov ecx, [ebp + 36]                 ; 错误码:COW 处理要看 bit1(写)和 bit0(present)
     call page_fault_try_handle
     test eax, eax
     jnz .resume

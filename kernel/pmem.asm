@@ -27,6 +27,12 @@ PMEM_BITMAP  equ 0x3D0000              ; 位图(8192 字节,最多 64512 页 = 2
                                        ;   和 USB 结构(0x3C0000~0x3C1FFF)之后的空闲区,
                                        ;   仍低于 4 MiB,恒等映射(PT_LOW)罩得住。
 PAGE_BYTES   equ 4096                  ; 一页 4 KiB
+; ---- 页引用计数表(COW 用):4 bit/页 ----
+;  0x3D2000 在页池位图(0x3D0000~0x3D1FFF)之后、4 MiB 以前的空闲区,
+;  8 KiB 覆盖 65536 页(= 256 MiB,页池上限 252 MiB 够用)。
+;  偶页在低 4 位、奇页在高 4 位;0 = 没分配,1..15 = 有几个地址空间映射它。
+REFCOUNT_BASE equ 0x3D2000
+REFCOUNT_DWORDS equ 2048               ; 8 KiB / 4
 ; 页池范围不写死了:kmain.asm 启动时按 E820 探到的 RAM 算好
 ;   pmem_start / pmem_end / pmem_total / pmem_words
 ; 位图按"一页一位、一个 dword 记 32 页"排,上限 64512 页 = 252 MiB 页池
@@ -40,6 +46,10 @@ pmem_init:
     mov edi, PMEM_BITMAP
     mov ecx, [pmem_words]              ; 运行时算出来的位图 dword 数
     xor eax, eax
+    rep stosd
+    ; 引用计数表整张清零:0 = 全部"没被任何地址空间引用"
+    mov edi, REFCOUNT_BASE
+    mov ecx, REFCOUNT_DWORDS
     rep stosd
     mov eax, [pmem_total]
     mov [pmem_free_count], eax
@@ -77,6 +87,9 @@ pmem_alloc:
     add eax, ecx                       ; 页号
     shl eax, 12                        ; × 4096
     add eax, [pmem_start]              ; 物理地址
+    push eax
+    call pmem_ref_set1                 ; 新分配的页引用计数 = 1
+    pop eax
     dec dword [pmem_free_count]
     inc dword [pmem_alloced]
     cmp eax, [pmem_hi]
@@ -91,25 +104,66 @@ pmem_alloc:
 ; ---------------------------------------------------------------------------
 pmem_free:
     push ebx
+    push ecx
+    push edx
+    push esi
     test eax, PAGE_BYTES - 1
     jnz .bad                           ; 没页对齐
     cmp eax, [pmem_start]
     jb .bad                            ; 低于池子(内核地盘,不归我们管)
     cmp eax, [pmem_end]
     jae .bad                           ; 高于池子
+    ; ---- 找到引用计数的那半个字节 ----
     sub eax, [pmem_start]
     shr eax, 12                        ; 页号
+    mov edx, eax
+    and edx, 1
+    shl edx, 2                         ; 位移:偶页 0,奇页 4
+    shr eax, 1
+    lea esi, [REFCOUNT_BASE + eax]
+    mov ecx, edx
+    movzx eax, byte [esi]
+    shr eax, cl
+    and eax, 15
+    test eax, eax
+    jz .bad                            ; 计数 0 = 没分配 / 重复释放
+    dec eax
+    jnz .store                         ; 还有别的地址空间在引用,页不能还
+    ; ---- 引用归零:把页真正还给池子(清位图 + 计数)----
+    mov eax, esi
+    sub eax, REFCOUNT_BASE
+    shl eax, 1
+    test edx, edx
+    jz .pn_ok
+    inc eax
+.pn_ok:
     mov ebx, eax
-    shr ebx, 5                         ; dword 下标
-    and eax, 31                        ; 位号
-    btr dword [PMEM_BITMAP + ebx * 4], eax   ; 清位,CF = 原来的值
-    jnc .bad                           ; 本来就是 0 = 重复释放
+    shr ebx, 5
+    and eax, 31
+    btr dword [PMEM_BITMAP + ebx * 4], eax
     inc dword [pmem_free_count]
     dec dword [pmem_alloced]
+    xor eax, eax                       ; 新计数 = 0
+.store:
+    ; byte = (byte & ~(15 << shift)) | (new << shift)
+    mov ecx, edx
+    mov ebx, 15
+    shl ebx, cl
+    not ebx
+    and byte [esi], bl
+    mov ecx, edx
+    shl eax, cl
+    or byte [esi], al
+    pop esi
+    pop edx
+    pop ecx
     pop ebx
     clc
     ret
 .bad:
+    pop esi
+    pop edx
+    pop ecx
     pop ebx
     stc
     ret
@@ -204,6 +258,20 @@ pmem_alloc_pages:
     dec ecx
     jnz .mark
 
+    ; 这一段的每一页引用计数 = 1(刚分配,还没有人共享)
+    mov edi, [pap_start]
+    shl edi, 12
+    add edi, [pmem_start]
+    mov ecx, [pap_need]
+.ref_init:
+    push ecx
+    mov eax, edi
+    call pmem_ref_set1
+    add edi, PAGE_BYTES
+    pop ecx
+    dec ecx
+    jnz .ref_init
+
     mov eax, [pap_need]
     sub dword [pmem_free_count], eax
     add dword [pmem_alloced], eax
@@ -239,6 +307,122 @@ pmem_free_pages:
     mov eax, edi
     pop edi
     pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  pmem_ref_set1:把 eax(池内物理页)的引用计数设成 1
+;  给 pmem_alloc / pmem_alloc_pages 用;破坏 eax/ebx/ecx/edx/esi(都存过)
+; ---------------------------------------------------------------------------
+pmem_ref_set1:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    sub eax, [pmem_start]
+    shr eax, 12
+    mov edx, eax
+    and edx, 1
+    shl edx, 2
+    shr eax, 1
+    lea esi, [REFCOUNT_BASE + eax]
+    mov ecx, edx
+    mov ebx, 15
+    shl ebx, cl
+    not ebx
+    and byte [esi], bl                 ; 清掉旧半字节
+    mov eax, 1
+    shl eax, cl
+    or byte [esi], al                  ; 写 1
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  pmem_ref_get:eax(池内物理页)→ eax = 它的引用计数(0..15)
+;  不在池里(没对齐/越界)→ CF=1,eax=0
+; ---------------------------------------------------------------------------
+pmem_ref_get:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    test eax, PAGE_BYTES - 1
+    jnz .bad
+    cmp eax, [pmem_start]
+    jb .bad
+    cmp eax, [pmem_end]
+    jae .bad
+    sub eax, [pmem_start]
+    shr eax, 12
+    mov edx, eax
+    and edx, 1
+    shl edx, 2
+    shr eax, 1
+    lea esi, [REFCOUNT_BASE + eax]
+    mov ecx, edx
+    movzx eax, byte [esi]
+    shr eax, cl
+    and eax, 15
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    clc
+    ret
+.bad:
+    xor eax, eax
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    stc
+    ret
+
+; ---------------------------------------------------------------------------
+;  pmem_ref_inc:把 eax(池内物理页)的引用计数 +1(封顶 15)
+;  返回 CF=1 表示已经满 15,加不上去(调用方应该让 fork 失败)
+; ---------------------------------------------------------------------------
+pmem_ref_inc:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    sub eax, [pmem_start]
+    shr eax, 12
+    mov edx, eax
+    and edx, 1
+    shl edx, 2
+    shr eax, 1
+    lea esi, [REFCOUNT_BASE + eax]
+    mov ecx, edx
+    movzx eax, byte [esi]
+    shr eax, cl
+    and eax, 15
+    cmp eax, 15
+    jae .sat
+    inc eax
+    mov ecx, edx
+    mov ebx, 15
+    shl ebx, cl
+    not ebx
+    and byte [esi], bl
+    mov ecx, edx
+    shl eax, cl
+    or byte [esi], al
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    clc
+    ret
+.sat:
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    stc
     ret
 
 pmem_free_count dd 0                   ; 空闲页数

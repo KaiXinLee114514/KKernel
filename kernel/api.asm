@@ -129,6 +129,19 @@ api_dispatch:
     je .meminfo
     cmp eax, 17
     je .read_pipe
+    ; ---- 进程 / 信号(功能号 18-23) ----
+    cmp eax, 18
+    je api_h_fork
+    cmp eax, 19
+    je api_h_wait
+    cmp eax, 20
+    je api_h_exit_code
+    cmp eax, 21
+    je api_h_getpid
+    cmp eax, 22
+    je api_h_signal_send
+    cmp eax, 23
+    je api_h_signal_block
     ret
 .print_str:
     call term_print
@@ -296,6 +309,44 @@ api_install:
     call idt_install_user               ; DPL=3:ring 3 的程序也只能从这一条门进来
     ret
 
+; ---- 18 fork():复制当前进程的地址空间(写时复制),子进程也回到 ring 3 ----
+;  ebx = api_stub 的栈帧基址(那里存着程序的 pushad 现场和 iret 帧)
+api_h_fork:
+    lea ebx, [esp + 20]                 ; 20 = api_dispatch 返回地址 4 + 4 个段寄存器 16
+    call process_fork
+    ret
+
+; ---- 19 wait(pid):等一个子进程变成僵尸,收回它的槽,返回退出码 ----
+api_h_wait:
+    mov eax, ebx                        ; 参数: pid,-1 表示任意子进程
+    call process_wait
+    ret
+
+; ---- 20 exit(code):子进程退出,变成僵尸等父进程回收 ----
+api_h_exit_code:
+    mov eax, ebx                        ; 参数: 退出码
+    call process_exit                   ; 不返回
+    ret
+
+; ---- 21 getpid() ----
+api_h_getpid:
+    call process_getpid
+    ret
+
+; ---- 22 signal_send(pid, sig):ebx=pid ecx=sig ----
+api_h_signal_send:
+    mov eax, ebx
+    mov ebx, ecx
+    call process_signal_send
+    ret
+
+; ---- 23 signal_block(mask):ebx=要屏蔽的信号位图(按动作号) ----
+api_h_signal_block:
+    mov eax, ebx
+    call process_signal_block
+    ret
+
+
 ; ---------------------------------------------------------------------------
 ;  api_exit(功能号 15):程序说"我跑完了"
 ;  ring 3 的程序没法用 `ret` 回内核(栈上那个返回地址是内核的,跳不过去),
@@ -305,6 +356,13 @@ api_install:
 ; ---------------------------------------------------------------------------
 api_exit:
     mov edx, [space_cur]
+    ; 有父进程 = fork 出来的子进程(或 shell 用 fork <prog> 跑起来的程序):
+    ; 走进程退出,把自己标成僵尸,等父进程 wait 来收;它没有"回 shell"这回事。
+    cmp dword [edx + TCB_PARENT], 0
+    je .shell_prog
+    mov eax, ebx                        ; 程序给的退出码
+    call process_exit                   ; 不返回
+.shell_prog:
     mov esp, [edx + TCB_SP_RUNESP]      ; cmd_run 进程序前存下的内核栈(每线程一份)
     mov ax, GDT_KDATA
     mov ds, ax
