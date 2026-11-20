@@ -29,10 +29,10 @@ PMEM_BITMAP  equ 0x3D0000              ; 位图(8192 字节,最多 64512 页 = 2
 PAGE_BYTES   equ 4096                  ; 一页 4 KiB
 ; ---- 页引用计数表(COW 用):4 bit/页 ----
 ;  0x3D2000 在页池位图(0x3D0000~0x3D1FFF)之后、4 MiB 以前的空闲区,
-;  8 KiB 覆盖 65536 页(= 256 MiB,页池上限 252 MiB 够用)。
+;  32 KiB 覆盖 65536 页(= 256 MiB,页池上限 252 MiB 够用)。4 bit/页 = 0.5 B/页。
 ;  偶页在低 4 位、奇页在高 4 位;0 = 没分配,1..15 = 有几个地址空间映射它。
 REFCOUNT_BASE equ 0x3D2000
-REFCOUNT_DWORDS equ 2048               ; 8 KiB / 4
+REFCOUNT_DWORDS equ 8192               ; 32 KiB / 4 (4 bit/页 × 65536 页)
 ; 页池范围不写死了:kmain.asm 启动时按 E820 探到的 RAM 算好
 ;   pmem_start / pmem_end / pmem_total / pmem_words
 ; 位图按"一页一位、一个 dword 记 32 页"排,上限 64512 页 = 252 MiB 页池
