@@ -2512,7 +2512,7 @@ def main() -> int:
             checks = [
                 ("标题",            "boot: Operation System"),
                 ("保护模式链路",    "bootloader -> protected mode -> kernel"),
-                ("内核区大小(多扇区)", "kernel area: 256 sectors = 131072 bytes"),
+                ("内核区大小(多扇区)", "kernel area: 512 sectors = 262144 bytes"),
                 ("kmain 地址",      "kmain at 0x00010000"),
                 ("GDT 生效(DS=0x10)", "DS = 0x00000010"),
                 ("读盘方式",         mode),

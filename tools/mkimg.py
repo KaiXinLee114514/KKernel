@@ -7,7 +7,7 @@
   · 硬盘(-hda,默认 16 MB):上面那些 + **磁盘字库**
         LBA 2047        字库描述块(magic 'JFD1' + 字库 LBA + 扇区数)
         LBA 2048 起     字库本体(KKF0,内核用 ATA PIO 读进内存)
-    内核因此能显示完整 Unifont(4 万字形),不受 128 KiB 内核区的限制。
+    内核因此能显示完整 Unifont(4 万字形),不受 256 KiB 内核区的限制。
 
 布局:
     LBA 0        引导扇区(512 字节,必须在 0 扇区,末尾要有 0xAA55)
@@ -30,7 +30,7 @@ HD_SIZE = 16 * 1024 * 1024              # 硬盘镜像默认 16 MB
 STUB_LBA = 1
 STUB_SECTS = 4                         # 2 KB 够实模式 stub 用了
 KERNEL_LBA = 5
-KERNEL_SECTS = 256                     # 必须和 boot/boot.asm 里的常量一致(128 KiB,给 FAT32 留余量)
+KERNEL_SECTS = 512                     # 必须和 boot/boot.asm 里的常量一致(256 KiB;真调度器/锁/长栈要地方)
 
 
 def main() -> int:
