@@ -1,10 +1,10 @@
 # KKernel
 
-**一个从零手写的 32 位 x86 操作系统。目标：功能对标并超越 1975 年的 Unix v6。**
+**一个从零手写的 32 位 x86 操作系统。**
+(...!才...才不是专门为你写的README呢...碰巧罢了...! 哼!)
+引导扇区、保护模式、分页、抢占调度、图形终端、FAT 文件系统、设备层、管道、多 shell、系统内 C 编译器、USB 大容量存储——全部自己实现，不 fork 任何现成内核。
 
-引导扇区、保护模式、分页、抢占调度、VBE 图形终端、FAT16/FAT32、`/DEV` 设备层、管道、多 shell、系统内 C 编译器、USB 大容量存储——全部自己实现，不 fork 任何现成内核。
-
-这不是教学演示。每一次提交都要求：能启动、能通过自动化测试、有文档。
+不是教学演示，也不是课程作业：每次提交都要求能启动、能通过自动化测试、有文档。(哪个混蛋说我这是教学系统的?!)
 
 ![KKernel 硬盘模式:字库从磁盘读、FAT16 列目录、跑磁盘上的程序](docs/screenshot-fat.png)
 
@@ -12,64 +12,72 @@
 
 ![4 条 shell 互相切换](docs/screenshot-shells.png) ![计算器](docs/screenshot-calc.png) ![文本编辑器](docs/screenshot-edit.png) ![拼音输入法悬浮候选条](docs/screenshot-ime.png)
 
-## 为什么对标 Unix v6
+## 设计目标
 
-Unix v6（1975）是「小而完整」的标杆：在 64 KB 地址空间的 PDP-11 上，同时做到多任务、分层文件系统、shell、C 编译器和设备抽象——一个能自己养活自己的最小系统。
+参照 Unix v6「小而完整」的标准从零搭一个操作系统：**引导 → 内核 → 内存管理 → 进程 → 文件系统 → 设备 → shell → 工具链**，每一层都自己写，并且能自己编译自己跑起来。
 
-KKernel 用同一套标准要求自己，但放在 2026 年的 x86 硬件上，并把 v6 时代没有的东西补上：图形、UTF-8/中文、USB、系统内自举编译器。
+不追求马上兼容 POSIX 或现成软件生态，先把「一个系统该有的骨架」做完整，再往上叠加网络、POSIX-lite、多用户等能力。(太难了一时半会兼容不完)
 
-**现在的 KKernel 已经覆盖了 v6 的骨架，并在图形、中文、自举编译、USB 上超出；差距在多用户、信号、fork、网络——这些是路线图里明确的目标。**
+## 基础功能
 
-## 和 Unix v6 对照
+### 引导与内核
 
-| 能力 | Unix v6 (1975) | KKernel (2026) |
-|---|---|---|
-| 平台 | PDP-11/40，64 KB 地址空间 | x86 32 位，分页 + ring 3 |
-| 内存管理 | 交换，无分页 | 分页 + 按需分页，每程序独立地址空间 |
-| 进程 | 分时多用户进程 | 抢占式内核线程（20 ms 轮转）+ 4 条 shell，每条 shell 各跑一个程序 |
-| 用户态隔离 | 有（多用户） | 有（ring 3 + TSS + 页表 U/S 位） |
-| 文件系统 | 原生 Unix FS（RK05 盘） | FAT16/FAT32 读写；实验性 KiFS（独立仓库，journal + CoW） |
-| 设备抽象 | 字符/块设备 | `/DEV` 虚拟设备层 + ATA PIO（LBA28/48）+ UHCI USB 存储（只读） |
-| 终端 | 串口 ASCII | VBE 800×600×32 图形终端，UTF-8 + 42 112 字形 + 拼音输入法 |
-| 编译器 | 系统自带 C 编译器 | 内置 TCC 移植：系统内编译 C → ELF → 运行 |
-| shell | sh（管道、重定向） | KKernel shell：管道、`cp`/`mv`、`/DEV`、样式、rc.conf 开机服务 |
-| 网络 | 无 | 无（PCI 已能枚举 e1000，协议栈在路线图上） |
-| 多用户/权限 | 多用户 + 权限位 | 单用户；FAT 无权限位（隔离靠 ring 3） |
-| 体积 | 内核数十 KB，磁盘 2.5 MB 级 | 内核 128 KB，镜像 16 MB，代码约 2.4 万行 |
+- 512 字节引导扇区（软盘 / 硬盘双路径，LBA 多扇区读 + CHS 兜底）
+- 保护模式：GDT、IDT、TSS，26 个中断 / 异常处理
+- E820 内存探测，运行时确定 `ident` 映射与页池大小，物理页池 + 分页 + 按需分页
+- 每个程序独立地址空间，页表从页池动态分配，退出时整空间回收、页泄漏检测
 
-> 一句话：**KKernel 是 v6 的能力骨架 + 2026 年的终端/编译器/USB，还差 v6 的多用户与网络。**
+### 进程与多 shell
 
-## 已实现
+- 抢占式轮转调度（20 ms 时间片，6 个线程槽），每线程独立内核栈
+- ring 3 用户态执行：`iret` 进入、TSS 维护内核栈；用户程序摸内核内存会被页保护干掉
+- 4 条 shell 各跑在一条内核线程里，每条 shell 可以独立启动程序，`Ctrl+←/→` 切换焦点
+- `ps` / `spawn` / `kill` 管理内核线程与程序
 
-| 子系统 | 内容 |
-|---|---|
-| 引导 | 512 B 引导扇区（软盘/硬盘双路径，LBA + CHS 兜底），加载内核到 0x100000 |
-| 内核骨架 | 保护模式、GDT/IDT、26 个中断/异常、TSS、`iret` 进入 ring 3 |
-| 内存 | E820 探测、运行时 `ident`、物理页池、分页 + 按需分页、每程序独立地址空间、页泄漏回收 |
-| 调度 | 抢占式轮转（20 ms 时间片，6 个线程槽），`ps`/`spawn`/`kill`；多 shell 各一条内核线程，`Ctrl+←/→` 切焦点 |
-| 图形 | VBE 800×600×32、帧缓冲行缓冲与滚动、UTF-8 终端（解码 + 全宽汉字）、42 112 字形全字库（磁盘）/ 416 字形内置子集、光标/清屏/颜色、提示符样式（`kao` 默认 / `plain` / `moe` / `dos` / `c64`） |
-| 输入 | PS/2 键盘、拼音输入法（Shift 切换，候选条浮在屏幕最底两行，候选 + 拼音回显） |
-| 文件系统 | FAT16/FAT32 读写（子目录、VFAT 长文件名、多簇文件、FAT 双份一致性）；`mkfat.py` 生成镜像；镜像根目录 `/BIN` `/LIB` `/SYS` `/DOCS` `/SRC` `/TEST` `/DEV` `/MNT` `/INCLUDE` |
-| 设备 | `/DEV` 虚拟设备（`NULL` `ZERO` `RANDOM` `RTC` `CON` `DEVICES`）、ATA PIO、UHCI USB + USB 大容量储存只读（INQUIRY / READ CAPACITY / READ(10) / MBR）、PCI 总线枚举 |
-| shell | 30+ 命令：`ls` `cd` `cat` `write` `cp` `mv` `rm` `mkdir` `run` `ps` `shell` `style` `usbdisk` 等 |
-| 管道 | `A \| B` 顺序管道（最多 4 段）：生产者屏幕输出被内核捕获进页池缓冲，消费者用 `int 0x30` 功能 17 读回；配套工具 `WC` / `UPPER` / `GREP` / `HEAD` |
-| 工具链 | 内置 TCC 0.9.28 移植（源码没改，配 18 个标准头文件到 `/INCLUDE`）：系统内编译 C → ELF → 运行；宿主机 `bin/kkernel-cc` + SDK |
-| 用户程序 | 计算器、文本编辑器（UTF-8 整字符退格 + 拼音输入）、vi（STEVIE 移植）、扫雷（4 难度 / 随机雷数 / QUICKPASS 作弊）、FCALC 浮点计算器、播放器、自测试程序等 |
-| 系统服务 | `RC.CONF` 开机配置（hostname/services/style…）、服务启动、事件账本（环形缓冲 + `rc log`） |
-| 测试 | 9 组 QEMU 自动化套件（软盘/硬盘/FAT32/异常/键盘/shell/完整字库/USB），测试台屏幕 OCR 断言；另有 KiFS 断电注入测试（独立项目） |
+### 图形终端与中文
 
-## 路线图摘要
+- VBE 800×600×32 图形模式，帧缓冲按行缓冲、脏段刷新，支持滚动
+- UTF-8 终端：ASCII + 全宽汉字混排、42 112 字形全字库（从磁盘加载）、416 字形内置子集兜底
+- 拼音输入法：Shift 切换，候选条浮在屏幕最底两行（候选 + 拼音回显各一行），支持翻页 / 取消
+- 提示符样式：`kao`（默认颜文字 `(・ω・)`） / `plain` / `moe` / `dos` / `c64`，`RC.CONF` 可设
+- 颜色、光标、清屏、按行定位输出等终端功能
 
-**已完成的大项**：多 shell 地址空间地基（每线程 TCB 持地址空间状态）、管道、`/DEV`、USB 大容量储存、FAT32、系统内 TCC 自举、KiFS 实验文件系统（journal + CoW，独立仓库）。
+### 文件系统
 
-**下一步**：
-1. **每 shell 独立虚拟控制台**（Phase 2）：后台 shell 不再共用一块屏，`Ctrl+←/→` 切出真正的多窗口体验——设计见 [docs/design-multishell-cow.md](docs/design-multishell-cow.md)。
-2. **fork + 写时复制 + wait**（Phase 3）：真正的进程模型，为 POSIX 兼容打地基。
-3. **网络**：PCI 已能枚举 e1000，协议栈（ARP/IP/ICMP/UDP/TCP）是中期目标。
-4. **POSIX-lite**：在 `int 0x30` 之上叠一层类 POSIX 系统调用，让现成 C 程序更容易移植。
-5. **多用户与权限**、**USB 写入**、**SMP**：长期目标。
+- FAT16 / FAT32 读写：子目录、VFAT 长文件名、多簇文件、两份 FAT 一致性维护
+- `mkfat.py` 宿主工具生成镜像；系统镜像根目录分为 `/BIN` `/LIB` `/SYS` `/DOCS` `/SRC` `/TEST` `/DEV` `/MNT` `/INCLUDE`
+- `run` 命令自动去 `/BIN` 找程序；程序可以直接读写当前目录、子目录
+- 实验性 **KiFS** 文件系统（独立仓库）：journal 崩溃一致性 + 写时复制（CoW），支持大卷、符号链接、FUSE 挂载
 
-详见 [docs/roadmap.md](docs/roadmap.md)。
+### 设备与存储
+
+- `/DEV` 虚拟设备层：`NULL` `ZERO` `RANDOM` `RTC` `CON` `DEVICES`，`cat` / `write` 直接用
+- ATA PIO 硬盘驱动（LBA28 / LBA48），支持多设备
+- UHCI USB 主机控制器 + USB 大容量存储（只读裸盘）：INQUIRY / READ CAPACITY / READ(10) / MBR 解析
+- PCI 总线枚举（枚举 IDE / USB / 网卡等设备）
+
+### Shell 与管道
+
+- 30+ 内部命令：`ls` `cd` `cat` `write` `cp` `mv` `rm` `mkdir` `rmdir` `run` `ps` `kill` `spawn` `shell` `clear` `info` `debug` `reboot` `uptime` `sleep` `date` `style` `pci` `usbdisk` `rc` `help` 等
+- 管道 `A | B`（最多 4 段）：生产者屏幕输出被内核捕获进页池缓冲，消费者通过 `int 0x30` 功能 17 读回；自带 `WC` / `UPPER` / `GREP` / `HEAD` 工具
+- `write` / `cp` / `mv` 写文件撞名时提示 **R/D/O**（Rename / Don't write / Overwrite）
+- `RC.CONF` 配置开机 hostname / services / 提示符样式；事件账本记录启动过程，`rc log` 可查
+- 命令历史、行编辑（退格按 UTF-8 整字符删除）、多行 buffer
+
+### 开发工具链
+
+- 内置 **TCC 0.9.28 移植**：系统内编译 C → 生成 ELF → 直接运行（TCC 源码未改，配 18 个标准头文件在 `/INCLUDE`）
+- 宿主开发路线：`bin/kkernel-cc` + SDK，把 C 程序编成 KKernel 可执行文件丢进 `progs/`
+- `int 0x30` 系统调用 API 17 个功能：打印、字符串、文件读写、键盘、内存信息、堆、参数、管道等
+
+### 用户程序
+
+- 计算器（定点小数四则运算）、文本编辑器（UTF-8 整字符编辑 + 拼音输入）、vi（STEVIE 移植）、扫雷（4 难度 / 随机雷数 / QUICKPASS 作弊码）、浮点计算器、播放器、以及一批自测试程序
+
+### 测试
+
+- 9 组 QEMU 自动化套件（软盘 / 硬盘 / FAT32 / 分页异常 / 键盘 / shell / 完整字库 / USB 等），测试台真正启动 QEMU、截图、用 OCR 断言屏幕内容，不做 mock
+- KiFS 独立项目另有断电注入一致性测试
 
 ## 快速开始
 
@@ -86,6 +94,7 @@ git clone https://github.com/KaiXinLee114514/KKernel.git
 cd KKernel
 make hd                 # 构建 16 MB 硬盘镜像 build/kkernel-hd.img
 ./tools/run.sh --hd     # 用 QEMU 启动
+#目前windows编译请左转claude code或vibe coding解决
 ```
 
 也可以 `make run` 直接跑默认硬盘镜像。
@@ -115,8 +124,6 @@ make test-hda           # 单组：硬盘模式快速验证
 make test-mine          # 扫雷专项
 make test-usb           # USB 大容量储存（挂一个假 U 盘启动）
 ```
-
-测试台会真的启动 QEMU、截图、用 OCR 断言屏幕内容；每项测试都对应一个真实行为，而不是 mock。
 
 ## 源码地图
 
@@ -153,16 +160,16 @@ docs/        架构、踩坑、shell 命令、子系统文档
 | [docs/font.md](docs/font.md) | 中文与字库数据 |
 | [docs/rc-conf.md](docs/rc-conf.md) | `RC.CONF` 配置项 |
 | [docs/known-issues.md](docs/known-issues.md) | 已知限制与 flaky 测试说明 |
-| [docs/design-multishell-cow.md](docs/design-multishell-cow.md) | 多 shell 虚拟控制台 + fork/CoW 设计稿 |
+| [docs/design-multishell-cow.md](docs/design-multishell-cow.md) | 多 shell 虚拟控制台 + fork/内存 CoW 设计稿 |
 
 ## 已知限制
 
-- **单用户，无账户/权限体系**：隔离只有 ring 3；FAT 没有权限位。
-- **没有 fork/exec/信号**：程序由 shell 启动，退出回 shell；进程模型的 Phase 2/3 在路线图上。
-- **没有网络**：PCI 能枚举网卡，协议栈还没写。
-- **USB 只支持 UHCI + 只读储存**，第一个 USB 设备必须是 U 盘，不支持热插拔。
+- **单用户，无账户/权限体系**：隔离只有 ring 3；FAT 没有权限位。(现在有了,文档懒得更新 临时加的几句 总之有了 Super=root=SYSTEM为最高账户 密码root 剩下的我也不知道了)
+- **没有 fork/exec/信号**：程序由 shell 启动，退出回 shell；**内存级 fork + 写时复制（CoW）尚未实现**，属于 Phase 3 路线图（注：KiFS 文件系统里的 CoW 是文件数据块的写时复制，与本条不同）。(实际上快了)
+- **没有网络**：PCI 能枚举网卡，协议栈还没写。(实在是没时间 等着吧)
+- **USB 只支持 UHCI + 只读储存**，第一个 USB 设备必须是 U 盘，不支持热插拔。(还得要时间沉淀 这我能怎么办...)
 - **单核**：无 SMP；图形终端逐像素刷新，不适合高频动画游戏。
-- 真机兼容性有限（主要在 QEMU 验证）；详细清单见 [docs/known-issues.md](docs/known-issues.md)。
+- 真机兼容性有限（主要在 QEMU 验证）；详细清单见 [docs/known-issues.md](docs/known-issues.md)。(实在是没那么多钱买新设备做experiments了!)
 
 ## 参与开发
 
@@ -176,4 +183,5 @@ docs/        架构、踩坑、shell 命令、子系统文档
 
 ---
 
-**KKernel** —— *Kai + Kernel*。一个初中生从引导扇区开始写的操作系统，仍在持续长大。
+**KKernel** —— *Kai + Kernel*。一个初中生从引导扇区开始写的操作系统，仍在持续长大。(2027下半年以后请自行脑补为高中生)
+联系方式:lkx2025awa@outlook.com qq:3927714593
