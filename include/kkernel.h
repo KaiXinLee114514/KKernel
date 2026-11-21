@@ -278,6 +278,24 @@ static inline int j_signal_block(int mask)
     return r;
 }
 
+/* 24:setprio(prio) —— 改当前线程优先级(0 最高、15 最低;shell 默认 8)→ 0/-1 */
+static inline int j_setprio(int prio)
+{
+    int r;
+    __asm__ volatile("int $0x30" : "=a"(r)
+                     : "a"(24), "b"(prio)
+                     : "memory");
+    return r;
+}
+
+/* 25:getprio() —— 当前线程优先级(0 最高、15 最低) */
+static inline int j_getprio(void)
+{
+    int r;
+    KK_SYSCALL0(25, r);
+    return r;
+}
+
 /* 13:在指定位置画一串字(不滚屏、不动光标)→ 占了几格 */
 static inline int j_puts_at(const char *s, int row, int col, int maxcells)
 {

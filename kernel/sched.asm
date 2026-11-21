@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 168               ; 每个 TCB 168 字节(A2 起:身份/优先级/睡眠,见 /4、imul)
+TCB_SIZE          equ 172               ; 每个 TCB 172 字节(A2/A3:身份/优先级/睡眠,见 /4、imul)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -91,6 +91,10 @@ TCB_SLEEPFLAG     equ 160               ; 睡眠结果:0 = 正常唤醒,1 = 超�
 ; ---- A2:用户窗口总页数(镜像窗口 + 堆区 + 参数页 + guard + 栈增长区)----
 ;   space_create 清窗口、fork 标 COW、space_destroy 收摊都按它扫。
 TCB_SP_WINDOWPAGES equ 164              ; 从 SPACE_IMG_VA 起一共几页
+; ---- A3:就绪队列/aging ----
+;  AGE = 这个线程在就绪队列里连续等了多少个 tick(不是自己的 tick);
+;  等满 AGING_TICKS 就提一级优先级,保证低优先级线程不会饿死。
+TCB_AGE           equ 168               ; 就绪等太久的 tick 数(A3 aging 用)
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))
@@ -100,6 +104,7 @@ ST_ALIVE          equ 1                 ; 活着(RUN:可被调度)
 ST_DEAD           equ 2                 ; (留着)已经死掉的
 ST_ZOMBIE         equ 3                 ; 已退出,等父进程 wait 收尸
 ST_STOPPED        equ 4                 ; 被信号暂停(调度器跳过)
+ST_SLEEPING       equ 5                 ; 睡在某个通道上等唤醒/超时
 
 SCHED_STACK_PAGES equ 4                 ; 每个线程 16 KiB 内核栈(ring3 中断/深调用要用)
                                         ;   ★ 栈下面还有 1 页 guard(摘出恒等映射),
@@ -107,6 +112,8 @@ SCHED_STACK_PAGES equ 4                 ; 每个线程 16 KiB 内核栈(ring3 �
 SLICE_TICKS       equ 2                 ; 一次跑 2 个 tick(20 ms)就换人
 SCHED_PRIO_SHELL  equ 8                 ; shell / 普通线程默认优先级
 SCHED_PRIO_IDLE   equ 15                ; 最低优先级(以后空闲线程用)
+SCHED_PRIO_KERNEL equ 7                 ; 内核服务线程:比普通线程高一级
+AGING_TICKS       equ 100               ; 等 1 秒(100 tick)提一级优先级
 SCHED_CS          equ 0x08              ; 内核代码段选择子(GDT 第 2 项)
 EFLAGS_IF         equ 0x202             ; eflags:IF=1,新线程一上来就能被打断
 
@@ -210,6 +217,151 @@ kstack_free:
 ;  这里**不能**自己换 esp:换栈那一下必须由调用方(irq0_stub)来做,
 ;  不然这个函数的 ret 会从别人的栈上弹返回地址。
 ; ---------------------------------------------------------------------------
+
+; ===========================================================================
+;  A3:优先级就绪队列
+;  16 个优先级,每级一条 FIFO 双链表;链表节点放在 TCB 里:
+;    TCB_READY_NEXT / TCB_READY_PREV 存「槽号+1」(0 = 没有)
+;  位图 sched_ready_bitmap 记哪几级非空 —— bsf 一条指令就能找最高优先级。
+;  约定:正在跑的线程不在队列里;其它 ST_ALIVE 线程必须都在队列里。
+; ===========================================================================
+sched_ready_enqueue:
+    ; 入:esi = 槽号(0..SCHED_MAX-1)
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push edi
+    mov edx, esi
+    imul edx, TCB_SIZE
+    add edx, tcb_table                  ; edx = TCB
+    mov ebx, [edx + TCB_PRIO]           ; 优先级 = 队列下标
+    mov eax, esi
+    inc eax                             ; 本项 = 槽号+1
+    lea edi, [sched_q_tail]
+    mov ecx, [edi + ebx * 4]            ; ecx = 原队尾(0 = 空队)
+    mov [edx + TCB_READY_PREV], ecx
+    mov dword [edx + TCB_READY_NEXT], 0
+    test ecx, ecx
+    jz .first
+    ; 原队尾的 next 指向本项
+    dec ecx
+    imul ecx, TCB_SIZE
+    add ecx, tcb_table
+    mov [ecx + TCB_READY_NEXT], eax
+    jmp .linked
+.first:
+    lea edi, [sched_q_head]
+    mov [edi + ebx * 4], eax            ; 队头 = 本项
+.linked:
+    lea edi, [sched_q_tail]
+    mov [edi + ebx * 4], eax            ; 队尾 = 本项
+    ; 位图置位
+    mov ecx, ebx
+    mov eax, 1
+    shl eax, cl
+    or [sched_ready_bitmap], eax
+    pop edi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+sched_ready_remove:
+    ; 入:esi = 槽号(必须在队列里)
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push edi
+    push ebp
+    mov edx, esi
+    imul edx, TCB_SIZE
+    add edx, tcb_table
+    mov ebx, [edx + TCB_PRIO]
+    mov ebp, [edx + TCB_READY_PREV]     ; 前项(槽号+1)
+    mov ecx, [edx + TCB_READY_NEXT]     ; 后项
+    ; 前项的 next(或队头)指向后项
+    test ebp, ebp
+    jz .at_head
+    mov eax, ebp
+    dec eax
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    mov [eax + TCB_READY_NEXT], ecx
+    jmp .fix_tail
+.at_head:
+    lea edi, [sched_q_head]
+    mov [edi + ebx * 4], ecx
+.fix_tail:
+    ; 后项的 prev(或队尾)指向前项
+    test ecx, ecx
+    jz .at_tail
+    dec ecx
+    imul ecx, TCB_SIZE
+    add ecx, tcb_table
+    mov [ecx + TCB_READY_PREV], ebp
+    jmp .cleared
+.at_tail:
+    lea edi, [sched_q_tail]
+    mov [edi + ebx * 4], ebp
+.cleared:
+    ; 队空了就清位图
+    lea edi, [sched_q_head]
+    cmp dword [edi + ebx * 4], 0
+    jne .unlink
+    mov ecx, ebx
+    mov eax, 1
+    shl eax, cl
+    not eax
+    and [sched_ready_bitmap], eax
+.unlink:
+    xor eax, eax
+    mov [edx + TCB_READY_NEXT], eax
+    mov [edx + TCB_READY_PREV], eax
+    pop ebp
+    pop edi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+sched_ready_dequeue_best:
+    ; 出:eax = 槽号(最高优先级队的队头),-1 = 没有可运行线程
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    mov eax, [sched_ready_bitmap]
+    test eax, eax
+    jz .none
+    bsf ecx, eax                        ; 数字最小的非空级 = 最高优先级
+    mov esi, [sched_q_head + ecx * 4]
+    dec esi                             ; 槽号
+    call sched_ready_remove             ; 摘掉(esi = 槽号)
+    mov eax, esi
+    jmp .out
+.none:
+    mov eax, -1
+.out:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  sched_pick:由 irq0_stub 调用(此刻 pushad 已经把现场压在栈上了)
+;    入:[sched_save_esp] = 当前 esp
+;    出:eax = 接下来该 resume 的 esp(可能是同一个,那就是"不切")
+;
+;  这里**不能**自己换 esp:换栈那一下必须由调用方(irq0_stub)来做,
+;  不然这个函数的 ret 会从别人的栈上弹返回地址。
+; ---------------------------------------------------------------------------
 sched_pick:
     push ebx
     push ecx
@@ -217,58 +369,124 @@ sched_pick:
     push esi
     push edi
 
-    ; ---- 1) 把当前线程的现场存好,顺手记一个 tick ----
+    ; ---- 1) 把当前线程的现场存好 ----
     mov eax, [sched_cur]
-    imul eax, TCB_SIZE                  ; × TCB_SIZE(112,不是 2 的幂)
+    imul eax, TCB_SIZE
     mov ebx, tcb_table
     add ebx, eax
     mov ecx, [sched_save_esp]
     mov [ebx + TCB_ESP], ecx
     mov eax, cr3
     mov [ebx + TCB_CR3], eax
+
+.again:
     inc dword [ebx + TCB_TICKS]
     inc dword [sched_ticks]
 
-    ; ---- 2) 只有自己一个线程?不用切(省掉一次 cr3 折腾)----
-    cmp dword [sched_live], 2
-    jb .keep
-
-    ; ---- 3) 时间片还没用完?继续跑 ----
-    dec dword [sched_slice]
-    jg .keep
-    mov dword [sched_slice], SLICE_TICKS
-
-    ; ---- 4) 从 cur+1 开始找下一个活着的(转一圈,最多 SCHED_MAX 次)----
-    mov esi, [sched_cur]
-    mov ecx, SCHED_MAX
-.next_slot:
+    ; ---- 2) 睡眠超时扫描(不管 sched_on 开没开都要走:开机向导也在用)----
+    xor esi, esi
+.to_scan:
+    mov edi, esi
+    imul edi, TCB_SIZE
+    add edi, tcb_table
+    cmp dword [edi + TCB_STATE], ST_SLEEPING
+    jne .to_next
+    mov ecx, [edi + TCB_SLEEPTICKS]
+    test ecx, ecx
+    jz .to_next                         ; 不限时
+    dec ecx
+    mov [edi + TCB_SLEEPTICKS], ecx
+    jnz .to_next
+    ; 到点了:记「超时」、醒来、挂回就绪队列
+    mov dword [edi + TCB_SLEEPFLAG], 1
+    mov dword [edi + TCB_WCHAN], 0
+    mov dword [edi + TCB_STATE], ST_ALIVE
+    call sched_ready_enqueue            ; esi = 槽号
+.to_next:
     inc esi
     cmp esi, SCHED_MAX
-    jb .no_wrap
-    xor esi, esi
-.no_wrap:
-    mov edx, esi
-    imul edx, TCB_SIZE
-    add edx, tcb_table
-    cmp dword [edx + TCB_STATE], ST_ALIVE
-    jne .try_next
-    ; 找到人:换地址空间(每个线程自己的 cr3),再交出它的 esp
-    mov [sched_cur], esi
-    mov [space_cur], edx                ; 之后 space_* 就读写这个人的 TCB
-    mov eax, [edx + TCB_CR3]
-    mov cr3, eax
-    ; ring3 进来的中断用它的内核栈顶:该线程正在跑程序时就是 run_esp;
-    ; 没跑程序时是 0(纯内核线程不会有特权级切换,用不到 esp0)
-    mov eax, [edx + TCB_SP_RUNESP]
-    mov [tss_blk + TSS_ESP0], eax
-    inc dword [edx + TCB_RUNS]
-    mov eax, [edx + TCB_ESP]
-    jmp .out
-.try_next:
-    dec ecx
-    jnz .next_slot
+    jb .to_scan
 
-    ; 一圈下来只剩自己 → 当没切
+    ; ---- 3) 调度没开?回去继续数 tick ----
+    cmp dword [sched_on], 0
+    je .keep
+
+    ; ---- 4) aging:在就绪队列里等太久的,优先级提一级(低优先级不饿死)----
+    xor esi, esi
+.age_scan:
+    mov edi, esi
+    imul edi, TCB_SIZE
+    add edi, tcb_table
+    cmp dword [edi + TCB_STATE], ST_ALIVE
+    jne .age_next
+    cmp esi, [sched_cur]
+    je .age_next                        ; 正在跑的不算"等"
+    inc dword [edi + TCB_AGE]
+    cmp dword [edi + TCB_AGE], AGING_TICKS
+    jb .age_next
+    mov dword [edi + TCB_AGE], 0
+    mov eax, [edi + TCB_PRIO]
+    ; 老化只把「比普通优先级低」的线程往上提,最多提到 SCHED_PRIO_SHELL(8):
+    ; 普通线程不会被自己老化成"永远最优先",低优先级也不会被饿死。
+    cmp eax, SCHED_PRIO_SHELL
+    jbe .age_next
+    dec eax
+    call sched_ready_remove             ; 按旧优先级摘
+    mov [edi + TCB_PRIO], eax
+    call sched_ready_enqueue            ; 按新优先级挂
+.age_next:
+    inc esi
+    cmp esi, SCHED_MAX
+    jb .age_scan
+
+    ; ---- 5) 决定切不切 ----
+    cmp dword [ebx + TCB_STATE], ST_ALIVE
+    jne .switch                         ; 自己在睡/僵尸:必须换人
+    mov eax, [sched_ready_bitmap]
+    test eax, eax
+    jz .keep                            ; 没别人可跑:保持
+    bsf ecx, eax
+    cmp ecx, [ebx + TCB_PRIO]
+    jb .switch                          ; 有人优先级比当前高:抢占
+    dec dword [sched_slice]
+    jg .keep                            ; 时间片没到
+    mov dword [sched_slice], SLICE_TICKS
+
+.switch:
+    ; 当前线程还活着就排到同优先级队尾(睡/僵尸/暂停的不排)
+    cmp dword [ebx + TCB_STATE], ST_ALIVE
+    jne .pick
+    mov esi, [sched_cur]
+    call sched_ready_enqueue
+.pick:
+    call sched_ready_dequeue_best
+    cmp eax, -1
+    je .idle
+    jmp .go
+
+.idle:
+    ; 一条可运行线程都没有:把控制权还给调用方(它的 hlt 循环会继续睡),
+    ; 下个 tick 再进来扫。★ 不能在这里 sti;hlt —— 那会让嵌套的 IRQ0
+    ; 一层层压栈,睡一夜就把内核栈睡爆了。
+    mov eax, [sched_save_esp]
+    jmp .out
+
+.go:
+    ; eax = 选中的槽号
+    mov [sched_cur], eax
+    mov esi, eax
+    imul esi, TCB_SIZE
+    add esi, tcb_table
+    mov [space_cur], esi                ; 之后 space_* 读写这个人的 TCB
+    mov eax, [esi + TCB_CR3]
+    mov cr3, eax
+    mov eax, [esi + TCB_SP_RUNESP]
+    mov [tss_blk + TSS_ESP0], eax
+    inc dword [esi + TCB_RUNS]
+    mov dword [sched_slice], SLICE_TICKS
+    mov eax, [esi + TCB_ESP]
+    jmp .out
+
 .keep:
     mov eax, [sched_save_esp]
 .out:
@@ -278,6 +496,229 @@ sched_pick:
     pop ecx
     pop ebx
     ret
+
+; ---------------------------------------------------------------------------
+;  A3 睡眠/唤醒 API
+;  通道(chan)约定:一个 4 字节全局地址(谁睡在上面由调用方约定)。
+;  process_wait 用「父线程 TCB 指针」当通道,tty 用 tty_chan。
+;
+;  掉唤醒(lost wakeup)防护的用法:
+;      call sched_sleep_prepare     ; 关中断,把自己标成睡眠
+;      <关中断复查条件;条件已成立 -> call sched_sleep_cancel / sti>
+;      call sched_sleep_commit      ; 开中断睡到被叫醒
+; ---------------------------------------------------------------------------
+
+; sched_sleep_prepare:eax = 通道;出:IF=0(调用方复查条件后再 commit/cancel)
+sched_sleep_prepare:
+    push ebx
+    push ecx
+    push edx
+    cli
+    mov ecx, eax
+    call process_cur_tcb                ; eax = 当前 TCB
+    mov dword [eax + TCB_STATE], ST_SLEEPING
+    mov [eax + TCB_WCHAN], ecx
+    mov dword [eax + TCB_SLEEPTICKS], 0
+    mov dword [eax + TCB_SLEEPFLAG], 0
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; sched_sleep_timeout_prepare:eax = 通道,ecx = 超时 tick(必须 >0)
+sched_sleep_timeout_prepare:
+    push ebx
+    push ecx
+    push edx
+    cli
+    mov [sched_sp_to], ecx
+    mov ecx, eax
+    call process_cur_tcb
+    mov dword [eax + TCB_STATE], ST_SLEEPING
+    mov [eax + TCB_WCHAN], ecx
+    mov ecx, [sched_sp_to]
+    mov [eax + TCB_SLEEPTICKS], ecx
+    mov dword [eax + TCB_SLEEPFLAG], 0
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; sched_sleep_commit:睡到被 wakeup 或超时叫醒;出:eax = SLEEPFLAG(1=超时),IF=1
+sched_sleep_commit:
+    push ebx
+    push ecx
+    push edx
+    push edi
+    call process_cur_tcb
+    mov edi, eax
+.sleep_loop:
+    sti
+    hlt
+    cli
+    cmp dword [edi + TCB_STATE], ST_SLEEPING
+    je .sleep_loop
+    mov eax, [edi + TCB_SLEEPFLAG]
+    mov dword [edi + TCB_SLEEPFLAG], 0
+    sti
+    pop edi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; sched_sleep_cancel:把"准备睡"撤回(ST_SLEEPING→ST_ALIVE);不开关中断
+sched_sleep_cancel:
+    push eax
+    push edi
+    call process_cur_tcb
+    mov edi, eax
+    cmp dword [edi + TCB_STATE], ST_SLEEPING
+    jne .out
+    mov dword [edi + TCB_STATE], ST_ALIVE
+    mov dword [edi + TCB_WCHAN], 0
+    mov dword [edi + TCB_SLEEPTICKS], 0
+    mov dword [edi + TCB_SLEEPFLAG], 0
+.out:
+    pop edi
+    pop eax
+    ret
+
+; sched_sleep_on:eax = 通道 → 睡到被唤醒(不计超时)
+sched_sleep_on:
+    push eax
+    call sched_sleep_prepare
+    call sched_sleep_commit
+    pop eax
+    xor eax, eax
+    ret
+
+; sched_sleep_timeout:eax = 通道,ecx = 超时 tick → eax = 1 超时 / 0 正常唤醒
+sched_sleep_timeout:
+    push eax
+    push ecx
+    call sched_sleep_timeout_prepare
+    call sched_sleep_commit
+    pop ecx
+    pop eax
+    ret
+
+; sched_wakeup:eax = 通道 → 把睡在这条通道上的线程全部叫醒(IRQ 安全)
+sched_wakeup:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    pushfd
+    cli
+    mov ebx, eax                        ; 通道
+    xor esi, esi
+.wk_loop:
+    mov edi, esi
+    imul edi, TCB_SIZE
+    add edi, tcb_table
+    cmp dword [edi + TCB_STATE], ST_SLEEPING
+    jne .wk_next
+    cmp [edi + TCB_WCHAN], ebx
+    jne .wk_next
+    mov dword [edi + TCB_SLEEPFLAG], 0
+    mov dword [edi + TCB_WCHAN], 0
+    mov dword [edi + TCB_SLEEPTICKS], 0
+    mov dword [edi + TCB_STATE], ST_ALIVE
+    call sched_ready_enqueue            ; esi = 槽号
+.wk_next:
+    inc esi
+    cmp esi, SCHED_MAX
+    jb .wk_loop
+    popfd
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; sched_wakeup_all:同 sched_wakeup(本实现就是"唤醒通道上所有线程")
+sched_wakeup_all:
+    jmp sched_wakeup
+
+; sched_yield:主动让出 CPU(把自己的时间片清零,然后借 IRQ0 走一遍完整调度)
+sched_yield:
+    cli
+    mov dword [sched_slice], 0
+    int 0x20
+    mov dword [sched_slice], SLICE_TICKS
+    sti
+    ret
+
+; sched_setprio:eax = 槽号,ecx = 优先级(0..15)→ eax = 0 成功 / -1 参数错
+sched_setprio:
+    push ebx
+    push edx
+    push esi
+    push edi
+    push ebp
+    mov dword [spr_ret], -1
+    cmp eax, SCHED_MAX
+    jae .out
+    cmp ecx, 15
+    ja .out
+    mov ebx, eax                        ; 槽号
+    mov ebp, ecx                        ; 新优先级
+    mov edi, eax
+    imul edi, TCB_SIZE
+    add edi, tcb_table
+    cmp dword [edi + TCB_STATE], ST_EMPTY
+    je .out
+    mov [spr_slot], ebx
+    mov [spr_val], ebp
+    pushfd
+    cli
+    ; 它在队列里的话(ALIVE 且不是当前线程)先摘下来,改完再挂回去
+    cmp dword [edi + TCB_STATE], ST_ALIVE
+    jne .set
+    cmp ebx, [sched_cur]
+    je .set
+    mov esi, ebx
+    call sched_ready_remove
+.set:
+    mov [edi + TCB_PRIO], ebp
+    cmp dword [edi + TCB_STATE], ST_ALIVE
+    jne .ok
+    cmp ebx, [sched_cur]
+    je .ok
+    mov esi, ebx
+    call sched_ready_enqueue
+.ok:
+    mov dword [spr_ret], 0
+    popfd
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ebx
+    mov eax, [spr_ret]
+    ret
+
+; sched_getprio:eax = 槽号 → eax = 优先级(0 最高..15 最低),-1 = 号不对
+sched_getprio:
+    cmp eax, SCHED_MAX
+    jae .bad
+    mov edx, eax
+    imul edx, TCB_SIZE
+    add edx, tcb_table
+    cmp dword [edx + TCB_STATE], ST_EMPTY
+    je .bad
+    mov eax, [edx + TCB_PRIO]
+    ret
+.bad:
+    mov eax, -1
+    ret
+
 
 ; ---------------------------------------------------------------------------
 ;  sched_spawn:造一个新线程
@@ -389,6 +830,7 @@ sched_spawn:
     ; 调度/睡眠字段:新线程默认优先级,睡眠状态一律清零
     mov eax, [sched_default_prio]
     mov [edx + TCB_PRIO], eax
+    mov dword [edx + TCB_AGE], 0
     mov dword [edx + TCB_WCHAN], 0
     mov dword [edx + TCB_SLEEPTICKS], 0
     mov dword [edx + TCB_READY_NEXT], 0
@@ -404,7 +846,14 @@ sched_spawn:
     mov eax, [spawn_stack]
     add eax, SCHED_STACK_PAGES * 4096
     mov [edx + TCB_SP_RUNESP], eax
+    ; 把新线程放进就绪队列 —— inc sched_live 和入队必须一起原子完成,
+    ; 否则调度器可能先看见"活着的线程"、却找不到它在哪条队列里。
+    pushfd
+    cli
     inc dword [sched_live]
+    mov esi, [spawn_slot]
+    call sched_ready_enqueue
+    popfd
     mov eax, [spawn_slot]                ; 返回线程号
     clc
     jmp .out
@@ -442,6 +891,9 @@ sched_kill:
     add ebx, tcb_table
     cmp dword [ebx + TCB_STATE], ST_ALIVE
     jne .bad
+    ; 先把它从就绪队列里摘掉(否则调度器还会挑到一条已经死了的线程)
+    mov esi, eax
+    call sched_ready_remove
 
     ; ★ 先把整块 TCB 抄到 kill_space,再清槽 —— 调用方(cmd_kill)要按里面的
     ;   地址空间字段把那套页目录 / 私有页表 / 镜像暂存区收摊:否则 kill 一条
@@ -552,6 +1004,15 @@ sched_default_prio dd SCHED_PRIO_SHELL  ; 新线程默认优先级
 kstack_base     dd 0                    ; kstack_alloc 的返回值暂存
 kstack_guard    dd 0                    ; kstack_alloc 的 guard 页暂存
 
+; ---- A3:就绪队列(16 个优先级,每级一条 FIFO;位图记哪几级非空)----
+sched_ready_bitmap dd 0
+sched_q_head    times 16 dd 0           ; 每级队头(槽号+1,0 = 空)
+sched_q_tail    times 16 dd 0           ; 每级队尾(槽号+1,0 = 空)
+sched_sp_to     dd 0                    ; timeout_prepare 的超时暂存
+spr_slot        dd 0                    ; sched_setprio 的临时
+spr_val         dd 0
+spr_ret         dd 0
+
 ; sched_spawn 的临时变量(不用 ebp 帧,省得栈上再挪一遍)
 spawn_entry     dd 0
 spawn_name      dd 0
@@ -571,40 +1032,42 @@ kill_space      times TCB_SIZE db 0     ; 上一次 sched_kill 杀掉的线程�
 ;  所以不写 [sched_save_esp],直接挑人、换 CR3、把对方的现场 popad/iret 回来。
 ;  调用前必须已经把当前 TCB 标成 ST_ZOMBIE(否则会又挑回自己)。
 ; ---------------------------------------------------------------------------
+
+; ---------------------------------------------------------------------------
+;  sched_abandon_current:当前线程不要了(退出/被杀),交给下一条可运行线程
+;
+;  和 sched_pick 的区别:这条线程的现场**不用保存**(它已经死了/是僵尸),
+;  所以不写 [sched_save_esp],直接挑人、换 CR3、把对方的现场 popad/iret 回来。
+;  调用前必须已经把当前 TCB 标成 ST_ZOMBIE(否则会又挑回自己)。
+;  优先级队列里有人的话不用管队列:直接取最高优先级的。
+; ---------------------------------------------------------------------------
 sched_abandon_current:
     cli
-    mov ecx, SCHED_MAX
-    mov edx, [sched_cur]
-.scan:
-    inc edx
-    cmp edx, SCHED_MAX
-    jb .no_wrap
-    xor edx, edx
-.no_wrap:
-    mov esi, edx
+.again:
+    call sched_ready_dequeue_best
+    cmp eax, -1
+    je .idle
+    ; eax = 槽号:切过去
+    mov [sched_cur], eax
+    mov esi, eax
     imul esi, TCB_SIZE
     add esi, tcb_table
-    cmp dword [esi + TCB_STATE], ST_ALIVE
-    je .found
-    dec ecx
-    jnz .scan
-    ; 一个 ALIVE 线程都没有了 —— 只能睡死(理论上 shell 主线程不会退)
-    sti
-.hang:
-    hlt
-    jmp .hang
-.found:
-    mov [sched_cur], edx
     mov [space_cur], esi
     mov eax, [esi + TCB_CR3]
     mov cr3, eax
     mov eax, [esi + TCB_SP_RUNESP]
     mov [tss_blk + TSS_ESP0], eax
     inc dword [esi + TCB_RUNS]
+    mov dword [sched_slice], SLICE_TICKS
     mov esp, [esi + TCB_ESP]
     popad
     add esp, 8
     iret
+.idle:
+    ; 一个可运行线程都没有 —— 只能睡死(理论上 shell 主线程不会退)
+    sti
+    hlt
+    jmp .again
 
 ; ---------------------------------------------------------------------------
 ;  sched_kill_space:上一次 sched_kill 杀掉的线程的地址空间快照

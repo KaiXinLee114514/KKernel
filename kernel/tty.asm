@@ -68,6 +68,7 @@ tty_init:
 ; ---------------------------------------------------------------------------
 tty_out_str:
     pushad
+    call console_lock                   ; A4:tty 输出互斥,整串不和其他线程交错
 .loop:
     call utf8_decode                    ; eax = 码位(0=结束),esi 前进
     test eax, eax
@@ -86,6 +87,7 @@ tty_out_str:
     call tty_out_char
     jmp .loop
 .done:
+    call console_unlock
     popad
     ret
 
@@ -94,6 +96,7 @@ tty_out_str:
 ; ---------------------------------------------------------------------------
 tty_out_char:
     pushad
+    call console_lock                   ; A4:单字符输出也进互斥(递归计数,串内不重复等锁)
     ; ---- 管道捕获优先:原始字节进缓冲,不做任何解释 ----
     cmp dword [pipe_capture_on], 0
     je .no_pipe
@@ -173,6 +176,7 @@ tty_out_char:
     mov byte [tty_esc_state], TTY_ESC_NONE
     jmp .done
 .done:
+    call console_unlock
     popad
     ret
 
@@ -710,7 +714,35 @@ tty_read_loop:
     jae .timeout
 .sleep:
     call fb_flush                      ; 保证提示行先上屏,再睡
-    hlt
+    ; ---- 有调度器就睡在 tty_chan 通道上(键盘 IRQ / 超时唤醒)----
+    cmp dword [sched_on], 0
+    je .poll_only
+    cmp dword [tr_timeout], 0
+    je .sleep_block
+    ; 限时版:算一下还剩几个 tick,<= 0 直接超时
+    mov ecx, [tr_deadline]
+    sub ecx, [pit_ticks]
+    jbe .timeout
+    mov eax, tty_chan
+    call sched_sleep_timeout           ; eax = 1 超时 / 0 被叫醒
+    test eax, eax
+    jnz .timeout
+    jmp .wait
+.sleep_block:
+    ; 不限时版:prepare → 关中断复查有没有键 → 有键就撤,没键就睡
+    mov eax, tty_chan
+    call sched_sleep_prepare
+    call kbd_avail
+    test eax, eax
+    jnz .sleep_cancel
+    call sched_sleep_commit
+    jmp .wait
+.sleep_cancel:
+    call sched_sleep_cancel
+    sti
+    jmp .wait
+.poll_only:
+    hlt                                ; 调度器还没开(极早期):裸 hlt 轮询
     jmp .wait
 .have_key:
     call kbd_getkey                    ; eax = ASCII,或 0x100+n(扩展键)
@@ -1249,6 +1281,8 @@ tr_len          dd 0
 tr_timeout      dd 0
 tr_deadline     dd 0
 tr_echo         dd 1
+tty_chan        dd 0                   ; tty 睡眠通道(键盘 IRQ 唤醒)
+
 ; ---- 程序注入输入用的 256 B 环 ----
 tty_ring        times 256 db 0
 tty_ring_head   dd 0

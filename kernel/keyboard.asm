@@ -408,6 +408,11 @@ kbd_push:
     je .full
     mov [kbd_buf + ebx], al
     mov [kbd_head], ecx
+    ; 唤醒睡在 tty 通道上的线程(tty_read_line / 向导 / 登录在等键)
+    push eax
+    mov eax, tty_chan
+    call sched_wakeup
+    pop eax
 .full:
     pop ecx
     pop ebx

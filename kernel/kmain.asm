@@ -805,6 +805,7 @@ term_set_cursor:
 ; ---------------------------------------------------------------------------
 term_puts_at:
     pushad
+    call console_lock                   ; A4:整行重画时别的线程不能插进输出
     mov [tpa_row], ebx
     mov [tpa_col], ecx
     mov [tpa_start], ecx
@@ -865,6 +866,7 @@ term_puts_at:
     mov eax, [tpa_col]
     sub eax, [tpa_start]
     mov [tpa_written], eax
+    call console_unlock
     popad
     mov eax, [tpa_written]
     ret

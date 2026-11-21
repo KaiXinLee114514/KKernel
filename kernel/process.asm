@@ -313,6 +313,7 @@ process_fork:
     mov dword [edx + TCB_READY_NEXT], 0
     mov dword [edx + TCB_READY_PREV], 0
     mov dword [edx + TCB_SLEEPFLAG], 0
+    mov dword [edx + TCB_AGE], 0        ; aging 计数从 0 开始
     mov eax, [esi + TCB_PRIO]           ; 优先级跟着父进程(fork 继承)
     mov [edx + TCB_PRIO], eax
     mov eax, [pf_child_pd]
@@ -347,6 +348,14 @@ process_fork:
     mov dword [edx + TCB_BLOCKED], 0
     mov dword [edx + TCB_PFCOW], 0
     inc dword [sched_live]
+    ; ---- A3:把子线程放进就绪队列 ----
+    ; (A3 前 wait 是 hlt 轮询,子进程靠什么被调度都行;现在调度器只认就绪队列,
+    ;  不 here 入队的话 ring3 fork 出来的子进程永远不跑 → FORK.BIN 挂死。)
+    pushfd
+    cli
+    mov esi, [pf_slot]
+    call sched_ready_enqueue
+    popfd
 
     mov eax, [pf_slot]
     inc eax                             ; 父进程拿到 pid
@@ -391,6 +400,7 @@ process_wait:
     mov [pw_pid], eax
     mov dword [pw_ret], -1
     mov dword [proc_last_child], 0
+    mov dword [pw_sleeping], 0
 .retry:
     xor esi, esi
 .scan:
@@ -410,6 +420,14 @@ process_wait:
     cmp eax, ecx
     jne .next
 .reap:
+    ; 可能是在"准备睡"的关中断复查里发现僵尸:先撤回睡眠状态(中断还关着)
+    cmp dword [pw_sleeping], 0
+    je .reap_go
+    mov eax, [pw_tcb]
+    call sched_sleep_cancel
+    mov dword [pw_sleeping], 0
+    sti
+.reap_go:
     mov [pw_slot], esi
     mov eax, [edx + TCB_EXITCODE]
     mov [pw_ret], eax
@@ -458,11 +476,28 @@ process_wait:
     ; ---- 没有孩子:wait 立刻返回 -1(和 POSIX 的 ECHILD 一个意思)----
     jmp .done
 .sleep:
-    sti
-    hlt
-    cli
+    ; ---- 睡在「父线程 TCB 指针」这个通道上;孩子 exit 时 sched_wakeup 叫醒 ----
+    cmp dword [pw_sleeping], 0
+    jne .sleep_commit
+    call process_cur_tcb
+    mov [pw_tcb], eax
+    mov eax, [pw_tcb]                   ; 通道 = 自己的 TCB 指针
+    call sched_sleep_prepare            ; 关中断,标成 ST_SLEEPING
+    mov dword [pw_sleeping], 1
+    jmp .retry                          ; ★ 关中断再扫一遍:防"检查后、睡下前"孩子恰好退出
+.sleep_commit:
+    call sched_sleep_commit             ; 开中断睡到被叫醒(返回时 IF=1)
+    mov dword [pw_sleeping], 0
     jmp .retry
 .done:
+    ; 不用睡了:万一还挂着"准备睡"就先撤掉,再把中断状态摆正
+    cmp dword [pw_sleeping], 0
+    je .done_sti
+    mov eax, [pw_tcb]
+    call sched_sleep_cancel
+    mov dword [pw_sleeping], 0
+.done_sti:
+    sti
     popad
     mov eax, [pw_ret]
     ret
@@ -475,11 +510,22 @@ process_wait:
 ; ---------------------------------------------------------------------------
 process_exit:
     pushad
+    cli                                 ; 标僵尸→叫醒父进程→拆空间,这段不能被抢占
     mov edx, [space_cur]
     mov [edx + TCB_EXITCODE], eax
     mov dword [edx + TCB_STATE], ST_ZOMBIE
     mov dword [edx + TCB_SP_RUNNING], 0
     mov dword [edx + TCB_SP_KILLREQ], 0
+    ; 叫醒睡在「父线程 TCB 指针」通道上的父进程(process_wait 睡在那儿)
+    mov ecx, [edx + TCB_PARENT]
+    test ecx, ecx
+    jz .no_parent
+    dec ecx
+    imul ecx, TCB_SIZE
+    add ecx, tcb_table
+    mov eax, ecx
+    call sched_wakeup
+.no_parent:
     call space_destroy                  ; 当前线程的空间;没建也能调
     popad
     jmp sched_abandon_current
@@ -535,6 +581,13 @@ process_terminate:
     jmp .ok
 .zombie:
     mov edx, [pt_tcb]
+    ; 它活着就一定在就绪队列里:先摘掉,别让调度器再挑到一个僵尸
+    cmp dword [edx + TCB_STATE], ST_ALIVE
+    jne .zombie_unqueued
+    mov esi, [pt_slot]
+    call sched_ready_remove
+.zombie_unqueued:
+    mov edx, [pt_tcb]
     mov dword [edx + TCB_STATE], ST_ZOMBIE
     mov eax, [pt_code]
     mov [edx + TCB_EXITCODE], eax
@@ -542,6 +595,16 @@ process_terminate:
     mov dword [edx + TCB_SP_KILLREQ], 0
     mov edi, edx
     call space_destroy_at
+    ; 叫醒等这个孩子的父进程
+    mov edx, [pt_tcb]
+    mov ecx, [edx + TCB_PARENT]
+    test ecx, ecx
+    jz .ok
+    dec ecx
+    imul ecx, TCB_SIZE
+    add ecx, tcb_table
+    mov eax, ecx
+    call sched_wakeup
     jmp .ok
 .shell_slot:
     mov edx, [pt_tcb]
@@ -678,6 +741,8 @@ process_signal_send:
     mov edx, [ss_tcb]
     cmp dword [edx + TCB_STATE], ST_ALIVE
     jne .accept
+    mov esi, [ss_slot]
+    call sched_ready_remove             ; 暂停:从就绪队列里摘掉
     mov dword [edx + TCB_STATE], ST_STOPPED
     jmp .accept
 
@@ -686,6 +751,9 @@ process_signal_send:
     cmp dword [edx + TCB_STATE], ST_STOPPED
     jne .accept
     mov dword [edx + TCB_STATE], ST_ALIVE
+    mov esi, [ss_slot]
+    call sched_ready_enqueue            ; 继续:重新挂到就绪队列
+    jmp .accept
 .accept:
     mov dword [ss_ret], 0
 .out:
@@ -1177,6 +1245,8 @@ process_status_name:
     je .zombie
     cmp eax, ST_STOPPED
     je .stopped
+    cmp eax, ST_SLEEPING
+    je .sleeping
     mov esi, st_run
     ret
 .zombie:
@@ -1184,6 +1254,9 @@ process_status_name:
     ret
 .stopped:
     mov esi, st_stopped
+    ret
+.sleeping:
+    mov esi, st_sleep
     ret
 
 ; ---------------------------------------------------------------------------
@@ -1206,6 +1279,8 @@ pf_result       dd 0
 pw_pid          dd 0
 pw_slot         dd 0
 pw_ret          dd 0
+pw_tcb          dd 0                    ; process_wait 睡眠用的通道 = 自己的 TCB 指针
+pw_sleeping     dd 0                    ; 1 = 已经 prepare 睡眠、还没 commit / 已撤回
 proc_last_child dd 0
 
 pt_tcb          dd 0
@@ -1244,6 +1319,7 @@ nm_exec         db 'exec', 0
 st_run          db 'RUN', 0
 st_zombie       db 'ZOMBIE', 0
 st_stopped      db 'STOP', 0
+st_sleep        db 'SLEEP', 0
 
 s_super         db 'super', 0
 s_system        db 'system', 0

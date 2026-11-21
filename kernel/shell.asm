@@ -867,12 +867,23 @@ shell_execute_plain:
     add ebx, 8                            ; 下一项:名字 + 处理函数
     jmp .try
 .run:
+    ; A4:文件系统类命令先上 fs 锁(多个 shell 线程同时碰 FAT/ATA 会互相踩)。
+    ; 命令里面会打印 → 持有 fs 锁再拿 console 锁,顺序是允许的。
+    mov [disp_word], edi
+    mov [disp_len], ecx
+    mov eax, [ebx + 4]
+    mov [disp_handler], eax
+    call shell_fs_enter                   ; eax = 1 → 结束时 shell_fs_leave
+    mov [disp_locked], eax
     mov eax, [fat_dir]                    ; 命令把 cwd 借去用(fat_path 会一层层进去)
     mov [saved_dir], eax
-    mov eax, [ebx + 4]
-    call eax
+    call dword [disp_handler]
     mov eax, [saved_dir]                  ; 用完还回来;cd 会改写 saved_dir
     mov [fat_dir], eax
+    cmp dword [disp_locked], 0
+    je .run_nofs
+    call fs_unlock
+.run_nofs:
     jmp .ret
 .unknown:
     mov dword [sh_kao_err], 1          ; 颜文字提示符:记一笔"刚出过错"
@@ -894,6 +905,34 @@ shell_execute_plain:
     mov al, COL_NORMAL
     call term_set_color
 .ret:
+    ret
+
+; ---------------------------------------------------------------------------
+;  shell_fs_enter:当前命令是不是"碰文件系统"的?是 → 加 fs 锁并返回 eax=1
+;   (ls/cat/write/cp/mv/rm/mkdir/rmdir/cd/info/rc 都要读写 FAT 全局状态)
+; ---------------------------------------------------------------------------
+shell_fs_enter:
+    push ebx
+    mov ebx, fs_cmd_names
+.loop:
+    mov edx, [ebx]
+    test edx, edx
+    jz .no
+    mov esi, [disp_word]
+    mov ecx, [disp_len]
+    call str_eq
+    test eax, eax
+    jnz .yes
+    add ebx, 4
+    jmp .loop
+.yes:
+    call fs_lock
+    mov eax, 1
+    pop ebx
+    ret
+.no:
+    xor eax, eax
+    pop ebx
     ret
 
 ; ---------------------------------------------------------------------------
@@ -3623,6 +3662,14 @@ cmd_ps:
     add eax, tcb_table
     mov eax, [eax + TCB_RUNS]
     call term_print_dec
+    ; ---- 优先级 ----
+    mov esi, msg_ps_prio
+    call term_print
+    mov eax, [ps_i]
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    mov eax, [eax + TCB_PRIO]
+    call term_print_dec
     ; 正在跑 ring 3 程序的线程标一下
     mov eax, [ps_i]
     imul eax, TCB_SIZE
@@ -3638,6 +3685,137 @@ cmd_ps:
     inc dword [ps_i]
     jmp .next
 .done:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  cmd_prio:prio                 看当前线程的 pid / 优先级
+;           prio <pid> <0-15>   改某个线程的优先级(cli 里改,IRQ 安全)
+;  0 最高,15 最低;shell / 普通线程默认 8,idle 用 15。
+; ---------------------------------------------------------------------------
+cmd_prio:
+    pushad
+    mov esi, [cmd_arg]
+.skp:
+    cmp byte [esi], ' '
+    jne .chk
+    inc esi
+    jmp .skp
+.chk:
+    cmp byte [esi], 0
+    je .show
+    ; ---- 第一个参数:pid ----
+    call parse_dec
+    jc .usage
+    mov [pr_id], eax
+    ; 跳到第一个数字后面,找第二个参数
+    mov esi, [cmd_arg]
+.skp0:
+    cmp byte [esi], ' '
+    jne .digits
+    inc esi
+    jmp .skp0
+.digits:
+    cmp byte [esi], '0'
+    jb .after_digits
+    cmp byte [esi], '9'
+    ja .after_digits
+    inc esi
+    jmp .digits
+.after_digits:
+.skp1:
+    cmp byte [esi], ' '
+    jne .second
+    inc esi
+    jmp .skp1
+.second:
+    cmp byte [esi], 0
+    je .show_id
+    ; 解析第二个数:临时把它当成命令参数头,喂给 parse_dec
+    mov eax, [cmd_arg]
+    mov [pr_save_arg], eax
+    mov [cmd_arg], esi
+    call parse_dec
+    mov ecx, eax                        ; 新优先级
+    mov eax, [pr_save_arg]
+    mov [cmd_arg], eax
+    jc .usage
+    mov [pr_val], ecx
+    mov eax, [pr_id]
+    test eax, eax
+    jz .bad_pid
+    cmp eax, SCHED_MAX
+    ja .bad_pid
+    dec eax
+    call sched_setprio                  ; eax=槽号,ecx=prio → eax=0/-1
+    test eax, eax
+    jnz .bad_pid
+    mov al, COL_OK
+    call term_set_color
+    mov esi, msg_prio_set
+    call term_print
+    mov eax, [pr_id]
+    call term_print_dec
+    mov esi, msg_prio_set2
+    call term_print
+    mov eax, [pr_val]
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+.show_id:
+    ; 只给了 pid:打印它的优先级
+    mov eax, [pr_id]
+    test eax, eax
+    jz .bad_pid
+    cmp eax, SCHED_MAX
+    ja .bad_pid
+    dec eax
+    mov [pr_val], eax
+    mov esi, msg_prio_pid
+    call term_print
+    mov eax, [pr_id]
+    call term_print_dec
+    mov esi, msg_prio_is
+    call term_print
+    mov eax, [pr_val]
+    call sched_getprio
+    cmp eax, -1
+    je .bad_pid
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    popad
+    ret
+.show:
+    mov esi, msg_prio_pid
+    call term_print
+    mov eax, [sched_cur]
+    inc eax
+    call term_print_dec
+    mov esi, msg_prio_is
+    call term_print
+    mov eax, [sched_cur]
+    call sched_getprio
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    popad
+    ret
+.bad_pid:
+    mov esi, msg_prio_bad
+    jmp .err
+.usage:
+    mov esi, msg_prio_usage
+.err:
+    mov al, COL_ERR
+    call term_set_color
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
     popad
     ret
 
@@ -4210,6 +4388,7 @@ n_nowait db 'nowait', 0
 n_spawn  db 'spawn', 0
 n_kill   db 'kill', 0
 n_rc     db 'rc', 0
+n_prio   db 'prio', 0
 n_fmt_ymd  db 'ymd', 0
 n_fmt_mdy  db 'mdy', 0
 n_fmt_dmy  db 'dmy', 0
@@ -4321,6 +4500,14 @@ cmd_style:
     call term_print
     ret
 
+; ---- A4:哪些命令碰文件系统(分派时自动加 fs 锁)----
+fs_cmd_names    dd n_ls, n_cat, n_write, n_cp, n_mv, n_rm, n_mkdir, n_rmdir
+                dd n_cd, n_info, n_rc, 0
+disp_word       dd 0                    ; 分派时暂存:命令词指针
+disp_len        dd 0                    ; 命令词长度
+disp_handler    dd 0                    ; 命令处理函数
+disp_locked     dd 0                    ; 1 = 已经加了 fs 锁
+
 cmd_table:
     dd n_help,   cmd_help
     dd n_echo,   cmd_echo
@@ -4356,6 +4543,7 @@ cmd_table:
     dd n_whoami, cmd_whoami
     dd n_su,     cmd_su
     dd n_login,  cmd_login
+    dd n_prio,   cmd_prio
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -4367,6 +4555,9 @@ cwd_str         times 64 db 0          ; 当前目录(cd 用,空 = 根)
 saved_dir       dd 0                   ; 命令借用目录时的"还回去"的值
 dbg_arg         dd 0                   ; debug 子命令后面那截参数的指针
 ps_i            dd 0                   ; ps 的循环下标(调用会碰寄存器,只能放内存)
+pr_id           dd 0                   ; cmd_prio 的临时
+pr_val          dd 0
+pr_save_arg     dd 0
 fork_nowait     dd 0                   ; fork 命令:1 = 不等子进程
 fork_prog       dd 0                   ; fork 命令:参数里的程序名指针
 fork_child      dd 0                   ; 刚 fork 出来的槽号
@@ -4445,7 +4636,14 @@ msg_ps_id      db '  [', 0
 msg_ps_name    db '] ', 0
 msg_ps_ticks   db '  ticks=', 0
 msg_ps_runs    db '  runs=', 0
+msg_ps_prio    db '  prio=', 0
 msg_ps_prog    db '  *prog', 0            ; 这条线程正在跑 ring3 程序
+msg_prio_usage  db 'prio: usage: prio | prio <pid> <0-15>', 13, 10, 0
+msg_prio_set    db 'prio: pid ', 0
+msg_prio_set2   db ' prio -> ', 0
+msg_prio_pid    db 'prio: pid ', 0
+msg_prio_is     db ' prio = ', 0
+msg_prio_bad    db 'prio: no such thread', 13, 10, 0
 msg_ps_pid     db '  pid ', 0
 msg_ps_ppid    db ' ppid ', 0
 msg_ps_space   db ' ', 0
@@ -4497,6 +4695,7 @@ msg_help db \
     'fork [nowait] [prog]  fork a child (demo child, or run a program in the child)', 10, \
     'wait [pid]    reap a zombie child and print its exit code', 10, \
     'spawn [who]   start a demo kernel thread (no arg = alpha, then beta)', 10, \
+    'prio [pid] [0-15]  show or set a thread priority (0 = highest, 15 = lowest)', 10, \
     'kill <pid> [class:action:level]  signal a process (default super:kill:0)', 10, \
     'shell [n]     list the 4 shells, or jump to one (Ctrl+Left / Ctrl+Right)', 10, \
     'rc <what>     rc.conf: list / get KEY / start N / log / reload (event log)', 10, \

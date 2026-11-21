@@ -142,6 +142,11 @@ api_dispatch:
     je api_h_signal_send
     cmp eax, 23
     je api_h_signal_block
+    ; ---- 调度(功能号 24-25):查/改当前线程优先级 ----
+    cmp eax, 24
+    je api_h_setprio
+    cmp eax, 25
+    je api_h_getprio
     ret
 .print_str:
     call term_print
@@ -183,6 +188,7 @@ api_dispatch:
     call dev_lookup
     test eax, eax
     jnz .read_dev
+    call fs_lock                        ; A4:串行化 FAT/ATA 全局状态
     mov eax, [fat_dir]                  ; 记下内核当前目录:fat_path 会 chdir 进去,
     mov [api_saved_dir], eax            ; 调完必须还回来(不然程序连存两次会跑错目录)
     mov esi, [api_name]                 ; 支持 DOCS/NOTE.TXT(相对当前目录)
@@ -203,6 +209,7 @@ api_dispatch:
     push eax                            ; 成功:恢复 cwd 再把返回值交回去
     mov eax, [api_saved_dir]
     mov [fat_dir], eax
+    call fs_unlock
     pop eax
     ret
 .read_dev:
@@ -219,6 +226,7 @@ api_dispatch:
 .read_fail:
     mov eax, [api_saved_dir]            ; 失败也恢复:别把 cwd 留在半路
     mov [fat_dir], eax
+    call fs_unlock
     mov eax, -1
     ret
 .read_pipe:
@@ -236,6 +244,7 @@ api_dispatch:
     call dev_lookup
     test eax, eax
     jnz .write_dev
+    call fs_lock                        ; A4:串行化 FAT/ATA 全局状态
     mov eax, [fat_dir]                  ; 同读文件:记下 cwd,调完还回来
     mov [api_saved_dir], eax
     mov esi, [api_name]
@@ -248,6 +257,7 @@ api_dispatch:
     push eax                            ; 恢复 cwd 再交还结果
     mov eax, [api_saved_dir]
     mov [fat_dir], eax
+    call fs_unlock
     pop eax
     ret
 .write_dev:
@@ -264,6 +274,7 @@ api_dispatch:
 .write_fail:
     mov eax, [api_saved_dir]
     mov [fat_dir], eax
+    call fs_unlock
     mov eax, -1
     ret
 .set_cursor:
@@ -344,6 +355,22 @@ api_h_signal_send:
 api_h_signal_block:
     mov eax, ebx
     call process_signal_block
+    ret
+
+; ---------------------------------------------------------------------------
+;  api_h_setprio / api_h_getprio(功能号 24/25)
+;    setprio(prio):ebx = 0..15(0 最高)→ eax = 0 成功 / -1 失败
+;    getprio():→ eax = 当前线程优先级(0 最高,15 最低)
+; ---------------------------------------------------------------------------
+api_h_setprio:
+    mov ecx, ebx
+    mov eax, [sched_cur]
+    call sched_setprio
+    ret
+
+api_h_getprio:
+    mov eax, [sched_cur]
+    call sched_getprio
     ret
 
 
