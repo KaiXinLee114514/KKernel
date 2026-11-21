@@ -143,10 +143,11 @@ program was killed, the kernel is fine
 | `堆顶-0x2000` | 参数页:内核里那份参数(0x11F000)对 ring 3 是"别人家的内存",装载器整块拷过来 |
 | `堆顶-0x1000` | 用户栈(栈顶 = 堆顶-4,那 4 字节是弹床地址) |
 
-### 线程与调度(内核线程 + 抢占式轮转)
+### 线程与调度(内核线程 + 优先级调度)
 
-`kernel/sched.asm` 里 6 个线程槽,每槽是一个 **40 字节**的 TCB:esp / cr3 / 状态 /
-拿到过多少 tick / 被调度过几次 / 栈的物理页 / 名字 / 出生在哪条 shell 上。
+`kernel/sched.asm` 里 16 个线程槽,每槽是一个 **172 字节**的 TCB:esp / cr3 / 状态 /
+拿到过多少 tick / 被调度过几次 / 栈的物理页 / 名字 / 出生在哪条 shell 上 /
+父进程 / 退出码 / uid+gid / 优先级 / 睡眠通道与超时 / 就绪队列前后指针 / aging 计数。
 (原来是 32 字节,所以全仓都用 `shl 5` 当下标步长;加字段时改成了 `imul X, TCB_SIZE` ——
 见 [踩坑笔记](pitfalls.md) 的 6.36。)**0 号线程永远是 shell 自己** ——
 它不是被谁创建的,而是开机时把当前上下文直接填进去。
@@ -161,13 +162,19 @@ EFLAGS / CS / EIP / 错误码 / 向量号 / pushad 的八个寄存器,esp 指向
 于是它第一次被 `iret` 上去时,看起来就像"刚被中断打断过",函数体从头开始跑。
 
 局限(玩具级别的诚实说明):
-- 没有优先级、没有阻塞/唤醒原语,纯轮转;时间片固定 20 ms(2 个 tick)
-- 每个线程 2 页栈(8 KiB),`spawn` 时从物理页池要,`kill` 时还回去
+- 有优先级调度:0 最高、普通 shell 线程 8、idle 15;每级一个 FIFO 就绪队列 + 位图,
+  同级按 20 ms(2 个 tick)时间片轮转,高优先级就绪可抢占。有阻塞/唤醒原语
+  (`sched_sleep_on` / `sched_sleep_timeout` / `sched_wakeup`),`process_wait` 和
+  `tty_read_line` 都睡在通道上;aging 只把低优先级线程慢慢提到 shell 级,不会被饿死
+- 每个线程 4 页栈(16 KiB)+ 底下 1 页 guard 页(恒等映射摘掉,踩了会 #PF;
+  内核栈真溢出走到双重故障门会打印 panic,而不是重启)
+- 用户栈从堆窗口顶部划出 128 页(512 KiB)增长区,按需补页;
+  栈顶下面是参数页与 guard 页(越界会被和平杀掉)
 - `kill` 一条**正在跑程序**的线程时,会看它当时用的 cr3 是不是现在这套程序的:
   是就把地址空间一并收摊(页目录 + 私有页表 + 已经按需补上的页全还回池子)
-- 内核不可重入的那些部分靠"大家都很老实"避开:线程各跑各的栈,但终端是全局状态,
-  两个线程一起打印、或者你正在敲命令时线程打印,屏幕上的字都会被插花 ——
-  看得见、不崩,输入缓冲区也不受影响(命令照常执行),只是显示乱。想打干净得先有锁
+- 终端、FAT 等全局状态用锁保护(`kernel/lock.asm`):spin 锁、可递归睡眠 mutex,
+  `console_lock` 保证多线程输出不插花,`fs_lock` 串行化文件命令;
+  锁顺序 `fs_mutex → console_mutex` 允许、反向禁止
 - 还是**内核态**线程:没有 ring 3、没有 TSS、也还没做到"一个线程一套地址空间"
 
 自己试试:
@@ -178,7 +185,7 @@ spawned thread 4 (alpha)
 > spawn
 spawned thread 5 (beta)
 > ps
-ps: 6 alive / 6 slots, scheduled ticks 1169
+ps: 6 alive / 16 slots, scheduled ticks 1169
   [0] shell   ticks=893  runs=85
   [1] shell2  ticks=790  runs=80
   [2] shell3  ticks=700  runs=78

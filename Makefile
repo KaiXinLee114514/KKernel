@@ -65,7 +65,7 @@ KERNEL_SRCS := $(wildcard kernel/*.asm)
 FONT_DEPS   := font/vga-font.bin font/vga-zh-map.asm font/vga-zh-strings.asm
 # asm 写的程序(progs/*.asm → nasm → 平铺二进制)
 PROGS       := HELLO.BIN COUNT.BIN CALC.BIN EDIT.BIN TOUCH.BIN HANG.BIN \
-               RING3.BIN FAULT.BIN
+               RING3.BIN FAULT.BIN STACK.BIN
 
 # ---- C 写的程序(progs/*.c):有 gcc 的多架构支持就编,没有就跳过 ----
 # 为什么单独探测:gcc -m32 需要 gcc-multilib,没装的话不该让整个 make 挂掉 ——
@@ -82,7 +82,8 @@ MINIC_OBJ   := $(BUILD)/minic.o
 CRT_TCC_OBJ := $(BUILD)/crt_tcc.o
 ifeq ($(CC_OK),yes)
 C_PROGS     := CHELLO.BIN PLAY.BIN RNGTEST.BIN P2TEST.BIN FPU.BIN FCALC.BIN ECHO.BIN MEMTEST.BIN IOTEST.BIN \
-               WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN FORK.BIN
+               WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN FORK.BIN \
+               PRIO.BIN SLEEPY.BIN CONCUR.BIN
 else
 C_PROGS     :=
 endif
@@ -117,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -377,7 +378,7 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-tty test-login
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-tty test-login test-sched
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -409,6 +410,12 @@ test-login: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── 多用户:login / whoami / su / 信号权限 --login ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --login
+
+# 调度器 + 锁(A5):优先级 / 睡眠超时 / 用户栈增长 / 并发写盘不交错
+test-sched: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── 调度器:优先级 / 睡眠超时 / 栈增长 / 并发 --sched ──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --sched
 
 # 扫雷:PROGS 在 /BIN 里,测试只读盘,不 -B 重建(那会把整盘重做一遍)
 test-mine: $(HDIMG)

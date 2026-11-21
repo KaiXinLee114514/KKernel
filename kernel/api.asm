@@ -147,6 +147,8 @@ api_dispatch:
     je api_h_setprio
     cmp eax, 25
     je api_h_getprio
+    cmp eax, 26
+    je api_h_sleep
     ret
 .print_str:
     call term_print
@@ -371,6 +373,27 @@ api_h_setprio:
 api_h_getprio:
     mov eax, [sched_cur]
     call sched_getprio
+    ret
+
+; ---------------------------------------------------------------------------
+;  api_h_sleep(功能号 26):ebx = 毫秒 → 当前线程睡这么久(0 = 正常睡醒)
+;  走 sched_sleep_timeout:通道 = 当前 TCB 自己的地址(每次睡眠天然唯一),
+;  100 Hz 定时器扫到时间就把线程叫醒。这是 ring 3 程序"睡眠超时"的入口。
+; ---------------------------------------------------------------------------
+api_h_sleep:
+    mov eax, ebx                        ; 毫秒
+    xor edx, edx
+    mov ecx, 10                         ; 100 Hz → 10 ms/tick(api.asm 先于 pit.asm
+                                        ; include,TICK_HZ 这里还不能用)
+    div ecx                             ; eax = ticks
+    test eax, eax
+    jnz .ticks_ok
+    mov eax, 1                          ; 至少睡 1 tick(10 ms)
+.ticks_ok:
+    mov ecx, eax                        ; ecx = ticks
+    call process_cur_tcb                ; eax = 当前 TCB 指针(唯一通道)
+    call sched_sleep_timeout            ; eax=chan, ecx=ticks → 1=超时
+    xor eax, eax                        ; 对程序只报"睡够了"
     ret
 
 

@@ -296,6 +296,13 @@ static inline int j_getprio(void)
     return r;
 }
 
+/* 26:sleep(ms) —— 当前线程睡眠 ms 毫秒(100 Hz 定时器叫醒,不是忙等);
+ *     0 = 正常睡醒。测试程序用它制造"睡眠 → 定时器唤醒"的现场。 */
+static inline void j_sleep(int ms)
+{
+    __asm__ volatile("int $0x30" : : "a"(26), "b"(ms) : "memory");
+}
+
 /* 13:在指定位置画一串字(不滚屏、不动光标)→ 占了几格 */
 static inline int j_puts_at(const char *s, int row, int col, int maxcells)
 {

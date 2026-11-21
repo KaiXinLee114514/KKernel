@@ -696,13 +696,14 @@ def main() -> int:
     proc_mode = "--proc" in argv            # 进程地基:ps/fork/wait/exit/kill/信号三元组
     tty_mode = "--tty" in argv              # TTY:两问向导 / ANSI 控制字符 / ASCII 降级
     login_mode = "--login" in argv          # 最小多用户:登录 / whoami / su / 信号权限
+    sched_mode = "--sched" in argv          # 调度器:优先级 / 睡眠超时 / 栈增长 / 并发
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
                          "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc",
-                         "--tty", "--login")]
+                         "--tty", "--login", "--sched")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -943,6 +944,55 @@ def main() -> int:
             login_run("su super")
             results.append(("user 不能 su", has("su: permission denied: need super"),
                             "su: permission denied: need super"))
+            return report(results)
+
+        if sched_mode:
+            # ---- 调度器 + 锁(A5):优先级 / 睡眠超时 / 用户栈增长 / 并发 ----
+            results = []
+
+            def sched_run(line: str, wait: float = 1.8) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            results.append(("登录后 shell 就绪", has('type "help" for commands.'),
+                            'type "help" for commands.'))
+
+            # ---- ps 显示优先级;prio 命令查/改 ----
+            sched_run("ps", 1.2)
+            results.append(("ps 每行带优先级", has("prio="), "pid ... prio=8"))
+            sched_run("prio", 1.0)
+            results.append(("prio 显示当前线程", has("prio: pid ") and has(" prio = "),
+                            "prio: pid 1 prio = 8"))
+            sched_run("prio 1 3", 1.0)
+            sched_run("prio 1", 1.0)
+            results.append(("prio 改优先级生效(普通线程不被老化抢跑)", has("prio = 3"),
+                            "prio: pid 1 prio = 3"))
+
+            # ---- 优先级:高的先完成,低的不被饿死 ----
+            sched_run("run PRIO.BIN", 2.0)
+            results.append(("优先级调度:高优先级先完成 + 低优先级不被饿死",
+                            wait_has("priotest: PASS", 45.0), "priotest: PASS high=N low=N"))
+
+            # ---- 睡眠 / 超时 / 唤醒 ----
+            sched_run("run SLEEPY.BIN", 2.0)
+            results.append(("睡眠超时:子进程 sleep 后 exit,父进程 wait 收回",
+                            wait_has("sleepytest: PASS", 25.0), "sleepytest: PASS child=N code=7"))
+
+            # ---- 用户栈自动增长:深递归 160 KiB + 大局部数组 200 KiB ----
+            sched_run("run STACK.BIN", 2.0)
+            results.append(("用户栈自动增长(深递归 + 大局部数组)", wait_has("STACK-OK", 25.0),
+                            "STACK-OK"))
+
+            # ---- 并发:两个子进程同时打印/写盘,行不交错、文件各自完整 ----
+            sched_run("run CONCUR.BIN", 2.5)
+            results.append(("并发写盘:两个文件内容各自完整", wait_has("concurtest: PASS", 30.0),
+                            "concurtest: PASS A=N B=N"))
+            rescan()
+            results.append(("并发输出不交错(A 行全 A / B 行全 B)",
+                            has("concurtest: A[AAAA") and has("concurtest: B[BBBB"),
+                            "concurtest: A[AAAA...] / B[BBBB...]"))
             return report(results)
 
         if usb_mode:
