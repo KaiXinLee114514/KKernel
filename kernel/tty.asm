@@ -847,6 +847,272 @@ tty_read_char:
     jmp kbd_getchar                    ; 阻塞等一个 ASCII 键
 
 ; ===========================================================================
+;  开机向导:RC.CONF 里没有 console.ctrl / console.charset 时问两句
+;    - 有 FAT 才问(软盘启动保持默认,不进交互——否则会挡掉老测试的屏幕断言)
+;    - 10 秒不答就用默认值:VBE 控制台 → y/u,文本模式 → n/a
+;    - 答案写回 SYS/RC.CONF(保留原内容),再 rc_load 一次让配置生效
+; ===========================================================================
+tty_rc_init:
+    pushad
+    cmp dword [fat_ok], 0
+    je .out
+    ; ---- 两个键都已有:不问,直接应用 ----
+    mov esi, k_console_ctrl
+    call rc_get
+    test eax, eax
+    jz .ask
+    mov esi, k_console_charset
+    call rc_get
+    test eax, eax
+    jz .ask
+    call tty_rc_apply
+    jmp .out
+.ask:
+    ; ---- 问题 1:要不要控制字符 ----
+    mov esi, msg_wiz_ctrl
+    call term_print
+    mov edi, tty_wiz_buf
+    mov ecx, 16
+    mov edx, TICK_HZ * 10              ; 10 秒(100 Hz)
+    call tty_read_line_timeout
+    mov esi, tty_wiz_buf
+    call tty_parse_yn                  ; eax = 1/0/-1
+    cmp eax, -1
+    jne .q1_ok
+    xor eax, eax
+    cmp dword [vbe_ok], 0
+    je .q1_ok
+    mov eax, 1
+.q1_ok:
+    mov [tty_wiz_ctrl], eax
+    ; ---- 问题 2:字符集 ----
+    mov esi, msg_wiz_charset
+    call term_print
+    mov edi, tty_wiz_buf
+    mov ecx, 16
+    mov edx, TICK_HZ * 10
+    call tty_read_line_timeout
+    mov esi, tty_wiz_buf
+    call tty_parse_au                  ; eax = 1(utf8)/0(ascii)/-1
+    cmp eax, -1
+    jne .q2_ok
+    xor eax, eax
+    cmp dword [vbe_ok], 0
+    je .q2_ok
+    mov eax, 1
+.q2_ok:
+    mov [tty_wiz_charset], eax
+    ; ---- 写回 SYS/RC.CONF,再重新加载一次 ----
+    call tty_rc_save
+    call rc_load
+    call tty_rc_apply
+.out:
+    popad
+    ret
+
+; tty_parse_yn:esi = 输入串 → eax = 1(y)/0(n)/-1(空或未知)
+tty_parse_yn:
+    push esi
+.skip:
+    cmp byte [esi], ' '
+    jne .chk
+    inc esi
+    jmp .skip
+.chk:
+    mov al, [esi]
+    cmp al, 'y'
+    je .yes
+    cmp al, 'Y'
+    je .yes
+    cmp al, 'n'
+    je .no
+    cmp al, 'N'
+    je .no
+    mov eax, -1
+    pop esi
+    ret
+.yes:
+    mov eax, 1
+    pop esi
+    ret
+.no:
+    xor eax, eax
+    pop esi
+    ret
+
+; tty_parse_au:esi = 输入串 → eax = 1(utf8/u)/0(ascii/a)/-1(空或未知)
+tty_parse_au:
+    push esi
+.skip:
+    cmp byte [esi], ' '
+    jne .chk
+    inc esi
+    jmp .skip
+.chk:
+    mov al, [esi]
+    cmp al, 'u'
+    je .u
+    cmp al, 'U'
+    je .u
+    cmp al, 'a'
+    je .a
+    cmp al, 'A'
+    je .a
+    mov eax, -1
+    pop esi
+    ret
+.u:
+    mov eax, 1
+    pop esi
+    ret
+.a:
+    xor eax, eax
+    pop esi
+    ret
+
+; tty_copy_z:esi = 0 结尾串 → 拷到 edi,edi 前进到末尾
+tty_copy_z:
+    push eax
+.loop:
+    mov al, [esi]
+    test al, al
+    jz .done
+    mov [edi], al
+    inc esi
+    inc edi
+    jmp .loop
+.done:
+    pop eax
+    ret
+
+; ---------------------------------------------------------------------------
+;  tty_rc_save:把 console.ctrl / console.charset 追加进 SYS/RC.CONF
+;  (FAT 写 API 是"整文件重写",所以先读出旧内容再追写;失败就只应用不落盘)
+; ---------------------------------------------------------------------------
+tty_rc_save:
+    pushad
+    mov eax, [fat_dir]
+    mov [tty_rc_saved_dir], eax
+    mov dword [fat_dir], 0
+    ; ---- 解析 SYS/RC.CONF ----
+    mov esi, tty_rc_fname
+    call fat_path
+    jc .restore
+    mov [tty_rc_seg], eax
+    ; ---- 读旧内容到 rc_buf(读不到就当空文件) ----
+    mov esi, eax
+    mov edi, rc_buf
+    call fat_read_file
+    cmp eax, -1
+    jne .have_len
+    xor eax, eax
+.have_len:
+    ; ---- edi 指到旧内容末尾 ----
+    mov ecx, eax
+    mov edi, rc_buf
+    add edi, ecx
+    test ecx, ecx
+    jz .append
+    mov al, [edi - 1]
+    cmp al, 10
+    je .append
+    mov byte [edi], 10
+    inc edi
+.append:
+    ; ---- console.ctrl=y|n ----
+    mov esi, tty_rc_k_ctrl
+    call tty_copy_z
+    mov al, 'n'
+    cmp dword [tty_wiz_ctrl], 0
+    je .ctrl_val
+    mov al, 'y'
+.ctrl_val:
+    mov [edi], al
+    inc edi
+    mov byte [edi], 10
+    inc edi
+    ; ---- console.charset=utf8|ascii ----
+    mov esi, tty_rc_k_charset
+    call tty_copy_z
+    mov esi, tty_rc_v_ascii
+    cmp dword [tty_wiz_charset], 0
+    je .cs_val
+    mov esi, tty_rc_v_utf8
+.cs_val:
+    call tty_copy_z
+    mov byte [edi], 10
+    inc edi
+    ; ---- 回写整个文件 ----
+    mov ecx, edi
+    sub ecx, rc_buf
+    mov esi, [tty_rc_seg]
+    mov edi, rc_buf
+    call fat_write_file
+.restore:
+    mov eax, [tty_rc_saved_dir]
+    mov [fat_dir], eax
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  tty_rc_apply:从 rc_get 读 console.ctrl / console.charset 并应用
+; ---------------------------------------------------------------------------
+tty_rc_apply:
+    pushad
+    ; ---- console.ctrl:y/Y=开,n/N=关,其它不动 ----
+    mov esi, k_console_ctrl
+    call rc_get
+    test eax, eax
+    jz .charset
+    mov al, [eax]
+    cmp al, '"'                        ; rc_parse 一般已去引号,这里兜个底
+    jne .ctrl_ch
+    mov al, [eax + 1]
+.ctrl_ch:
+    cmp al, 'y'
+    je .ctrl_on
+    cmp al, 'Y'
+    je .ctrl_on
+    cmp al, 'n'
+    je .ctrl_off
+    cmp al, 'N'
+    je .ctrl_off
+    jmp .charset
+.ctrl_on:
+    mov dword [tty_ctrl_on], 1
+    jmp .charset
+.ctrl_off:
+    mov dword [tty_ctrl_on], 0
+.charset:
+    ; ---- console.charset:u/U=utf8,a/A=ascii,其它不动 ----
+    mov esi, k_console_charset
+    call rc_get
+    test eax, eax
+    jz .out
+    mov al, [eax]
+    cmp al, '"'
+    jne .cs_ch
+    mov al, [eax + 1]
+.cs_ch:
+    cmp al, 'u'
+    je .cs_utf8
+    cmp al, 'U'
+    je .cs_utf8
+    cmp al, 'a'
+    je .cs_ascii
+    cmp al, 'A'
+    je .cs_ascii
+    jmp .out
+.cs_utf8:
+    mov dword [tty_utf8], 1
+    jmp .out
+.cs_ascii:
+    mov dword [tty_utf8], 0
+.out:
+    popad
+    ret
+
+; ===========================================================================
 ;  shell 的 tty 命令:调试/演示控制字符与字符集开关
 ;     tty                      显示当前状态
 ;     tty on|off               控制字符解释开/关
@@ -990,6 +1256,22 @@ tty_ring_tail   dd 0
 ; ---- SGR 颜色映射:ANSI 色号 → VGA 属性位(前景/背景) ----
 tty_ansi_fg     db 0, 4, 2, 6, 1, 5, 3, 7
 tty_ansi_bg     db 0x00, 0x40, 0x20, 0x60, 0x10, 0x50, 0x30, 0x70
+; ---- 开机向导 ----
+msg_wiz_ctrl    db 'Is your console enable with control-characters? y/n: ', 0
+msg_wiz_charset db 'Which types of output do you want? ascii/utf8 (a/u): ', 0
+k_console_ctrl  db 'console.ctrl', 0
+k_console_charset db 'console.charset', 0
+tty_rc_fname    db 'SYS/RC.CONF', 0
+tty_rc_k_ctrl   db 'console.ctrl=', 0
+tty_rc_k_charset db 'console.charset=', 0
+tty_rc_v_ascii  db 'ascii', 0
+tty_rc_v_utf8   db 'utf8', 0
+tty_rc_saved_dir dd 0
+tty_rc_seg      dd 0
+tty_wiz_buf     times 16 db 0
+tty_wiz_ctrl    dd 0
+tty_wiz_charset dd 0
+
 ; ---- 命令名 ----
 n_tty           db 'tty', 0
 n_tty_on        db 'on', 0

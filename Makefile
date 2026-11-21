@@ -255,6 +255,23 @@ $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ)
 	python3 tools/mkimg.py $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(HDIMG) font/full-kkf.bin
 	python3 tools/mkfat.py $(HDIMG) 6144 8 $(MKFAT_FILES)
 
+# ---------------------------------------------------------------------------
+#  TTY 向导测试镜像:和 HDIMG 一样,但 FAT 里**不放** SYS/RC.CONF ——
+#  开机内核发现没有 console.ctrl / console.charset,就会启动两问向导。
+#  (向导会把答案写回镜像里的 SYS/RC.CONF,所以每次测试都重建镜像。)
+# ---------------------------------------------------------------------------
+TTY_IMG := $(BUILD)/kkernel-tty.img
+TTY_MKFAT_FILES := $(filter-out SYS/RC.CONF=progs/RC.CONF,$(MKFAT_FILES))
+
+$(TTY_IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
+          $(PINYIN_BIN) $(BUILD)/TCC.BIN \
+          $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
+          progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
+          $(wildcard tccinc/*.h) \
+          $(BUILD)/bigdir/.stamp
+	python3 tools/mkimg.py $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(TTY_IMG) font/full-kkf.bin
+	python3 tools/mkfat.py $(TTY_IMG) 6144 8 $(TTY_MKFAT_FILES)
+
 hd: $(HDIMG)
 	@rm -f $(QMP_SOCK)
 	$(QEMU) -drive file=$(HDIMG),format=raw,if=ide,index=0 -boot c -qmp unix:$(QMP_SOCK),server,nowait $(RTC_ARG) $(USB_ARG)

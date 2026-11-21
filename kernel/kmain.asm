@@ -492,6 +492,7 @@ COL_ERR    equ 0x0C                    ; 亮红
     xor ebx, ebx
     call evt_log
     call rc_load                         ; 读 + 解析 + 报一行
+    call tty_rc_init                     ; 终端向导:RC.CONF 没写 console.* 时间两句
     call ime_load                        ; 拼音输入法的字表(没有就安静地关掉)
     call rc_print_osname                 ; 显示名(默认 KKernel,RC.CONF 的 osname 可改)
     call rc_print_bootmsg                ; 配置里写了的开机提示
