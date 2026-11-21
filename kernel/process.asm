@@ -101,7 +101,7 @@ process_clear_tcb:
 ;        失败 eax = -1
 ;
 ;  顺序和设计稿一致:
-;    找槽 → 子内核栈 2 页 → 子页目录/页表各 1 页 → 预检引用计数 →
+;	找槽 → 子内核栈(16 KiB + guard) → 子页目录/页表各 1 页 → 预检引用计数 →
 ;    整页拷父页目录/页表 → 窗口页全部 COW(父子都只读、计数 +1)→
 ;    刷新父进程 TLB → 在子栈顶搭 60 字节 iret 帧 → 填 TCB → ++sched_live
 ;  真正"复制页"推迟到写的时候(14 号页错误里的 .cow 分支)。
@@ -118,6 +118,12 @@ process_fork:
     mov [pf_parent_pd], eax
     mov eax, [edx + TCB_SP_PT]
     mov [pf_parent_pt], eax
+    ; guard 页下标:窗口里唯一一页「只读且不参与 COW」的,单独处理
+    mov eax, [edx + TCB_SP_STACKVA]
+    sub eax, 0x1000
+    shr eax, 12
+    and eax, 0x3FF
+    mov [pf_guard_idx], eax
     cmp dword [edx + TCB_SP_LIVE], 0
     je .fail                            ; 父进程没在跑程序(理论上到不了)
     cmp dword [pf_parent_pd], 0
@@ -128,9 +134,8 @@ process_fork:
     jc .fail
     mov [pf_slot], eax
 
-    ; ---- 2) 子进程的内核栈:2 页(IRQ0 从 ring 3 进来要用它)----
-    mov ecx, SCHED_STACK_PAGES
-    call pmem_alloc_pages
+    ; ---- 2) 子进程的内核栈:16 KiB + guard(IRQ0 从 ring 3 进来要用它)----
+    call kstack_alloc
     test eax, eax
     jz .fail
     mov [pf_child_stack], eax
@@ -150,9 +155,10 @@ process_fork:
     mov esi, [pf_parent_pt]
     mov ebx, (SPACE_IMG_VA >> 12) & 0x3FF
     mov ecx, [pf_parent_tcb]
-    mov ecx, [ecx + TCB_SP_HEAPPAGES]
-    add ecx, SPACE_IMG_PAGES
+    mov ecx, [ecx + TCB_SP_WINDOWPAGES]
 .precheck:
+    cmp ebx, [pf_guard_idx]
+    je .pk_next                         ; guard 页不共享、不标 COW
     mov eax, [esi + ebx * 4]
     test eax, PAGE_P
     jz .pk_next
@@ -187,9 +193,10 @@ process_fork:
     mov edi, [pf_child_pt]
     mov ebx, (SPACE_IMG_VA >> 12) & 0x3FF
     mov ecx, [pf_parent_tcb]
-    mov ecx, [ecx + TCB_SP_HEAPPAGES]
-    add ecx, SPACE_IMG_PAGES
+    mov ecx, [ecx + TCB_SP_WINDOWPAGES]
 .mark_cow:
+    cmp ebx, [pf_guard_idx]
+    je .cow_next                        ; guard 页:父子各用各的,不进 COW
     mov eax, [esi + ebx * 4]
     test eax, PAGE_P
     jz .cow_next
@@ -224,6 +231,26 @@ process_fork:
     dec ecx
     jnz .stage_inc
 .no_stage:
+
+    ; ---- 7.5) 子进程的 guard 页:单独给一页(不和父进程共享)----
+    ;   两边空间各自收摊,free_window 各还各的页;共享会变成双重释放。
+    mov eax, [pf_child_pt]
+    mov ebx, [pf_guard_idx]
+    mov dword [eax + ebx * 4], 0        ; 先摘掉继承下来的父 guard 项
+    mov ecx, 1
+    call pmem_alloc_pages
+    test eax, eax
+    jz .fail_all                        ; OOM:半套 COW 已标,放弃子进程
+    mov [pf_child_guard_pa], eax
+    mov edi, eax
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd                           ; 清零
+    mov eax, [pf_child_guard_pa]
+    or eax, PAGE_P | PAGE_USER          ; 只读:越界写 → #PF → 杀程序
+    mov edi, [pf_child_pt]
+    mov ebx, [pf_guard_idx]
+    mov [edi + ebx * 4], eax
 
     ; ---- 8) 父进程的页表刚改成只读,刷一下 TLB ----
     mov eax, [pf_parent_pd]
@@ -279,6 +306,15 @@ process_fork:
     mov [edx + TCB_SP_STACKVA], eax
     mov eax, [esi + TCB_SP_STACKTOP]
     mov [edx + TCB_SP_STACKTOP], eax
+    mov eax, [esi + TCB_SP_WINDOWPAGES]
+    mov [edx + TCB_SP_WINDOWPAGES], eax
+    mov dword [edx + TCB_WCHAN], 0
+    mov dword [edx + TCB_SLEEPTICKS], 0
+    mov dword [edx + TCB_READY_NEXT], 0
+    mov dword [edx + TCB_READY_PREV], 0
+    mov dword [edx + TCB_SLEEPFLAG], 0
+    mov eax, [esi + TCB_PRIO]           ; 优先级跟着父进程(fork 继承)
+    mov [edx + TCB_PRIO], eax
     mov eax, [pf_child_pd]
     mov [edx + TCB_SP_PD], eax
     mov eax, [pf_child_pt]
@@ -327,8 +363,7 @@ process_fork:
     call pmem_free
 .fail_stack:
     mov eax, [pf_child_stack]
-    mov ecx, SCHED_STACK_PAGES
-    call pmem_free_pages
+    call kstack_free
 .fail:
     mov dword [pf_result], -1
     popad
@@ -380,12 +415,11 @@ process_wait:
     mov [pw_ret], eax
     lea eax, [esi + 1]
     mov [proc_last_child], eax
-    ; 内核栈 2 页还回去(地址空间在 exit 时已经拆了)
+    ; 内核栈(16 KiB + guard)还回去(地址空间在 exit 时已经拆了)
     mov eax, [edx + TCB_STACK]
     test eax, eax
     jz .nostack
-    mov ecx, SCHED_STACK_PAGES
-    call pmem_free_pages
+    call kstack_free
 .nostack:
     mov edx, [pw_slot]
     imul edx, TCB_SIZE
@@ -1162,6 +1196,8 @@ pf_parent_pt    dd 0
 pf_slot         dd 0
 pf_child_tcb    dd 0
 pf_child_stack  dd 0
+pf_guard_idx    dd 0                    ; 父进程 guard 页在窗口页表中的下标
+pf_child_guard_pa dd 0                  ; 子进程自己那页 guard
 pf_child_pd     dd 0
 pf_child_pt     dd 0
 pf_child_frame  dd 0

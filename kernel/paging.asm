@@ -290,6 +290,63 @@ paging_translate:
     stc
     ret
 
+; ---------------------------------------------------------------------------
+;  paging_ident_unmap:eax = 物理页(4 MiB 以上页池里的)→ 从恒等映射摘掉
+;  用于内核栈 guard 页:摘掉后一碰就 #PF,不会静悄悄踩别人。
+;  只改 PTE(动态恒等映射页表是各进程共享的那张),不碰 PT 本身。
+; ---------------------------------------------------------------------------
+paging_ident_unmap:
+    push eax
+    push ecx
+    push edx
+    push edi
+    mov edi, eax
+    shr edi, 22                        ; PDE 下标(≥1:页池在 4 MiB 以上)
+    mov edx, [PD_ADDR + edi * 4]
+    test edx, PAGE_P
+    jz .out
+    and edx, 0xFFFFF000
+    mov ecx, eax
+    shr ecx, 12
+    and ecx, 0x3FF
+    mov dword [edx + ecx * 4], 0
+    invlpg [eax]
+.out:
+    pop edi
+    pop edx
+    pop ecx
+    pop eax
+    ret
+
+; ---------------------------------------------------------------------------
+;  paging_ident_map:eax = 物理页 → 重新挂回恒等映射(P|RW)
+;  和 paging_ident_unmap 配对:还 guard 页之前先映射回来。
+; ---------------------------------------------------------------------------
+paging_ident_map:
+    push eax
+    push ecx
+    push edx
+    push edi
+    mov edi, eax
+    shr edi, 22
+    mov edx, [PD_ADDR + edi * 4]
+    test edx, PAGE_P
+    jz .out                            ; 没有恒等页表(理论上不会发生)
+    and edx, 0xFFFFF000
+    mov ecx, eax
+    shr ecx, 12
+    and ecx, 0x3FF
+    or eax, PAGE_P | PAGE_RW
+    mov [edx + ecx * 4], eax
+    and eax, 0xFFFFF000
+    invlpg [eax]
+.out:
+    pop edi
+    pop edx
+    pop ecx
+    pop eax
+    ret
+
 ; ===========================================================================
 ;  ── 程序地址空间:每条线程一套页目录 + 按需分页 ──────────────────────────
 ;  第一步(全分页)已经做完:每条 shell 线程跑程序前都给它建一套**自己的页目录**:
@@ -400,8 +457,7 @@ space_create:
     shr eax, 12
     and eax, 0x3FF                     ; 窗口第一页在页表里的下标(288)
     lea edi, [edi + eax * 4]
-    mov ecx, [edx + TCB_SP_HEAPPAGES]  ; 窗口是连着的:镜像 96 页 + 堆窗口 N 页
-    add ecx, SPACE_IMG_PAGES
+    mov ecx, [edx + TCB_SP_WINDOWPAGES] ; 镜像窗口 + 堆区 + 参数页 + guard + 栈增长区
     xor eax, eax
     rep stosd
 
@@ -521,7 +577,18 @@ page_fault_try_handle:
     shl ecx, 12
     cmp ebx, ecx
     jb .heap
-    jmp .out
+    ; ---- 用户栈增长区:[TCB_SP_STACKVA, TCB_SP_STACKTOP) ----
+    ;   越往下用栈,缺页就现补一页;补到 guard 页就杀程序。
+    mov ebx, eax
+    mov edi, [pf_space]
+    mov ecx, [edi + TCB_SP_STACKVA]
+    cmp ebx, ecx
+    jb .out
+    mov edx, [edi + TCB_SP_STACKTOP]
+    cmp ebx, edx
+    jae .out
+    mov byte [pf_is_img], 0             ; 栈页 = 零页(和堆页同一条补页路径)
+    jmp .check_pte
 .image:
     mov byte [pf_is_img], 1
     jmp .check_pte
@@ -708,7 +775,8 @@ sd_go:                                  ; 两条入口共用(非局部标签,别
     call space_free_window
     mov ebx, SPACE_HEAP_VA
     mov eax, [sd_block]
-    mov ecx, [eax + TCB_SP_HEAPPAGES]
+    mov ecx, [eax + TCB_SP_WINDOWPAGES]
+    sub ecx, SPACE_IMG_PAGES            ; 堆区 + 参数页 + guard + 栈增长区
     call space_free_window
 .no_scan:
 
@@ -794,6 +862,14 @@ space_free_window:
 ;  以上是恒等映射的,内核视角里物理地址就是虚拟地址。
 ; ---------------------------------------------------------------------------
 space_user_page:
+    mov ebx, PAGE_P | PAGE_RW | PAGE_USER
+    ; 落到下面带权限位的那条
+
+; space_user_page_flags:ebx = 页表项权限位(必须含 PAGE_P)
+;   比如队栈 guard 页要
+;   PAGE_P|PAGE_USER(只读) —— 写它就 #PF,程序被干掉。
+space_user_page_flags:
+    mov [sup_flags], ebx
     push ebx
     push ecx
     push edx
@@ -816,7 +892,7 @@ space_user_page:
     mov edx, [space_cur]
     mov edi, [edx + TCB_SP_PT]
     mov eax, [sup_pa]
-    or eax, PAGE_P | PAGE_RW | PAGE_USER
+    or eax, [sup_flags]
     mov [edi + ebx * 4], eax
     inc dword [edx + TCB_SP_PAGES]      ; 这两页不是"按需补的",跟着空间一起收摊
     mov eax, [sup_va]
@@ -849,14 +925,26 @@ space_prepare_user:
     mov esi, tramp_code
     mov ecx, tramp_code_end - tramp_code
     rep movsb
+    ; ---- 用户栈:先只映射顶部一页(往下增长交给 #PF 补页)----
     mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_STACKVA]
+    mov eax, [edx + TCB_SP_STACKTOP]
+    and eax, 0xFFFFF000                 ; 栈顶所在的那一页
     call space_user_page
     test eax, eax
     jz .fail
     mov edi, eax
     add edi, 4096 - 4                   ; 栈顶往下 4 字节:弹床的地址
     mov dword [edi], SPACE_TRAMP_VA
+    ; ---- 栈增长区底下垫一页 guard(只读)----
+    ;   往下越过栈区界一页 → #PF(页在但只读)→ prog_kill_from_fault
+    ;   不会一路踩穿堆、踩进内核。
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_STACKVA]
+    sub eax, 0x1000                     ; 栈增长区下面那一页 = guard
+    mov ebx, PAGE_P | PAGE_USER         ; 故意不带 PAGE_RW:只读!
+    call space_user_page_flags
+    test eax, eax
+    jz .fail
     popad
     mov eax, SPACE_TRAMP_VA
     ret
@@ -968,6 +1056,7 @@ pf_old_pa       dd 0
 
 sup_va         dd 0                    ; space_user_page:要映的虚拟地址
 sup_pa         dd 0                    ; space_user_page:拿到的物理页
+sup_flags      dd 0                    ; space_user_page_flags 的权限位
 pk_frame       dd 0                    ; prog_kill_from_fault:异常现场的帧指针
 ; 弹床页里的三条指令:mov eax,15(退出) / int 0x30 / jmp $。程序 `ret` 到这里。
 tramp_code:

@@ -32,6 +32,20 @@ TSS_SIZE         equ 104                ; 32 位 TSS 就固定这么大
 TSS_ESP0         equ 4                  ; +4  esp0:ring 0 用哪个栈顶
 TSS_SS0          equ 8                  ; +8  ss0
 TSS_IOMAP        equ 102                ; +102 I/O 位图偏移(= TSS_SIZE 就是"没有位图")
+TSS_CR3          equ 28                 ; +28 CR3(任务切换时加载)
+TSS_EIP          equ 32                 ; +32 入口 EIP
+TSS_EFLAGS       equ 36                 ; +36 eflags
+TSS_ESP          equ 56                 ; +56 新任务的 esp
+TSS_CS           equ 76                 ; +76 新任务的 cs
+TSS_SS           equ 80                 ; +80 新任务的 ss
+TSS_DS           equ 84                 ; +84 ds
+TSS_ES           equ 88                 ; +88 es
+TSS_FS           equ 92                 ; +92 fs
+TSS_GS           equ 96                 ; +96 gs
+
+DF_TSS_SEG       equ 0x30               ; GDT 第 6 项 = 双重故障任务 TSS
+DF_TSS_CR3       equ 0x1000             ; = paging.asm 的 PD_ADDR(内核页目录)
+DF_STACK_SIZE    equ 4096               ; 双故障处理程序自己的栈(独立,不靠坏掉的栈)
 
 RING3_STACK_TOP  equ 0x60000            ; ring 3 期间中断用的内核栈顶
 
@@ -91,6 +105,13 @@ gdt_new_tss:                            ; 0x28 TSS:类型 9 = 32 位可用 TSS
     db 10001001b                        ; P=1 DPL=0 类型 1001 = 32 位可用 TSS
     db 0x00
     db 0x00                             ;   (granularity 0:以字节为单位)
+gdt_new_df:                             ; 0x30 双重故障任务 TSS:类型 9 = 32 位可用 TSS
+    dw TSS_SIZE - 1                     ; limit = 104 字节
+    dw 0x0000                           ; base 开机时由 df_task_init 填
+    db 0x00
+    db 10001001b                        ; P=1 DPL=0 类型 1001
+    db 0x00
+    db 0x00
 
 ; 把 TSS 的真实地址填进描述符的 base 三段。
 ; ★ 为什么不在表里直接算:nasm -f bin 里对**标签**做 & / >> 会报
@@ -147,3 +168,114 @@ gdt_tss_flush:
     popad
     popfd
     ret
+
+; ---------------------------------------------------------------------------
+;  gdt_set_desc_base:ebx = 选择子,eax = 段/表基址 → 填进对应 GDT 描述符
+;  (gdt_tss_set_base 的通用版;df 任务门也要用)
+; ---------------------------------------------------------------------------
+gdt_set_desc_base:
+    push eax
+    push ebx
+    push edi
+    shr ebx, 3
+    shl ebx, 3
+    mov edi, gdt_new
+    add edi, ebx
+    mov [edi + 2], ax                   ; base 位 0-15
+    shr eax, 16
+    mov [edi + 4], al                   ; base 位 16-23
+    shr eax, 8
+    mov [edi + 7], al                   ; base 位 24-31
+    pop edi
+    pop ebx
+    pop eax
+    ret
+
+; ===========================================================================
+;  ── 双重故障(#DF)任务门:A2 的内核栈溢出报警 ─────────────────────────
+;  内核栈下面垫了 guard 页(摘出恒等映射):栈溢出 → #PF。若在 #PF 处理中又
+;  出错(比如 panic 打印时栈已经花掉)→ CPU 报 #DF;此时普通中断门也可能不可用,
+;  **任务门**是唯一还能跑的通道:CPU 切换到独立 TSS + 独立栈,执行 df_handler。
+;  我们不恢复,只把原因打到屏上然后挂住 —— 比三连故障自动重启好查。
+; ===========================================================================
+df_task_init:
+    pushad
+    ; GDT[0x30] 的 base = df_tss
+    mov eax, df_tss
+    mov ebx, DF_TSS_SEG
+    call gdt_set_desc_base
+    ; 填 "新任务现场":任务切换时 CPU 从这些字段加载寄存器
+    mov edi, df_tss
+    mov dword [edi + 0], TSS_SEG        ; 返回链(调试用)
+    mov dword [edi + TSS_CR3], DF_TSS_CR3
+    mov dword [edi + TSS_EIP], df_handler
+    mov dword [edi + TSS_EFLAGS], 0x202
+    mov dword [edi + TSS_ESP], df_stack_top
+    mov dword [edi + TSS_CS], GDT_KCODE
+    mov dword [edi + TSS_SS], GDT_KDATA
+    mov dword [edi + TSS_DS], GDT_KDATA
+    mov dword [edi + TSS_ES], GDT_KDATA
+    mov dword [edi + TSS_FS], GDT_KDATA
+    mov dword [edi + TSS_GS], GDT_KDATA
+    mov word [edi + TSS_IOMAP], TSS_SIZE
+    ; IDT[8] 换成任务门:偏移字段无意义填 0,选择子 0x30,类型 0101b(任务门)= 0x85
+    mov edi, idt + 8 * 8
+    mov dword [edi], 0
+    mov word [edi + 2], DF_TSS_SEG
+    mov byte [edi + 4], 0
+    mov byte [edi + 5], 0x85
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  df_handler:双重故障现场。全程只用 raw 输出(term_raw_putc/term_raw_print),
+;  绕开 tty 层和任何锁 —— 故障现场可能正拿着它们;也不依赖坏掉的那个栈。
+; ---------------------------------------------------------------------------
+df_handler:
+    cli
+    mov ax, GDT_KDATA
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov esp, df_stack_top               ; TSS 已切过来,这里再设一次保险
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_df_head
+    call term_raw_print
+    mov esi, msg_df_cr2
+    call term_raw_print
+    mov eax, cr2
+    mov ecx, 8
+.hex:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .digit
+    add dl, 'a' - 10
+    jmp .put
+.digit:
+    add dl, '0'
+.put:
+    mov [df_char], dl
+    mov al, [df_char]
+    call term_raw_putc
+    loop .hex
+    mov al, 10
+    call term_raw_putc
+.hang:
+    cli
+    hlt
+    jmp .hang
+
+; ---- 数据 ----
+align 4
+df_tss:         times TSS_SIZE db 0
+align 16
+df_stack:       times DF_STACK_SIZE db 0
+df_stack_top:
+df_char         db 0
+msg_df_head     db 'KERNEL PANIC: 双重故障(#DF;常见原因:内核栈溢出/踩 guard 页)', 10, 0
+msg_df_cr2      db '  CR2=', 0

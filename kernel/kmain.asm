@@ -108,7 +108,8 @@ COL_ERR    equ 0x0C                    ; 亮红
     ;   字库占 ident-2 MiB 起的 2 MiB 槽(1.8 MB 放得下),临时缓冲在它前面一页;
     ;   堆窗口 = 0x180000 ~ min(字库临时缓冲, PINYIN 起点 0x3B0000),
     ;   但要留在 4 MiB 以内(程序页表只有低 4 MiB 那一张私有 PT)。
-    ;   参数页/用户栈占堆窗口最后两页。
+    ;   A2 起窗口尾部不再固定两页:参数页 + guard 页 + 用户栈增长区(最多 512 KiB),
+    ;   栈往下长到 guard 为止;堆让出这块地方(128 MiB 机器上还有 ~1.6 MiB)。
     mov eax, [ident_limit]
     sub eax, 0x200000                   ; 字库槽起点
     mov [font_load_addr], eax
@@ -119,18 +120,44 @@ COL_ERR    equ 0x0C                    ; 亮红
     jbe .heap_end_ok
     mov eax, ecx
 .heap_end_ok:
-    sub eax, 0x180000
+    mov [space_window_end], eax         ; 堆窗口末端 W
+    sub eax, SPACE_IMG_VA
     shr eax, 12
-    mov [space_heap_pages], eax         ; 堆窗口页数(含参数页+栈页)
-    mov ecx, eax
-    sub ecx, 2
-    shl ecx, 12
-    add ecx, 0x180000
-    mov [space_args_va], ecx
-    add ecx, 0x1000
-    mov [space_stack_va], ecx
-    add ecx, 4092
-    mov [space_user_stack_top], ecx
+    mov [space_window_pages], eax       ; 用户窗口总页数(镜像窗口也含在内)
+
+    ; 窗口尾部:参数页 1 + guard 1 + 栈增长区 g;g = 窗口的 1/4,夹在 [8,128] 页
+    mov edx, [space_window_end]
+    sub edx, 0x180000
+    shr edx, 12                         ; 堆+参数+guard+栈 区域总页数
+    mov eax, edx
+    shr eax, 2
+    cmp eax, 128                       ; 最多 128 页 = 512 KiB 用户栈
+    jbe .grow_cap_ok
+    mov eax, 128
+.grow_cap_ok:
+    cmp eax, 8                         ; 至少 8 页 = 32 KiB
+    jae .grow_min_ok
+    mov eax, 8
+.grow_min_ok:
+    cmp eax, edx                       ; 小内存机器别把堆挤没
+    jb .grow_fit_ok
+    mov eax, edx
+    shr eax, 1
+.grow_fit_ok:
+    mov [space_stack_grow_pages], eax
+    add eax, 2                         ; + 参数页 + guard
+    sub edx, eax                       ; 堆页数(不含尾部)
+    mov [space_heap_pages], edx
+    mov eax, edx
+    shl eax, 12
+    add eax, 0x180000
+    mov [space_args_va], eax           ; 参数页(arguments page)
+    add eax, 0x1000                    ; 参数页后面一页:guard(只读,写它就 #PF)
+    add eax, 0x1000
+    mov [space_stack_va], eax          ; 栈增长区下界(guard 上面第一页开始可用)
+    mov eax, [space_window_end]
+    sub eax, 4
+    mov [space_user_stack_top], eax    ; 栈顶(顶部一页由 space_prepare_user 先映射)
 
     ; ---- 物理页池顶端: min(ident_limit, 字库槽下界) ----
     ;   字库(1.8 MB)在恒等映射里、却不是"随便能发出去的页":页池必须停在它下面,
@@ -264,6 +291,8 @@ COL_ERR    equ 0x0C                    ; 亮红
 
     ; ---- 开分页 ----
     call paging_init
+    ; 双重故障任务门:内核栈溢出/guard 页等致命错时,用独立任务/独立栈报个信
+    call df_task_init
     mov esi, msg_paging
     call term_print
     mov eax, [ident_limit]
@@ -964,10 +993,13 @@ pmem_pages  dd 0                       ; (同 pmem_total,给 shell 用)
 pmem_words  dd 0                       ; 位图需要多少个 dword
 font_load_addr dd 0x200000             ; 字库加载地址(运行时 = ident-2 MiB)
 font_tmp_addr  dd 0x1F0000             ; 读字库描述块的临时缓冲(运行时 = 字库前 4 KiB)
-space_heap_pages dd 0x70               ; 程序堆窗口页数(含参数页+用户栈页)
-space_args_va   dd 0x1EE000            ; 参数页虚拟地址(窗口倒数第二页)
-space_stack_va  dd 0x1EF000            ; 用户栈页虚拟地址(窗口最后一页)
-space_user_stack_top dd 0x1EFFFC       ; 用户栈顶(栈页顶部往下 4 字节)
+space_window_end dd 0x3B0000           ; 程序窗口末端 W(运行时算)
+space_window_pages dd 0x290            ; 用户窗口总页数(运行时算)
+space_heap_pages dd 0x70               ; 程序堆窗口页数(运行时装,不含参数/栈)
+space_stack_grow_pages dd 0x20         ; 用户栈增长区页数(运行时装)
+space_args_va   dd 0x1EE000            ; 参数页虚拟地址
+space_stack_va  dd 0x1EF000            ; 用户栈增长区下界(guard 上面第一页)
+space_user_stack_top dd 0x1EFFFC       ; 用户栈顶
 msg_fbw     db ' w=', 0
 msg_fbh     db ' h=', 0
 msg_fbp     db ' pitch=', 0

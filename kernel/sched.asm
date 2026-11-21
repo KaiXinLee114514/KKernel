@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 140               ; 每个 TCB 140 字节(见 /4、imul 的用法)
+TCB_SIZE          equ 168               ; 每个 TCB 168 字节(A2 起:身份/优先级/睡眠,见 /4、imul)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -79,6 +79,18 @@ TCB_PFCOW         equ 128               ; 这趟运行里 COW 缺页复制了几
 ;  0 = super(root/SYSTEM),1 = system,2 = user(见 kernel/users.asm)
 TCB_UID           equ 132               ; 登录用户号
 TCB_GID           equ 136               ; 登录用户组号
+
+; ---- A3:优先级调度 + 睡眠(先占好字段;A2 只负责把 TCB 扩大、清干净)----
+TCB_PRIO          equ 140               ; 优先级:0 最高,15 最低(shell=8,idle=15)
+TCB_WCHAN         equ 144               ; 睡眠在哪个通道上(0 = 没在睡)
+TCB_SLEEPTICKS    equ 148               ; 睡眠超时还剩几个 tick(0 = 不限时)
+TCB_READY_NEXT    equ 152               ; 就绪队列:下一项(槽号+1,0 = 没有)
+TCB_READY_PREV    equ 156               ; 就绪队列:上一项(槽号+1,0 = 没有)
+TCB_SLEEPFLAG     equ 160               ; 睡眠结果:0 = 正常唤醒,1 = 超时
+
+; ---- A2:用户窗口总页数(镜像窗口 + 堆区 + 参数页 + guard + 栈增长区)----
+;   space_create 清窗口、fork 标 COW、space_destroy 收摊都按它扫。
+TCB_SP_WINDOWPAGES equ 164              ; 从 SPACE_IMG_VA 起一共几页
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))
@@ -89,8 +101,12 @@ ST_DEAD           equ 2                 ; (留着)已经死掉的
 ST_ZOMBIE         equ 3                 ; 已退出,等父进程 wait 收尸
 ST_STOPPED        equ 4                 ; 被信号暂停(调度器跳过)
 
-SCHED_STACK_PAGES equ 2                 ; 每个线程 8 KiB 栈,从物理页池拿
+SCHED_STACK_PAGES equ 4                 ; 每个线程 16 KiB 内核栈(ring3 中断/深调用要用)
+                                        ;   ★ 栈下面还有 1 页 guard(摘出恒等映射),
+                                        ;   共 SCHED_STACK_PAGES+1 页连续物理页,见 kstack_alloc
 SLICE_TICKS       equ 2                 ; 一次跑 2 个 tick(20 ms)就换人
+SCHED_PRIO_SHELL  equ 8                 ; shell / 普通线程默认优先级
+SCHED_PRIO_IDLE   equ 15                ; 最低优先级(以后空闲线程用)
 SCHED_CS          equ 0x08              ; 内核代码段选择子(GDT 第 2 项)
 EFLAGS_IF         equ 0x202             ; eflags:IF=1,新线程一上来就能被打断
 
@@ -120,6 +136,10 @@ sched_init:
     mov [edi + TCB_SP_STACKVA], eax
     mov eax, [space_user_stack_top]
     mov [edi + TCB_SP_STACKTOP], eax
+    mov eax, [space_window_pages]
+    mov [edi + TCB_SP_WINDOWPAGES], eax
+    mov eax, [sched_default_prio]
+    mov [edi + TCB_PRIO], eax
     mov [space_cur], edi                ; 现在跑的就是 0 号线程
     mov dword [tss_blk + TSS_ESP0], 0   ; ring3 进来时才设,先清掉开机时的旧值
     mov dword [sched_cur], 0
@@ -136,6 +156,50 @@ sched_init:
 ; ---------------------------------------------------------------------------
 sched_enable:
     mov dword [sched_on], 1
+    ret
+
+; ---------------------------------------------------------------------------
+;  kstack_alloc:给线程要一段内核栈(16 KiB)+ 下面一页 guard
+;    出:eax = 栈基址(4 页连续物理页),ebx = guard 页物理地址;eax=0 = 页池空了
+;  为什么要 guard:内核栈溢出是最阴的 bug —— 越过栈底就静悄悄踩到别人的页。
+;  这里把 guard 页从**恒等映射**里摘掉:一旦越界写,CPU 立刻 #PF(不在映射里),
+;  内核不会带着花掉的栈继续跑。
+; ---------------------------------------------------------------------------
+kstack_alloc:
+    pushad
+    mov ecx, SCHED_STACK_PAGES + 1      ; guard 1 页 + 栈 4 页,必须连续
+    call pmem_alloc_pages
+    test eax, eax
+    jz .fail
+    mov [kstack_guard], eax             ; 整段第一页 = guard
+    add eax, 4096
+    mov [kstack_base], eax              ; 第二页起 = 栈
+    mov eax, [kstack_guard]
+    call paging_ident_unmap             ; guard 摘出恒等映射
+    popad
+    mov eax, [kstack_base]
+    mov ebx, [kstack_guard]
+    ret
+.fail:
+    popad
+    xor eax, eax
+    xor ebx, ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  kstack_free:入 eax = 栈基址(guard 在它下面 4 KiB);把 guard 映射回来,
+;  然后连着 guard 一起还给页池(共 SCHED_STACK_PAGES+1 页)。
+; ---------------------------------------------------------------------------
+kstack_free:
+    pushad
+    mov ebx, eax
+    sub ebx, 4096                       ; guard = 栈基址 - 4 KiB(连续分配)
+    mov eax, ebx
+    call paging_ident_map               ; 先映射回来,页池/后续使用者才能正常访问
+    mov eax, ebx
+    mov ecx, SCHED_STACK_PAGES + 1
+    call pmem_free_pages
+    popad
     ret
 
 ; ---------------------------------------------------------------------------
@@ -255,9 +319,8 @@ sched_spawn:
     mov [spawn_slot], esi
     mov [spawn_tcb], edx
 
-    ; ---- 2) 要一段连续页当栈(栈得是连续内存,不然 push 就散了)----
-    mov ecx, SCHED_STACK_PAGES
-    call pmem_alloc_pages
+    ; ---- 2) 内核栈:16 KiB + 下面一页 guard(see kstack_alloc)----
+    call kstack_alloc
     test eax, eax
     jz .nomem
     mov [spawn_stack], eax
@@ -321,6 +384,16 @@ sched_spawn:
     mov [edx + TCB_SP_STACKVA], eax
     mov eax, [space_user_stack_top]
     mov [edx + TCB_SP_STACKTOP], eax
+    mov eax, [space_window_pages]
+    mov [edx + TCB_SP_WINDOWPAGES], eax
+    ; 调度/睡眠字段:新线程默认优先级,睡眠状态一律清零
+    mov eax, [sched_default_prio]
+    mov [edx + TCB_PRIO], eax
+    mov dword [edx + TCB_WCHAN], 0
+    mov dword [edx + TCB_SLEEPTICKS], 0
+    mov dword [edx + TCB_READY_NEXT], 0
+    mov dword [edx + TCB_READY_PREV], 0
+    mov dword [edx + TCB_SLEEPFLAG], 0
     ; 进程/信号字段:空槽可能留着上一个死者的值,必须清干净
     mov dword [edx + TCB_PARENT], 0
     mov dword [edx + TCB_EXITCODE], 0
@@ -378,12 +451,11 @@ sched_kill:
     mov ecx, TCB_SIZE / 4
     rep movsd
 
-    ; 还栈(杀的是别人,它此刻没在跑,放心还)
+    ; 还栈(杀的是别人,它此刻没在跑,放心还;guard 一起还)
     mov eax, [ebx + TCB_STACK]
     test eax, eax
     jz .freed
-    mov ecx, SCHED_STACK_PAGES
-    call pmem_free_pages
+    call kstack_free
 .freed:
     mov dword [ebx + TCB_STATE], ST_EMPTY
     mov dword [ebx + TCB_STACK], 0
@@ -476,6 +548,9 @@ sched_ticks     dd 0                    ; 调度器一共数了多少 tick
 sched_slice     dd SLICE_TICKS          ; 当前线程还剩几个 tick 的时间片
 sched_save_esp  dd 0                    ; irq0_stub 交给 sched_pick 的 esp
 sched_next_demo dd 0                    ; spawn 不带参数时下一个起谁(0=alpha 1=beta)
+sched_default_prio dd SCHED_PRIO_SHELL  ; 新线程默认优先级
+kstack_base     dd 0                    ; kstack_alloc 的返回值暂存
+kstack_guard    dd 0                    ; kstack_alloc 的 guard 页暂存
 
 ; sched_spawn 的临时变量(不用 ebp 帧,省得栈上再挪一遍)
 spawn_entry     dd 0
