@@ -117,7 +117,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -377,7 +377,7 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-tty test-login
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -397,6 +397,18 @@ test-proc: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── 进程:fork/COW/wait/exit/ps/kill --proc ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --proc
+
+# TTY:两问向导(镜像里故意没有 SYS/RC.CONF)+ ANSI 控制字符 + ASCII 降级
+test-tty: $(TTY_IMG) font/full-kkf.bin
+	@echo "── TTY:向导 / ANSI / ASCII 降级 --tty ──"
+	$(MAKE) -s -B $(TTY_IMG)
+	python3 -u tests/qemu_test.py $(TTY_IMG) --hda --tty --font font/full-kkf.bin
+
+# 最小多用户:login / whoami / su / 信号发送权限
+test-login: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── 多用户:login / whoami / su / 信号权限 --login ──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --login
 
 # 扫雷:PROGS 在 /BIN 里,测试只读盘,不 -B 重建(那会把整盘重做一遍)
 test-mine: $(HDIMG)

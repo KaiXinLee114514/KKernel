@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 132               ; 每个 TCB 132 字节(见 /4、imul 的用法)
+TCB_SIZE          equ 140               ; 每个 TCB 140 字节(见 /4、imul 的用法)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -74,6 +74,11 @@ TCB_EXITCODE      equ 116               ; 退出码(是不是有效看 STATE 是
 TCB_PENDING       equ 120               ; 待投递信号位图(bit = 动作号)
 TCB_BLOCKED       equ 124               ; 被屏蔽信号位图(bit = 动作号)
 TCB_PFCOW         equ 128               ; 这趟运行里 COW 缺页复制了几页
+
+; ---- 身份(最小多用户):登录用户 & 组;fork/spawn 时继承 ----
+;  0 = super(root/SYSTEM),1 = system,2 = user(见 kernel/users.asm)
+TCB_UID           equ 132               ; 登录用户号
+TCB_GID           equ 136               ; 登录用户组号
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))

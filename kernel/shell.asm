@@ -367,6 +367,11 @@ shell_spawn_extra:
     imul eax, TCB_SIZE
     add eax, tcb_table
     mov [eax + TCB_OWNER], ecx
+    ; 登录身份跟着继承(最小多用户;登录在 shell_spawn_extra 之前)
+    mov ecx, [login_uid]
+    mov [eax + TCB_UID], ecx
+    mov ecx, [login_gid]
+    mov [eax + TCB_GID], ecx
     inc ebp
     jmp .next
 .done:
@@ -4348,6 +4353,9 @@ cmd_table:
     dd n_kill,   cmd_kill
     dd n_rc,     cmd_rc
     dd n_tty,    cmd_tty
+    dd n_whoami, cmd_whoami
+    dd n_su,     cmd_su
+    dd n_login,  cmd_login
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -4482,6 +4490,9 @@ msg_help db \
     'usb           UHCI controller / ports / USB keyboard status', 10, \
     'usbdisk       USB mass storage (read-only): info / read <lba> / hexdump <lba> / mbr / sense', 10, \
     'tty           console TTY: state / on / off (ANSI) / ascii / utf8 / esc (ESC demo)', 10, \
+    'whoami        print the current login user and uid', 10, \
+    'su <user>     switch user (super only; no password prompt)', 10, \
+    'login         log in again (asks user name and password)', 10, \
     'ps            list processes (pid / ppid / state / name / ticks / runs)', 10, \
     'fork [nowait] [prog]  fork a child (demo child, or run a program in the child)', 10, \
     'wait [pid]    reap a zombie child and print its exit code', 10, \

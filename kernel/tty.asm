@@ -854,7 +854,7 @@ tty_read_char:
 ; ===========================================================================
 tty_rc_init:
     pushad
-    cmp dword [fat_ok], 0
+    cmp byte [fat_ok], 0
     je .out
     ; ---- 两个键都已有:不问,直接应用 ----
     mov esi, k_console_ctrl

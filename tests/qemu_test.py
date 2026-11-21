@@ -694,12 +694,15 @@ def main() -> int:
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
     mine_mode = "--mine" in argv            # 扫雷(BIN/MINE.BIN):菜单/棋盘/光标/旗子/退出
     proc_mode = "--proc" in argv            # 进程地基:ps/fork/wait/exit/kill/信号三元组
+    tty_mode = "--tty" in argv              # TTY:两问向导 / ANSI 控制字符 / ASCII 降级
+    login_mode = "--login" in argv          # 最小多用户:登录 / whoami / su / 信号权限
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc")]
+                         "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc",
+                         "--tty", "--login")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -762,16 +765,20 @@ def main() -> int:
         # ★ 抓屏本身是重活:guest 正一行行往 VBE 帧缓冲(MMIO)上画的时候,
         #   连续 screendump 会把 QEMU 的 monitor 拖死(整套挂死、连 info registers
         #   都不回 —— 踩过一次,查了两小时)。所以开局**先干等**,再少量、间隔大地试探。
-        time.sleep(7.0)              # 先干等:这段时间屏幕一直在变,抓屏纯属浪费
+        # TTY 向导只有 10 秒回答时间(没有输入就按默认值走),等不了 7 秒。
+        time.sleep(3.5 if tty_mode else 7.0)   # 先干等:这段时间屏幕一直在变,抓屏纯属浪费
+        # 开机画面最后可能是:shell 提示符 / 登录提示 / TTY 两问向导的第一问
+        boot_markers = ('type "help" for commands.', 'login:', 'Is your console enable')
         for _ in range(6):
             try:
-                if find_text(mon.screendump(), 'type "help" for commands.',
-                             load_font(font_path), None):
-                    time.sleep(2.0)      # 让最后的提示符画完
+                boot_img = mon.screendump()
+                fnt = load_font(font_path)
+                if any(find_text(boot_img, m, fnt, None) for m in boot_markers):
+                    time.sleep(0.8 if tty_mode else 2.0)   # 让最后的提示符画完
                     break
             except Exception:
                 break
-            time.sleep(2.0)
+            time.sleep(1.2 if tty_mode else 2.0)
 
         if qemu.poll() is not None:
             err = qemu.stderr.read().decode("utf-8", "replace")[:400]
@@ -796,6 +803,36 @@ def main() -> int:
             shot = mon.screendump()
             ink = image_ink_rows(shot) if graphics else None
 
+        def wait_has(needle: str, timeout: float = 15.0) -> bool:
+            """等屏幕出现某段文字(字画完之前比像素会失败,要反复抓)"""
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                if has(needle):
+                    return True
+                rescan()
+                time.sleep(0.3)
+            return False
+
+        def auto_login_root(timeout: float = 15.0) -> bool:
+            """硬盘模式开机后自动用 root/root 登录,给后面的用例铺路。
+
+            软盘启动没有登录(没 FAT,users_login 直接跳过)→ 等不到 login: 就返回。
+            """
+            if not wait_has("login:", 6.0):
+                return False
+            mon.type_text("root")
+            mon.sendkey("ret")
+            time.sleep(1.0)
+            rescan()
+            mon.type_text("root")        # 密码
+            mon.sendkey("ret")
+            time.sleep(1.2)
+            rescan()
+            return wait_has('type "help" for commands.', timeout)
+
+        if not tty_mode and not login_mode:
+            auto_login_root()
+
         screen = mon.screen() if not graphics else []
         text = "\n".join(screen)
         print("=== 屏幕内容 ===")
@@ -811,6 +848,102 @@ def main() -> int:
                 shot.save("build/screen.png")
                 print(f"(图形模式 {shot.size[0]}×{shot.size[1]},已存 build/screen.png)")
             return 0
+
+        if tty_mode:
+            # ---- TTY:两问向导 → 登录 → ANSI / ASCII 降级行为 ----
+            results = []
+            results.append(("向导第一问(控制字符)",
+                            has("Is your console enable with control-characters?"),
+                            "Is your console enable with control-characters? y/n:"))
+
+            def tty_run(line: str, wait: float = 1.5) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            tty_run("y", 1.0)
+            results.append(("向导第二问(输出字符集)",
+                            has("Which types of output do you want? ascii/utf8 (a/u):"),
+                            "Which types of output do you want? ascii/utf8 (a/u):"))
+            tty_run("a", 1.5)
+            ok_login = auto_login_root()
+            results.append(("向导答案写回 RC.CONF 后能登录", ok_login, "登录后 shell 就绪"))
+            rescan()
+            results.append(("ASCII 降级:默认提示符 (・ω・) → (owo)", has("(owo)"), "(owo)"))
+            tty_run("tty")
+            results.append(("tty 状态:charset=ascii / ctrl=on",
+                            has("charset=ascii") and has("ctrl=on"),
+                            "tty: ctrl=on charset=ascii size=..."))
+            tty_run("style moe")
+            results.append(("假名降级:かいかーねる → kaikaaneru", has("kaikaaneru"), "kaikaaneru>"))
+            tty_run("style kao")
+            # ---- ANSI:清屏 + 定位(ESC[2J / ESC[1;1H)----
+            tty_run("echo before-esc", 1.0)
+            tty_run("tty esc", 1.5)
+            results.append(("ctrl_on:ESC[2J 清屏 + ESC[1;1H 归位",
+                            has("ESC-OK") and not has("before-esc"),
+                            "屏幕只剩 ESC-OK;before-esc 被清掉"))
+            # ---- 哑终端:ESC 序列按字面显示 ----
+            tty_run("tty off")
+            tty_run("tty esc", 1.5)
+            results.append(("ctrl_off:ESC 序列原样显示", has("[ESC][2J"),
+                            "[ESC][2J[ESC][1;1HESC-OK"))
+            tty_run("tty on")
+            tty_run("cat SYS/RC.CONF", 1.6)
+            results.append(("向导写回 RC.CONF(全词 ascii)",
+                            has("console.ctrl=") and has("console.charset=ascii"),
+                            'console.ctrl="y" / console.charset="ascii"'))
+            return report(results)
+
+        if login_mode:
+            # ---- 最小多用户:登录 / whoami / su / 信号权限 ----
+            results = []
+
+            def login_run(line: str, wait: float = 1.5) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            results.append(("开机出现 login: 提示", wait_has("login:", 15.0), "login:"))
+            mon.type_text("root")
+            mon.sendkey("ret")
+            time.sleep(1.0)
+            rescan()
+            results.append(("输密码前提示 Password:", has("Password:"), "Password:"))
+            mon.type_text("root")
+            mon.sendkey("ret")
+            time.sleep(1.5)
+            rescan()
+            results.append(("super 登录:欢迎语", has("Welcome, super (uid=0)"),
+                            "Welcome, super (uid=0)"))
+            login_run("whoami")
+            results.append(("whoami = super", has("whoami: super (uid=0)"),
+                            "whoami: super (uid=0)"))
+            # ---- 换成 user(空密码)----
+            login_run("login", 1.2)
+            wait_has("login:", 10.0)
+            mon.type_text("user")
+            mon.sendkey("ret")
+            time.sleep(1.0)
+            rescan()
+            mon.sendkey("ret")           # 空密码
+            time.sleep(1.5)
+            rescan()
+            results.append(("user 登录:欢迎语", has("Welcome, user (uid=2)"),
+                            "Welcome, user (uid=2)"))
+            login_run("whoami")
+            results.append(("whoami = user", has("whoami: user (uid=2)"),
+                            "whoami: user (uid=2)"))
+            # ---- user 发 super 类信号:被拒 ----
+            login_run("kill 2 super:kill:0", 1.8)
+            results.append(("user 发 super 类信号被拒", has("permission denied: need super"),
+                            "permission denied: need super"))
+            login_run("su super")
+            results.append(("user 不能 su", has("su: permission denied: need super"),
+                            "su: permission denied: need super"))
+            return report(results)
 
         if usb_mode:
             # ---- USB 大容量储存(只读裸盘):QEMU 挂的假 U 盘 ----

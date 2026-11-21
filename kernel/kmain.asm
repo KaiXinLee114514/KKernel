@@ -514,6 +514,8 @@ COL_ERR    equ 0x0C                    ; 亮红
     div ecx                              ; 除零 → 0 号异常
 %endif
 
+    ; ---- 最小多用户:登录(软盘启动没有 FAT,users_login 会直接跳过)----
+    call users_login
 
     ; ---- 开调度:从这句起 shell 会被 IRQ0 定期打断,时间片轮转开始 ----
     call shell_spawn_extra               ; 再起 3 条 shell(0 号就是主线程)

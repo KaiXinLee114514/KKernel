@@ -267,6 +267,10 @@ process_fork:
     mov dword [edx + TCB_NAME], nm_child
 
     mov esi, [pf_parent_tcb]
+    mov eax, [esi + TCB_UID]            ; 登录身份跟着父进程(最小多用户)
+    mov [edx + TCB_UID], eax
+    mov eax, [esi + TCB_GID]
+    mov [edx + TCB_GID], eax
     mov eax, [esi + TCB_SP_HEAPPAGES]
     mov [edx + TCB_SP_HEAPPAGES], eax
     mov eax, [esi + TCB_SP_ARGSVA]
@@ -536,8 +540,9 @@ process_terminate:
 ;    · kill/term 的默认动作都是"终止"(term 的用户态处理函数留给下一阶段);
 ;      stop/cont 改 TCB 状态(调度器只挑 ST_ALIVE,所以 STOPPED 就是暂停);
 ;      intr/usr 只投 pending。
-;    · 本阶段**不检查发送方的权限类**(super/system/user 只是编码,下一阶段才做
-;      身份系统与强制校验)。
+;    · 发送方权限(最小多用户,见 kernel/users.asm):uid 0(super)不受限;
+;      super 类只允许 uid 0,system 类只允许 uid 0/1,user 类不限;
+;      级别 0(只查不杀)只允许 uid 0;越权返回 -1 并打印权限提示。
 ; ---------------------------------------------------------------------------
 process_signal_send:
     pushad
@@ -560,6 +565,33 @@ process_signal_send:
     jb .out
     cmp dword [ss_action], SIG_ACT_USR
     ja .out
+
+    ; ---- 1.5) 发送方权限检查(最小多用户)----
+    ;   uid 0(super)想发什么发什么;super 类只允许 uid 0,system 类只允许
+    ;   uid 0/1,user 类不限;级别 0(只查询不杀)只允许 uid 0。
+    call process_cur_tcb
+    mov ecx, [eax + TCB_UID]
+    test ecx, ecx
+    jz .perm_ok                         ; uid 0 = super,全放行
+    cmp dword [ss_class], SIG_CLASS_SUPER
+    je .perm_deny
+    cmp dword [ss_class], SIG_CLASS_SYSTEM
+    ja .perm_level                      ; user 类:uid 不限,只查级别
+    cmp ecx, 1                          ; system 类:uid 0/1
+    ja .perm_deny
+.perm_level:
+    cmp dword [ss_level], SIG_LEVEL_NONE
+    jne .perm_ok
+.perm_deny:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_perm_denied
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    mov dword [ss_ret], -1
+    jmp .out
+.perm_ok:
 
     ; ---- 2) 找目标 ----
     mov eax, [ss_pid]
@@ -872,6 +904,19 @@ process_spawn_kernel:
     mov [edx + TCB_OWNER], ecx
     inc ecx
     mov [edx + TCB_PARENT], ecx
+    ; 登录身份从当前进程继承(最小多用户)
+    ;   注意:这里不能踩 eax —— 本函数的返回值就是 eax=槽号,
+    ;   下面要用 push/pop 把它保住(commit3 曾漏了,导致 fork 拿到
+    ;   一个"当前 TCB 指针"当 pid,test-proc 全挂)。
+    push eax
+    mov eax, [sched_cur]
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    mov ecx, [eax + TCB_UID]
+    mov [edx + TCB_UID], ecx
+    mov ecx, [eax + TCB_GID]
+    mov [edx + TCB_GID], ecx
+    pop eax
     clc
     pop ebx
     ret
@@ -1183,3 +1228,4 @@ sig_action_strs dd s_none, s_kill, s_term, s_stop, s_cont, s_intr, s_usr
 
 msg_exec_nofile db 'exec: program not found', 13, 10, 0
 msg_exec_nomem  db 'exec: not enough memory to build the address space', 13, 10, 0
+msg_perm_denied db 'permission denied: need super', 13, 10, 0
