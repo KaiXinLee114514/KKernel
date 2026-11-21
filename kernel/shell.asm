@@ -509,6 +509,8 @@ shell_readline_resume:
     je .done
     cmp al, 8                             ; Backspace
     je .backspace
+    cmp al, 3                             ; Ctrl-C:中断当前输入行(tty 的 ISIG)
+    je .ctrlc
     cmp al, 32                            ; 其它控制字符先不管
     jb .next
     cmp al, 0x80                          ; ≥0x80 = 多字节 UTF-8 的首字节
@@ -624,6 +626,16 @@ shell_readline_resume:
     mov dword [ime_state], 0
     call ime_reset
     jmp .next
+
+.ctrlc:
+    ; Ctrl-C:清掉当前输入行,回显 ^C 后换行(和真终端一个手感)
+    mov dword [shell_len], 0
+    mov byte [shell_buf], 0
+    mov al, '^'
+    call term_putc
+    mov al, 'C'
+    call term_putc
+    jmp .done
 
 .backspace:
     cmp dword [shell_len], 0
@@ -4335,6 +4347,7 @@ cmd_table:
     dd n_spawn,  cmd_spawn
     dd n_kill,   cmd_kill
     dd n_rc,     cmd_rc
+    dd n_tty,    cmd_tty
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -4468,6 +4481,7 @@ msg_help db \
     'pci [b:s.f]   list the PCI devices on bus 0, or show one in detail', 10, \
     'usb           UHCI controller / ports / USB keyboard status', 10, \
     'usbdisk       USB mass storage (read-only): info / read <lba> / hexdump <lba> / mbr / sense', 10, \
+    'tty           console TTY: state / on / off (ANSI) / ascii / utf8 / esc (ESC demo)', 10, \
     'ps            list processes (pid / ppid / state / name / ticks / runs)', 10, \
     'fork [nowait] [prog]  fork a child (demo child, or run a program in the child)', 10, \
     'wait [pid]    reap a zombie child and print its exit code', 10, \

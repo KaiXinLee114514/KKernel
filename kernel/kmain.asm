@@ -175,6 +175,7 @@ COL_ERR    equ 0x0C                    ; 亮红
 %endif
 
     call term_init                     ; 清屏 + 光标归位
+    call tty_init                      ; 终端层:tty.asm(接管 term_putc/term_print)
 
     ; ---- 开机报到 ----
     mov al, COL_HEADER
@@ -564,7 +565,9 @@ term_set_color:
     ret
 
 ; al = 字符(支持 \n \r \b)
-term_putc:
+; ★ 这是"真正画屏"的底层入口;对外的 term_putc 在 tty.asm 里(先过终端层)。
+;   原来的名字叫 term_putc,为了给 tty 让路改名为 term_raw_putc,内容没动。
+term_raw_putc:
     ; ---- 管道捕获:整条链在抓输出时,字符不画屏,原样进管道缓冲 ----
     cmp dword [pipe_capture_on], 0
     jne .pipe_cap
@@ -836,7 +839,8 @@ term_puts_at:
 
 ; esi = 以 0 结尾的 **UTF-8** 字符串
 ; (以前是逐字节 lodsb,现在先解码成码位再画 —— 这样中英都走一条路,而且跟外界一致)
-term_print:
+; ★ 这是"真正解码画屏"的底层入口;对外的 term_print 在 tty.asm 里(先过终端层)。
+term_raw_print:
     ; ---- 管道捕获:整串原样存(程序写出来的 UTF-8 字节一个不改) ----
     cmp dword [pipe_capture_on], 0
     jne pipe_capture_str

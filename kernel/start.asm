@@ -40,6 +40,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "fbterm.asm"                   ; 帧缓冲终端(图形模式)
 %include "vgafont.asm"                   ; 自定义点阵字模(文本模式实验)
 %include "keyboard.asm"                  ; PS/2 键盘(顺手重映射 PIC)
+%include "tty.asm"                       ; 控制台 TTY(ANSI/ASCII 降级 + 行规程输入)
 %include "pit.asm"                       ; PIT 定时器(IRQ0,100 Hz 心跳)
 %include "rtc.asm"                       ; CMOS 实时时钟(日期 / 时间)
 %include "sched.asm"                     ; 调度器(内核线程 + 抢占式轮转)
