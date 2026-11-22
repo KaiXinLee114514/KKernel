@@ -692,6 +692,7 @@ def main() -> int:
     hd_mode = "--fontdisk" in argv          # 硬盘镜像:磁盘字库 + FAT16 + 跑程序
     fat32_mode = "--fat32" in argv          # 同一个内核,但分区是 FAT32(镜像得开大)
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
+    usb_kbd_mode = "--usb-kbd" in argv      # USB 键盘:QEMU 只插 usb-kbd(PS/2 收不到 sendkey)
     mine_mode = "--mine" in argv            # 扫雷(BIN/MINE.BIN):菜单/棋盘/光标/旗子/退出
     proc_mode = "--proc" in argv            # 进程地基:ps/fork/wait/exit/kill/信号三元组
     tty_mode = "--tty" in argv              # TTY:两问向导 / ANSI 控制字符 / ASCII 降级
@@ -708,7 +709,7 @@ def main() -> int:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc",
+                         "--fontdisk", "--fat32", "--usbdisk", "--usb-kbd", "--mine", "--proc",
                          "--tty", "--login", "--sched", "--jobctl",
                          "--swap", "--swap-cold")]
     if "--mem" in argv:
@@ -745,6 +746,11 @@ def main() -> int:
         make_usb_stick_image(usb_img)
         usb_args = ["-device", "usb-storage,drive=kkstick",
                     "-drive", f"if=none,id=kkstick,format=raw,file={usb_img}"]
+    # USB 键盘测试:只插 usb-kbd(不插 PS/2 之外的键盘)。QEMU 一旦有 USB 键盘,
+    # sendkey 就改投 USB 键盘 —— 内核 usb.asm 的 HID 驱动必须能收到并送进 kbd_buf。
+    usb_kbd_args: list = []
+    if usb_kbd_mode:
+        usb_kbd_args = ["-device", "usb-kbd"]
     # 再开一个 QMP socket:Alt 码位输入要"按住 Alt 敲数字",HMP 的 sendkey 做不到,
     # 得用 QMP 的 input-send-event 分开按/放(tools/text2alt.py --send 就是干这个的)
     qmp_sock = f"{sock}.qmp"
@@ -760,7 +766,7 @@ def main() -> int:
          # `pci 0:1.2` 那组断言就对不上了。
          # ⚠️ 别在这里插 usb-kbd:QEMU 的 sendkey 会改投 USB 键盘,
          #    整套 PS/2 键盘用例(还有 shell 打字)会全部失灵。
-         "-usb", *usb_args,
+         "-usb", *usb_args, *usb_kbd_args,
          "-monitor", f"unix:{sock},server,nowait",
          "-qmp", f"unix:{qmp_sock},server,nowait"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -1147,6 +1153,43 @@ def main() -> int:
                                 has(" out=0"), "swap: enabled total=... used=0 out=0 in=0"))
             results.append(("程序退出后 swap 占用回落(used<=1)", (has(" used=0 out=") or has(" used=1 out=")),
                             "swap: enabled ... used<=1(极端时序可能残留 1 槽,--swap 已知限制)"))
+            return report(results)
+
+        if usb_kbd_mode:
+            # ---- USB 键盘:QEMU 只插 usb-kbd,sendkey 全部走 USB —— 能登录能敲命令才算过 ----
+            results = []
+            rescan()
+
+            def kbd_run(line: str, wait: float = 1.3) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            kbd_run("usb", 1.6)          # 先敲 usb 命令,让内核把 HID 状态打出来
+            results.append(("USB 键盘枚举:HID boot keyboard ready",
+                            has("HID boot keyboard ready"),
+                            "usb: HID boot keyboard ready"))
+            # 登录 root/root 本身就是 USB 键盘敲的;到这里说明字符真的进了 kbd_buf
+            results.append(("登录 shell 就绪(root/root 全由 USB 键盘敲入)",
+                            has('type "help" for commands.'),
+                            'type "help" for commands.'))
+            # 报告计数证明 HID 中断 IN 真的收到过数据(不只是枚举成功)
+            reports = 0
+            for line in mon.screen() if not graphics else screen_text(shot, glyphs):
+                m = re.search(r"HID reports (\d+)", line)
+                if m:
+                    reports = int(m.group(1))
+            results.append(("USB HID 报告计数 > 0(键盘事件真走 USB 通道)",
+                            reports > 0, f"usb: HID reports N (N={reports})"))
+
+            # shift 位:大写字母 / '-' 都在 HID 报告的修饰键里,验证映射没歪
+            kbd_run("echo USB-Kbd-123")
+            results.append(("shift/大写/数字输入正确",
+                            has("USB-Kbd-123"), "echo USB-Kbd-123 回显"))
+            kbd_run("help")
+            results.append(("help 命令可用(USB 键盘敲出来)", has("usbdisk"),
+                            "help 列表里有 usbdisk 一行"))
             return report(results)
 
         if usb_mode:

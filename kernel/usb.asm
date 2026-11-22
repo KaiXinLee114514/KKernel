@@ -786,6 +786,7 @@ usb_poll:
 ; ===========================================================================
 usb_handle_report:
     pushad
+    inc dword [usb_hid_reports]      ; 诊断:收到几帧 HID 报告(test-usb-kbd 断言用)
     xor ebp, ebp
 .slot:
     mov al, [USB_INT_BUF + 2 + ebp]
@@ -1121,6 +1122,12 @@ cmd_usb:
     je .nohid
     mov esi, msg_usb_ok
     call term_print
+    mov esi, msg_usb_reports
+    call term_print
+    mov eax, [usb_hid_reports]
+    call term_print_dec
+    mov al, 10
+    call term_putc
     jmp .done
 .nohid:
     mov esi, msg_usb_nohid
@@ -1157,6 +1164,7 @@ usb_read_port:
 usb_iobase      dd 0
 usb_ready       db 0
 usb_hid_ok      db 0
+usb_hid_reports dd 0
 usb_toggle      db 0
 usb_caps        db 0
 usb_port_idx    dd 0
@@ -1222,6 +1230,7 @@ msg_usb_epin    db ' IN, max ', 0
 msg_usb_epint   db ', interval ', 0
 msg_usb_ms      db ' ms', 10, 0
 msg_usb_ok      db 'usb: HID boot keyboard ready', 10, 0
+msg_usb_reports db 'usb: HID reports ', 0
 msg_usb_nohid   db 'usb: no boot keyboard on this device', 10, 0
 msg_usb_nodev   db 'usb: no device connected', 10, 0
 msg_usb_notinit db 'usb: controller present, driver not initialised', 10, 0
