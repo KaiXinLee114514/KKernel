@@ -303,6 +303,17 @@ static inline void j_sleep(int ms)
     __asm__ volatile("int $0x30" : : "a"(26), "b"(ms) : "memory");
 }
 
+/* 31:要一块大匿名内存(页对齐)→ 返回基址;0 = 失败。
+ * 第一次访问才补物理页;物理内存不够时内核把冷页换出到 swap 区(Phase C)。 */
+static inline void *j_anon_alloc(int size)
+{
+    int r;
+    __asm__ volatile("int $0x30" : "=a"(r)
+                     : "a"(31), "b"(size)
+                     : "memory");
+    return (void *)(unsigned int)r;
+}
+
 /* 13:在指定位置画一串字(不滚屏、不动光标)→ 占了几格 */
 static inline int j_puts_at(const char *s, int row, int col, int maxcells)
 {

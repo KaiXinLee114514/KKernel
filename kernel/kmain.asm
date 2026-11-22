@@ -53,6 +53,13 @@ SPACE_IMG_PAGES  equ 0x60              ; 384 KiB
 SPACE_HEAP_VA    equ 0x180000          ; 堆窗口起点(页数/参数页/栈顶运行时算)
 SPACE_TRAMP_VA   equ SPACE_IMG_VA + (SPACE_IMG_PAGES - 1) * 4096
 
+; 用户大匿名堆(Phase C:swap)的虚拟地址区。放在 2 GiB 以上:
+; 恒等映射最高只到 256 MiB(IDENT_LIMIT),VBE LFB 在 0xFD000000,都不会撞上。
+; 首次访问时按需挂 4 MiB 的页表(一张页表 1024 项 × 4 KiB = 4 MiB);
+; fork 不继承这块(子进程从自己的 UBRK=USER_HEAP_VA 重新开始)。
+USER_HEAP_VA     equ 0x80000000        ; 2 GiB
+USER_HEAP_MAX    equ 0x04000000        ; 最多 64 MiB(16 张页表)
+
 COL_NORMAL equ 0x07                    ; 浅灰
 COL_HEADER equ 0x0B                    ; 亮青
 COL_OK     equ 0x0A                    ; 亮绿
@@ -291,6 +298,7 @@ COL_ERR    equ 0x0C                    ; 亮红
 
     ; ---- 开分页 ----
     call paging_init
+    call swap_init                        ; Phase C:swap 区(没有 swap 头的镜像里静默禁用)
     ; 双重故障任务门:内核栈溢出/guard 页等致命错时,用独立任务/独立栈报个信
     call df_task_init
     mov esi, msg_paging

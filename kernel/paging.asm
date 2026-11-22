@@ -565,6 +565,15 @@ page_fault_try_handle:
 .classify:
     mov eax, [pf_va]                    ; COW 判定用掉了 eax,这里恢复成出错地址
 
+    ; ---- Phase C:大匿名堆 [USER_HEAP_VA, TCB_UBRK) ----
+    ;     用户申请的大块匿名内存:必要时现挂一张 4 MiB 页表,再走补页/换入。
+    cmp eax, USER_HEAP_VA
+    jb .windows
+    mov edi, [pf_space]
+    cmp eax, [edi + TCB_UBRK]
+    jb .bigheap
+
+.windows:
     ; ---- 这个地址落在哪个窗口?(窗口外 = 真错误)----
     mov ebx, eax
     sub ebx, SPACE_IMG_VA
@@ -596,12 +605,99 @@ page_fault_try_handle:
     mov byte [pf_is_img], 0
     jmp .check_pte
 
+; ---- 大匿名堆缺页:页表不在就现挂一张,然后补页/从 swap 读回 ----
+.bigheap:
+    ; PDE 下标 = va >> 22
+    mov eax, [pf_va]
+    shr eax, 22
+    mov [bh_pdeidx], eax
+    mov edx, [pf_space]
+    mov edx, [edx + TCB_SP_PD]
+    lea edx, [edx + eax * 4]
+    mov [bh_pdeaddr], edx
+    mov eax, [edx]
+    test eax, PAGE_P
+    jnz .bh_have_pt
+    ; 没有页表:要一页(页池紧先换出冷页),清零后挂成用户页表
+    call swap_alloc_frame
+    test eax, eax
+    jz .oom
+    mov [bh_pt], eax
+    mov edi, eax
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd
+    mov eax, [bh_pt]
+    or  eax, PAGE_P | PAGE_RW | PAGE_USER
+    mov edx, [bh_pdeaddr]
+    mov [edx], eax
+.bh_have_pt:
+    mov edx, [bh_pdeaddr]
+    mov eax, [edx]
+    and eax, 0xFFFFF000
+    mov [bh_pt], eax
+    ; 页表项地址
+    mov eax, [pf_va]
+    shr eax, 12
+    and eax, 0x3FF
+    mov edi, [bh_pt]
+    lea edi, [edi + eax * 4]
+    mov [pf_pteaddr], edi
+    mov eax, [edi]
+    test eax, PAGE_P
+    jnz .out                           ; 页在(比如只读)→ 交给 panic
+    mov edx, eax
+    and edx, 0xFFFFF000
+    jz .bh_fresh
+    ; ---- 是 swap 页:读回来 ----
+    mov eax, [pf_pteaddr]
+    mov ebx, [pf_va]
+    call swap_swapin
+    test eax, eax
+    jz .oom
+    mov dword [pf_ret], 1
+    popad
+    mov eax, [pf_ret]
+    ret
+.bh_fresh:
+    ; ---- 拿一帧,清零,装 PTE ----
+    call swap_alloc_frame
+    test eax, eax
+    jz .oom
+    mov [pf_new_pa], eax
+    mov edi, eax
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd
+    mov edi, [pf_pteaddr]
+    mov eax, [pf_new_pa]
+    or  eax, PAGE_P | PAGE_RW | PAGE_USER
+    mov [edi], eax
+    mov eax, [pf_va]
+    invlpg [eax]
+    ; 记账
+    mov edi, [pf_space]
+    inc dword [edi + TCB_SP_PFRUN]
+    inc dword [space_pf_total]
+    cmp dword [edi + TCB_SP_FIRSTPA], 0
+    jne .bh_anon
+    mov eax, [pf_new_pa]
+    mov [edi + TCB_SP_FIRSTPA], eax
+.bh_anon:
+    ; 匿名页,引用计数 1 → 登记可换出
+    mov eax, [pf_new_pa]
+    mov ebx, [pf_pteaddr]
+    call swap_mark_anon
+    mov dword [pf_ret], 1
+    popad
+    mov eax, [pf_ret]
+    ret
+
 .cow:
     ; ---- 1) 记下旧页,拿一页新的,整页复制 ----
     and eax, 0xFFFFF000
     mov [pf_old_pa], eax
-    mov ecx, 1
-    call pmem_alloc_pages
+    call swap_alloc_frame               ; 页池紧就先换出冷页(Phase C)
     test eax, eax
     jz .cow_oom
     mov [pf_new_pa], eax
@@ -618,8 +714,14 @@ page_fault_try_handle:
     mov edx, [pf_new_pa]
     or  edx, PAGE_P | PAGE_RW | PAGE_USER
     mov [edi + eax * 4], edx
+    lea edx, [edi + eax * 4]
+    mov [pf_pteaddr], edx
     mov eax, [pf_va]
     invlpg [eax]
+    ; ---- Phase C:复制出来的新页是匿名页(引用计数 1),登记可换出 ----
+    mov eax, [pf_new_pa]
+    mov ebx, [pf_pteaddr]
+    call swap_mark_anon
     ; ---- 3) 旧页少一个引用者(归零才真的还给页池)----
     mov eax, [pf_old_pa]
     call pmem_free
@@ -646,14 +748,27 @@ page_fault_try_handle:
     and eax, 0x3FF
     mov edi, [pf_space]
     mov edi, [edi + TCB_SP_PT]
-    mov eax, [edi + eax * 4]
+    lea edi, [edi + eax * 4]
+    mov [pf_pteaddr], edi
+    mov eax, [edi]
     test eax, 1
     jnz .out
-
-    ; ---- 从页池拿一页(pmem_alloc_pages 会轮转,所以同一个程序跑两次
-    ;     拿到的物理页不一样 —— 一眼能看出虚拟地址 ≠ 物理地址)----
-    mov ecx, 1
-    call pmem_alloc_pages
+    ; ---- Phase C:present=0 但带 swap 标记 → 从 swap 区读回来 ----
+    mov edx, eax
+    and edx, 0xFFFFF000
+    jz .need_page
+    mov eax, [pf_pteaddr]
+    mov ebx, [pf_va]
+    call swap_swapin
+    test eax, eax
+    jz .oom
+    mov dword [pf_ret], 1
+    popad
+    mov eax, [pf_ret]
+    ret
+.need_page:
+    ; ---- 从页池拿一页(页池紧的话先换出冷页;轮转让每次物理页不同)----
+    call swap_alloc_frame
     test eax, eax
     jz .oom
     mov [pf_new_pa], eax
@@ -714,6 +829,11 @@ page_fault_try_handle:
     mov eax, [pf_va]
     invlpg [eax]
 
+    ; ---- Phase C:这页是匿名用户页(引用计数 1),登记可换出 ----
+    mov eax, [pf_new_pa]
+    mov ebx, [pf_pteaddr]
+    call swap_mark_anon
+
     ; ---- 记账(给 run 的输出和测试用)----
     mov edi, [pf_space]
     inc dword [edi + TCB_SP_PFRUN]
@@ -765,6 +885,11 @@ sd_go:                                  ; 两条入口共用(非局部标签,别
     mov dword [sd_pages], 0
     mov ebx, [sd_block]
     mov dword [ebx + TCB_SP_LIVE], 0   ; 先把开关关掉,免得半路又触发按需分页
+
+    ; ---- Phase C:大匿名堆(0x80000000 起)的帧/页表/swap 槽一起收 ----
+    mov edi, ebx
+    call swap_space_free
+    add [sd_pages], eax
 
     ; ---- 窗口里已经补进来的私有页 ----
     mov edi, [ebx + TCB_SP_PT]
@@ -835,14 +960,32 @@ space_free_window:
     and eax, 0x3FF                     ; 页表项下标
     mov esi, [sd_block]
     mov esi, [esi + TCB_SP_PT]
-    mov edx, [esi + eax * 4]
+    lea esi, [esi + eax * 4]           ; 这一项的地址
+    mov edx, [esi]
     test edx, 1
-    jz .next                           ; 没映过 = 这页没拿过
+    jz .swapped                        ; present=0:可能是 swap 页
+    ; ---- 正常页:还帧,清 PTE(清掉免得残留元数据指向已归还的帧)----
+    mov dword [esi], 0
     and edx, 0xFFFFF000
     mov eax, edx
     call pmem_free
     jc .next
     inc dword [sd_pages]
+    jmp .next
+.swapped:
+    ; ---- Phase C:swap 页 → 还 swap 槽(不占物理页)----
+    test edx, PAGE_SWAP
+    jz .next
+    mov eax, edx
+    shr eax, 12
+    cmp dword [swap_enabled], 0
+    je .next
+    call swap_slot_free
+    cmp eax, SWAP_SLOTS
+    jae .next
+    cmp dword [swap_slots_used], 0
+    je .next
+    dec dword [swap_slots_used]
 .next:
     add ebx, 4096
     dec ecx
@@ -1053,6 +1196,10 @@ msg_pf_oom     db 'out of physical pages while faulting in a page', 10, 0
 msg_cow_oom     db 'cow: out of memory (page still shared)', 13, 10, 0
 pf_err          dd 0
 pf_old_pa       dd 0
+pf_pteaddr      dd 0                    ; C:缺页要补/换入的那条页表项地址
+bh_pdeidx       dd 0                    ; C:大匿名堆缺页的 PDE 下标
+bh_pdeaddr      dd 0                    ; C:大匿名堆缺页的 PDE 地址
+bh_pt           dd 0                    ; C:大匿名堆的页表物理地址
 
 sup_va         dd 0                    ; space_user_page:要映的虚拟地址
 sup_pa         dd 0                    ; space_user_page:拿到的物理页

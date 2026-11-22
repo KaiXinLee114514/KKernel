@@ -314,6 +314,7 @@ pmem_free_pages:
 ;  给 pmem_alloc / pmem_alloc_pages 用;破坏 eax/ebx/ecx/edx/esi(都存过)
 ; ---------------------------------------------------------------------------
 pmem_ref_set1:
+    push eax                            ; 原始物理页地址(下面 swap 元数据清理要用)
     push ebx
     push ecx
     push edx
@@ -337,6 +338,11 @@ pmem_ref_set1:
     pop edx
     pop ecx
     pop ebx
+    pop eax                            ; 原始页地址
+    ; Phase C:这帧可能还留着上一个用户(换出又换入/收摊后复用)的 swap 元数据,
+    ;   不复位的话新页可能被当成"可换出的老页"写盘 —— 先清干净。
+    ;   (swap 未启用时 swap_frame_dispose 直接返回;它保留所有寄存器)
+    call swap_frame_dispose
     ret
 
 ; ---------------------------------------------------------------------------

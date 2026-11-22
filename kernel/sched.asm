@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 192               ; 每个 TCB 192 字节(A2/A3+B:身份/优先级/睡眠/进程组,见 /4、imul)
+TCB_SIZE          equ 196               ; 每个 TCB 196 字节(A2/A3+B+C:身份/优先级/睡眠/进程组/大堆,见 /4、imul)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -104,6 +104,11 @@ TCB_SID           equ 176               ; 会话号(最小实现:所有 shell/�
 TCB_EXECBUF       equ 180               ; 子进程 exec 载荷页(名字+参数;0 = 没有)
 TCB_STOPREQ       equ 184               ; 1 = ^Z 要求这条线程在 ring3 现场停下
 TCB_KBUSY         equ 188               ; 最近一次读键盘的 tick(判"交互程序"用)
+
+; ---- C(Phase C swap):用户大匿名堆的 brk ----
+;   USER_HEAP_VA 起按需映射的大块匿名内存;UBRK = 下次分配的起点(0/未用 = 从
+;   USER_HEAP_VA 开始)。fork 不继承大堆(子进程的 UBRK 重置)。
+TCB_UBRK          equ 192               ; 大匿名堆的 brk
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))
@@ -161,6 +166,7 @@ sched_init:
     ; B:0 号线程 = 主 shell,它属于 shell 自己的进程组/会话
     mov dword [edi + TCB_PGRP], SHELL_PGRP
     mov dword [edi + TCB_SID], SHELL_SID
+    mov dword [edi + TCB_UBRK], 0       ; C:内核线程不起用户大堆
     mov [space_cur], edi                ; 现在跑的就是 0 号线程
     mov dword [tss_blk + TSS_ESP0], 0   ; ring3 进来时才设,先清掉开机时的旧值
     mov dword [sched_cur], 0
@@ -188,10 +194,20 @@ sched_enable:
 ; ---------------------------------------------------------------------------
 kstack_alloc:
     pushad
+    mov dword [kstack_tries], 0
+.retry:
     mov ecx, SCHED_STACK_PAGES + 1      ; guard 1 页 + 栈 4 页,必须连续
     call pmem_alloc_pages
     test eax, eax
-    jz .fail
+    jnz .got
+    ; Phase C:页池紧(比如大量换出后碎片化)→ 先换出几页再试,最多 3 次
+    inc dword [kstack_tries]
+    cmp dword [kstack_tries], 3
+    jae .fail
+    mov eax, (SCHED_STACK_PAGES + 1) * 4
+    call swap_reclaim
+    jmp .retry
+.got:
     mov [kstack_guard], eax             ; 整段第一页 = guard
     add eax, 4096
     mov [kstack_base], eax              ; 第二页起 = 栈
@@ -862,6 +878,7 @@ sched_spawn:
     mov dword [edx + TCB_EXECBUF], 0
     mov dword [edx + TCB_STOPREQ], 0
     mov dword [edx + TCB_KBUSY], 0
+    mov dword [edx + TCB_UBRK], 0       ; C:大堆由 exec 建新空间时再开
     ; 内核线程没有 ring3 程序,但给一个有效的 esp0 顶(真跑程序时 exec 会覆盖)
     mov eax, [spawn_stack]
     add eax, SCHED_STACK_PAGES * 4096
@@ -1023,6 +1040,7 @@ sched_next_demo dd 0                    ; spawn 不带参数时下一个起谁(0
 sched_default_prio dd SCHED_PRIO_SHELL  ; 新线程默认优先级
 kstack_base     dd 0                    ; kstack_alloc 的返回值暂存
 kstack_guard    dd 0                    ; kstack_alloc 的 guard 页暂存
+kstack_tries    dd 0                    ; Phase C:页池紧张时 reclaim 重试计数
 
 ; ---- A3:就绪队列(16 个优先级,每级一条 FIFO;位图记哪几级非空)----
 sched_ready_bitmap dd 0

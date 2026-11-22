@@ -191,11 +191,13 @@ process_fork:
     mov [pf_child_stack], eax
 
     ; ---- 3) 子进程自己的页目录 + 低端页表 ----
-    call pmem_alloc
+    ;   Phase C:页池紧的时候 swap_alloc_frame 会先换出冷页,避免 fork 在
+    ;   内存压力下直接失败(COW 的共享页优先,所以这里尽量挤得出来)。
+    call swap_alloc_frame
     test eax, eax
     jz .fail_stack
     mov [pf_child_pd], eax
-    call pmem_alloc
+    call swap_alloc_frame
     test eax, eax
     jz .fail_pd
     mov [pf_child_pt], eax
@@ -235,6 +237,16 @@ process_fork:
     mov eax, [pf_child_pt]
     or  eax, PAGE_P | PAGE_RW | PAGE_USER
     mov [edi], eax
+
+    ; ---- 5.5) 大匿名堆(0x80000000 起)不继承 ----
+    ;   父进程的 PD 在这一段可能挂着它自己的页表页;直接拷过来会让父子共用
+    ;   同一张用户页表(收摊/减引用都会乱套),所以清掉,子进程从自己的
+    ;   UBRK=USER_HEAP_VA 重新长。
+    mov edi, [pf_child_pd]
+    add edi, (USER_HEAP_VA >> 22) * 4
+    xor eax, eax
+    mov ecx, USER_HEAP_MAX / 0x400000   ; 16 张页表项
+    rep stosd
 
     ; ---- 6) 两个窗口里的页全部改成写时复制 ----
     ;   父页表和子页表都写成"只读 + PAGE_COW",并把引用计数 +1。
@@ -287,8 +299,7 @@ process_fork:
     mov eax, [pf_child_pt]
     mov ebx, [pf_guard_idx]
     mov dword [eax + ebx * 4], 0        ; 先摘掉继承下来的父 guard 项
-    mov ecx, 1
-    call pmem_alloc_pages
+    call swap_alloc_frame               ; Phase C:页池紧时先换出冷页
     test eax, eax
     jz .fail_all                        ; OOM:半套 COW 已标,放弃子进程
     mov [pf_child_guard_pa], eax
@@ -353,6 +364,7 @@ process_fork:
     mov [edx + TCB_PGRP], eax
     mov eax, [esi + TCB_SID]
     mov [edx + TCB_SID], eax
+    mov dword [edx + TCB_UBRK], USER_HEAP_VA   ; C:子进程的大匿名堆从头开始
     mov eax, [esi + TCB_SP_HEAPPAGES]
     mov [edx + TCB_SP_HEAPPAGES], eax
     mov eax, [esi + TCB_SP_ARGSVA]
@@ -1394,6 +1406,9 @@ process_exec:
     jc .nomem
     mov eax, [proc_exec_size]
     call space_set_image
+    ; ---- Phase C:新地址空间的大匿名堆从 USER_HEAP_VA 重新开始 ----
+    mov eax, [space_cur]
+    mov dword [eax + TCB_UBRK], USER_HEAP_VA
     ; ---- 报一声自己的 CR3(旧 cmd_run 的那行;bundle 模式,管道静音)----
     cmp dword [proc_exec_quiet], 0
     jne .no_space_msg

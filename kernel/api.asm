@@ -77,7 +77,21 @@ api_stub:
     mov fs, ax
     mov gs, ax
     mov eax, ebp                        ; 恢复功能号
+    ; ★ 保存程序原来的 EBX / ESI:只有"确实用它们返回数据"的功能(11 屏幕尺寸、
+    ;   12 取参数)才允许改;其余功能必须原样还回去 —— 否则编译器把值放在
+    ;   EBX/ESI 里的代码(比如 SWAPTEST 在 fork 之后 EBX 还存着子 pid)会被
+    ;   内核的中间实现污掉,程序拿到垃圾参数。
+    mov [api_func], eax
+    mov [api_orig_ebx], ebx
+    mov [api_orig_esi], esi
     call api_dispatch
+    cmp dword [api_func], 11
+    je .wb_ok
+    cmp dword [api_func], 12
+    je .wb_ok
+    mov ebx, [api_orig_ebx]
+    mov esi, [api_orig_esi]
+.wb_ok:
     pop gs
     pop fs
     pop es
@@ -158,6 +172,8 @@ api_dispatch:
     je api_h_tcsetpgrp
     cmp eax, 30
     je api_h_tcgetpgrp
+    cmp eax, 31
+    je api_h_anon_alloc
     ret
 .print_str:
     call term_print
@@ -456,6 +472,17 @@ api_h_tcgetpgrp:
     call tty_getpgrp
     ret
 
+; ---------------------------------------------------------------------------
+;  api_h_anon_alloc(功能号 31):向内核要一块大匿名内存(Phase C)
+;    程序侧:j_anon_alloc(字节数) → 返回指向这块内存的指针(0 = 失败);
+;    内核拿到基址后什么都不做,程序第一次碰那页时缺页现补,物理页紧张时
+;    swap_alloc_frame 会先把冷页换出到 swap 区。
+; ---------------------------------------------------------------------------
+api_h_anon_alloc:
+    mov eax, ebx                        ; 字节数
+    call swap_anon_alloc
+    ret
+
 
 ; ---------------------------------------------------------------------------
 ;  api_exit(功能号 15):程序说"我跑完了"
@@ -509,3 +536,8 @@ api_name    dd 0
 api_buf     dd 0
 api_max     dd 0
 api_saved_dir dd 0                      ; 文件 API 调用前的 [fat_dir](调完恢复)
+
+; --- api_stub 的寄存器保存(Phase C:防止 EBX/ESI 被中间实现污掉)---
+api_func        dd 0
+api_orig_ebx    dd 0
+api_orig_esi    dd 0
