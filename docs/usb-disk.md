@@ -1,116 +1,106 @@
-# USB 大容量储存(只读裸盘)
+# USB 大容量储存(读写 + FAT 挂载)
 
-> 插一个 U 盘,`usbdisk` 一条命令就能看它是什么、读任意扇区、解 MBR 分区表。
-> 目前是 **只读 + 裸扇区**:不接 FAT、不写盘 —— 这是刻意的第一步。
+> 插一个 U 盘,`usbdisk mount` 之后 shell 的 `ls / cat / write / cp / mkdir / rm`
+> 直接操作 U 盘上的 FAT16/FAT32 文件系统;`usbdisk umount` 再干净地切回内部 ATA 盘。
+> 底层是 UHCI(USB 1.1)+ Bulk-Only Transport,SCSI READ(10)/WRITE(10)。
 
 ## 用法
 
 ```
-> usbdisk
+> usbdisk                      ← INQUIRY + READ CAPACITY + 挂载状态
 usbdisk: QEMU QEMU HARDDISK rev 2.5+
-usbdisk: 8192 sectors × 512 B = 4096 KiB
+usbdisk: 16384 sectors × 512 B = 8192 KiB
+usbdisk: status: not mounted (FAT device: ATA)
 
-> usbdisk read 1                 ← 读 LBA 1,转储前 64 字节
-0000: 55 53 42 20 54 45 53 54  20 53 45 43 54 4F 52 20  | USB TEST SECTOR
-0010: 31 20 2D 20 4B 4B 65 72  6E 65 6C 20 75 73 62 64  | 1 - KKernel usbd
-...
+> usbdisk mount                ← 扫 MBR 分区表,把 FAT 文件系统切到 U 盘
+usbdisk: mounted FAT16 at LBA 2048, 16384 sectors
 
-> usbdisk hexdump 1              ← 完整 512 字节(16 行 × 32B + ASCII 列)
+> ls
+USB_HI.TXT
+> cat USB_HI.TXT
+hello from usb
+> write NEW.TXT hello-usb
+wrote NEW.TXT (9 bytes)
+> mkdir USBDIR
+created directory USBDIR
 
-> usbdisk mbr
-usbdisk: MBR (LBA 0)
-p1: type=0x06 start=2048 sectors=4096
-p2: type=0x00 start=0 sectors=0
-...
+> usbdisk umount               ← 同步缓存,恢复 ATA 的 FAT 几何/cwd
+usbdisk: unmounted, FAT device back to ATA FAT16 at LBA 6144
 
-> usbdisk sense
-sense: rc=0x70 key=0x00 asc=0x00 ascq=0x00
+> ls                           ← 又回到内部硬盘
+BIN  DOCS  SRC  ...
 ```
 
 | 命令 | 作用 |
 |---|---|
-| `usbdisk` | INQUIRY:厂商 / 型号 / 版本 + READ CAPACITY(10) 得到的扇区数与容量 |
-| `usbdisk read <lba> [count]` | READ(10) 读扇区;默认打印前 64 字节(调试用) |
+| `usbdisk` | INQUIRY:厂商 / 型号 / 版本 + 扇区数 + 当前挂载状态 |
+| `usbdisk mount` | 切块设备到 USB;扫 MBR 找 FAT 分区(LBA0 无分区表时按超级软盘处理)并 `fat_mount` |
+| `usbdisk umount` | SYNCHRONIZE CACHE → 恢复 ATA 的 FAT 状态(几何/目录缓存/分配提示)→ cwd 回根 |
+| `usbdisk status` | 当前 FAT 设备是 ATA 还是 USB、挂的是 FAT16 还是 FAT32 |
+| `usbdisk read <lba> [count]` | READ(10) 裸读扇区;默认打印前 64 字节 |
 | `usbdisk hexdump <lba>` | READ(10) 读一个扇区并转储完整 512 字节 |
-| `usbdisk mbr` | 读 LBA 0,解析四个 MBR 分区项(type / start_lba / sectors) |
+| `usbdisk write <lba>` | 写自测:备份原扇区 → 写图案 → 读回逐字节校验 → 恢复原扇区 |
+| `usbdisk mbr` | 解析 LBA 0 的四个 MBR 分区项 |
 | `usbdisk sense` | REQUEST SENSE,看最近一次错误感应数据 |
 
-## 限制
+mount 后所有文件命令都走 USB——**不用**给 `ls/cat/write` 加设备前缀(U3 的取舍:
+单 FAT 上下文 + 显式 mount/umount,比给每条命令加 `USB:` 前缀干净)。
 
-- **只读**:没有 WRITE(10),也没有 FAT 挂载。要看文件内容只能用 `read`/`hexdump` 自己按手册算。
-- **只有 UHCI(USB 1.1)**:QEMU 的 PIIX3 自带的 UHCI 没问题;真机新笔记本多半是 xHCI,那份驱动还没写。
-- **一次只认一个 USB 设备,而且要插在第一个枚举到的位置**:`usb_init` 找到第一个设备就停;
-  如果先插的是 USB 键盘,`usbdisk` 会报
-  `no USB mass storage device (first USB device must be the disk)`。要同时用键盘 + U 盘,
-  得先把「多设备枚举」补上(见 [路线图](roadmap.md))。
-- 全速设备跑在 12 Mbit/s(足够读小 U 盘),大容量盘能认但读大文件会慢。
-- LUN 固定 0、单接口、无热插拔(开机后拔插不重新枚举)。
+## 分层(为什么 FAT 驱动一行设备相关代码都没有)
 
-## 实现
+```
+shell 的 ls/cat/write/cp/mkdir/rm/...        (shell.asm,完全不知道块设备的存在)
+        ↓
+fat.asm   FAT16 / FAT32 文件系统             (fat_dev_read / fat_dev_write)
+        ↓
+blkdev.asm  块设备抽象:blkdev_ata / blkdev_usb + blk_cur 指针
+        ↓                                    (统一 ABI:eax=LBA, ecx=扇区数, edi=buf)
+   ata.asm  ATA PIO 读写             usbdisk.asm  SCSI READ(10)/WRITE(10) → USB BOT
+```
 
-代码在 `kernel/usbdisk.asm`,分三层:
-
-1. **UHCI bulk 传输**(`usb_bulk_xfer`)
-   - 复用 `usb.asm` 的帧列表/QH/TD 结构,把帧列表临时切到 `USB_BULK_QH`(传输完切回控制 QH);
-   - 一个 TD 一个包(≤ `wMaxPacketSize`),DATA0/DATA1 toggle 显式翻转;
-   - 等待时扫 TD 的 `TD_ERRMASK`,3 秒超时;失败清 Active 并恢复链路。
-2. **Bulk-Only Transport**(`usb_bot`)
-   - CBW 31 字节:`dCBWSignature='USBC'(0x43425355)` + tag + 传输长度 + flags(0x80=IN)+ LUN + CDB(16B);
-   - 数据阶段(IN/OUT 由 CDB 决定);CSW 13 字节:`dCSWSignature='USBS'(0x53425355)` + tag + residue + status。
-3. **SCSI 命令集**(最小集)
-   - `TEST UNIT READY(0x00)` `INQUIRY(0x12,36B)` `READ CAPACITY(10)(0x25,8B,大端)`
-     `READ(10)(0x28,LBA 大端 32 位 + 扇区数大端 16 位)` `REQUEST SENSE(0x03,18B)`。
-
-枚举侧(`kernel/usb.asm` 的 `usb_enumerate`):读完整配置描述符后识别
-**接口 Class 8 / SubClass 6 / Protocol 0x50**(Mass Storage, SCSI, Bulk-Only),
-记录 bulk IN/OUT 端点与 `wMaxPacketSize` → `SET_CONFIGURATION(1)` → `usb_msd_ok=1`;
-`usbdisk_init`(开机时在 `usb_init` 之后调用)再做 SCSI 初始化。
-
-> 一个容易摔的坑:控制传输的 EP0 `bMaxPacketSize0` 不是永远 8 字节。
-> usb-storage 是 64 —— 所以枚举时先读设备描述符前 8 字节拿它,再按它读完整的描述符。
-
-## 内存
-
-| 区域 | 用途 |
-|---|---|
-| `0x3C1200` | `USB_BULK_QH`(bulk 常驻队列头) |
-| `0x3C1210` | `USB_BULK_TD` 数组(80 × 16B) |
-| `0x3C1800` | `USB_BOT_CBW`(31 字节指令块) |
-| `0x3C1820` | `USB_BOT_CSW`(13 字节状态块) |
-| `0x3C1840` | `USB_MSD_CDB`(16 字节 SCSI 命令) |
-| `0x3C1860` | `USB_MSD_TMP`(INQUIRY/容量等临时缓冲) |
-| `0x3C2000` | `USB_MSD_DATA`(扇区数据缓冲,4 KiB) |
+- **U1(blkdev)**:`kernel/blkdev.asm`。描述符 20B(名字 / 读函数 / 写函数 / 扇区数 /
+  扇区大小);`blk_read_sectors` / `blk_write_sectors` 按 `[blk_cur]` 分发,ABI 和原来的
+  `ata_read_sectors` 一样(`eax=LBA, ecx=n, edi=buf`;写是 `esi=src`),所以 FAT 驱动只是把
+  `call ata_read_sectors` 换成 `call fat_dev_read`(30 处),逻辑零改动。
+  USB 后端按 ≤8 扇区一块(USB_MSD_DATA 4 KiB 缓冲)分块搬运,并保护所有调用者寄存器。
+- **U2(BOT 写路径)**:`usb_scsi_write` = WRITE(10)(CDB `0x2A`)+ CBW flags=0x00 + 数据 OUT
+  + CSW 校验;失败 `REQUEST SENSE` 后重试 ≤3 次。`usb_scsi_sync` = SYNCHRONIZE CACHE(10)。
+  底层 `usb_bulk_xfer` 原本就支持 OUT 方向,这次直接复用(按 mps 拆 TD,3 秒超时)。
+- **U3(FAT 挂载)**:`usbdisk mount` 时 `fat_state_save` 把整段 FAT 全局状态(几何/缓存/
+  fat_dir/fat_next_free/…,`fat_state_begin..fat_state_end`)备份到 0x3C6000,
+  然后 `blkdev_select_usb` + `fat_set_part_base` + 重新 `fat_mount`;
+  `umount` 反过来 `fat_state_restore` + `blkdev_select_ata`。无文件系统/读失败会回滚到 ATA。
 
 ## 测试
 
 ```bash
-make test-usb      # 无头自动化:QEMU 挂一个 4 MiB 假 U 盘(已知 MBR + LBA1 文本)
+make -s test-usb-kbd   # USB 键盘(UHCI + HID boot):枚举 / HID 报告 / shift 打字 → shell
+make -s test-usb       # 只读裸盘:INQUIRY / 容量 / READ(10) / MBR / SENSE
+make -s test-usb-rw    # U 盘 FAT16:mount → ls/cat/write/cp/mkdir/rm → umount → 重挂 → host 校验
+make -s test-usb-rw32  # 同上,但 U 盘是 FAT32(64 MiB)
 ```
 
-测试会断言:设备识别(INQUIRY)、容量(8192 扇区 × 512B = 4096 KiB)、READ(10) 读到 LBA1 的已知文本、
-MBR 分区项(`p1: type=0x06 start=2048 sectors=4096`)、REQUEST SENSE 的正常响应。
+`--usb-rw` 测试的 U 盘镜像由 `tests/qemu_test.py` 里的 `make_usb_fat16_image()` /
+`make_usb_fat32_image()` **纯 Python 现造**(MBR + BPB + 两份 FAT + 根目录 + 预置
+USB_HI.TXT,不依赖 mkfs.fat/mtools)。跑完 QEMU 后用**独立的 Python FAT 解析器**
+(`Fat16` 类 + `check_usb_fat_image()`)**离线读** U 盘镜像,确认内核写的字节真的落盘:
+文件内容逐字节一致、rm 掉的真没了、两份 FAT 一致、簇链无交叉/短链;
+同时校验内部 ATA 镜像一字节未变(mount/umount 没误写)。
 
-想手动玩:
+## 限制 / 已知问题
 
-```bash
-# 造一个 4 MiB 假 U 盘,LBA1 写点东西
-python3 - <<'EOF'
-buf = bytearray(4 * 1024 * 1024)
-buf[446:462] = bytes([0x80,0,0,0,0x06,0,0,0]) + (2048).to_bytes(4,"little") + (4096).to_bytes(4,"little")
-buf[510:512] = b"\x55\xAA"
-buf[512:512+45] = b"USB TEST SECTOR 1 - KKernel usbdisk read-only"
-open("/tmp/usbstick.img","wb").write(buf)
-EOF
-
-qemu-system-i386 -m 128 -drive file=build/kkernel-hd.img,format=raw,if=ide \
-  -usb -device usb-storage,drive=stick \
-  -drive if=none,id=stick,format=raw,file=/tmp/usbstick.img
-```
+- 同一时刻只驱动**一台** USB 大容量设备,且只认第一台;没有热插拔(需重新上电)。
+- mount 后不能同时用 U 盘和 ATA 的文件(单 FAT 上下文);要拷文件就先 mount、操作、umount。
+- WRITE(10) 每次 BOT 一个数据阶段(≤8 扇区/次),FAT 表 1 个扇区一写,速度是 UHCI
+  全速量级("能用",不追求快)。
+- 不支持长文件名(LFN)——和内部 FAT 驱动一致,只用 8.3 短名。
+- 拔盘/坏 CSW 时返回错误并回滚挂载,不做重试风暴。
 
 ## 以后可以往哪长
 
-- WRITE(10) + 写盘(先只读验证,再放开)
-- FAT16/FAT32 挂到 U 盘上(`ls USB/` / `cat USB/DOCS/README.TXT`)
-- 多设备枚举(键盘 + U 盘同时用)、热插拔(端口状态变化中断/轮询)
-- xHCI 驱动(真机新笔记本),或者先支持 EHCI(USB 2.0)
-- `mount` / `umount` 命令,把设备号抽象出来(现在是「第一台 USB 设备」的简化版)
+- **U4 EHCI(USB 2.0 高速)**:调研结论见 `AGENT-USB-REPORT.md`;QEMU 的
+  `-device usb-ehci` 下 usb-storage 会以 480 Mb/s 高速设备接进来,值得做,但需要
+  新的控制器驱动(周期帧列表/异步 QH/qTD/PING)+ 传输层抽象重构,列为后续阶段。
+- 多设备枚举(键盘 + U 盘同时用,现在 usb.asm 的键盘和 usbdisk 各自枚举,要统一)。
+- 热插拔(端口变化中断 / 定时轮询 PORTSC)。
+- xHCI(真机新平台)。
