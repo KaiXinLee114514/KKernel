@@ -2786,7 +2786,7 @@ def main() -> int:
                 time.sleep(wait)
                 rescan()
 
-            def ps_rows(tries=3):
+            def ps_rows(tries=6):
                 """抓 "pid N ppid M RUN alpha ticks=T"。被线程插花了就 clear 重来。"""
                 got, head = [], False
                 for _ in range(tries):
@@ -2797,8 +2797,8 @@ def main() -> int:
                     # 插成 "scheduled tialpha 6 ks= 1400"),而且 ps 那几行是
                     # 一格一格画的。所以:短时间内多抓几张,把各张里认出来的
                     # 行并起来看,凑够 alpha/beta 两行才算数。
-                    for _ in range(4):
-                        time.sleep(0.5)
+                    for _ in range(8):
+                        time.sleep(0.45)
                         rescan()
                         txt = ("\n".join(screen_text(shot, glyphs)) if graphics
                                else "\n".join(mon.screen()))
