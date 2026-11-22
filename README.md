@@ -1,7 +1,7 @@
 # KKernel
 
 **一个从零手写的 32 位 x86 操作系统。**
-(...!才...才不是专门为你写的README呢...碰巧罢了...! 哼!zako!baka!!)
+(...!才...才不是专门为你写的README呢...碰巧罢了...! 哼!zako!baka!!((つд⊂)))
 引导扇区、保护模式、分页、抢占调度、图形终端、FAT 文件系统、设备层、管道、多 shell、系统内 C 编译器、USB 大容量存储——全部自己实现，不 fork 任何现成内核。
 
 不是教学演示，也不是课程作业：每次提交都要求能启动、能通过自动化测试、有文档。(哪个混蛋说我这是教学系统的?!)
@@ -53,7 +53,8 @@
 
 - `/DEV` 虚拟设备层：`NULL` `ZERO` `RANDOM` `RTC` `CON` `DEVICES`，`cat` / `write` 直接用
 - ATA PIO 硬盘驱动（LBA28 / LBA48），支持多设备
-- UHCI USB 主机控制器 + USB 大容量存储（只读裸盘）：INQUIRY / READ CAPACITY / READ(10) / MBR 解析
+- UHCI USB 主机控制器 + USB 大容量存储（读写）：INQUIRY / READ CAPACITY / READ(10) / WRITE(10) / MBR 解析；USB 键盘（HID boot）输入
+- USB 块设备上的 FAT16/FAT32 文件系统：`usbdisk mount` 挂载后可直接 ls/cat/write/cp/mv/mkdir/rm（unmount 后恢复内部盘）
 - PCI 总线枚举（枚举 IDE / USB / 网卡等设备）
 
 ### Shell 与管道
@@ -76,7 +77,7 @@
 
 ### 测试
 
-- 9 组 QEMU 自动化套件（软盘 / 硬盘 / FAT32 / 分页异常 / 键盘 / shell / 完整字库 / USB 等），测试台真正启动 QEMU、截图、用 OCR 断言屏幕内容，不做 mock
+- 18 组 QEMU 自动化套件（软盘 / 硬盘 / FAT32 / 分页异常 / 键盘 / shell / 完整字库 / USB 按键/读写/FAT 挂载 / tty / 登录 / 调度 / 作业控制 / swap 等）+ 扫雷专项，测试台真正启动 QEMU、截图、用 OCR 断言屏幕内容，不做 mock
 - KiFS 独立项目另有断电注入一致性测试
 
 ## 快速开始
@@ -119,10 +120,13 @@ make hd                 # 构建 16 MB 硬盘镜像 build/kkernel-hd.img
 ### 测试
 
 ```sh
-make test               # 全部 9 组 QEMU 套件（约 40–60 分钟）
+make test               # 全部 18 组 QEMU 套件（约 90–120 分钟）
 make test-hda           # 单组：硬盘模式快速验证
 make test-mine          # 扫雷专项
-make test-usb           # USB 大容量储存（挂一个假 U 盘启动）
+make test-usb           # USB 大容量储存只读
+make test-usb-kbd       # USB 键盘输入
+make test-usb-rw        # USB 盘上 FAT16 读写 + 挂载
+make test-usb-rw32      # FAT32 同上
 ```
 
 ## 源码地图
@@ -154,7 +158,7 @@ docs/        架构、踩坑、shell 命令、子系统文档
 | [docs/encoding.md](docs/encoding.md) | UTF-8、字库、拼音输入法 |
 | [docs/programs.md](docs/programs.md) | 用户程序(SDK) 与 int 0x30 API |
 | [docs/pci.md](docs/pci.md) | PCI 总线枚举 |
-| [docs/usb-disk.md](docs/usb-disk.md) | USB 大容量储存（只读裸盘） |
+| [docs/usb-disk.md](docs/usb-disk.md) | USB 大容量储存（读写 + FAT16/FAT32 挂载） |
 | [docs/pipes.md](docs/pipes.md) | 顺序管道实现 |
 | [docs/devices.md](docs/devices.md) | `/DEV` 设备层 |
 | [docs/font.md](docs/font.md) | 中文与字库数据 |
@@ -167,7 +171,7 @@ docs/        架构、踩坑、shell 命令、子系统文档
 - **单用户，无账户/权限体系**：隔离只有 ring 3；FAT 没有权限位。(现在有了,文档懒得更新 临时加的几句 总之有了 Super=root=SYSTEM为最高账户 密码root 剩下的我也不知道了)
 - **没有 fork/exec/信号**：程序由 shell 启动，退出回 shell；**内存级 fork + 写时复制（CoW）尚未实现**，属于 Phase 3 路线图（注：KiFS 文件系统里的 CoW 是文件数据块的写时复制，与本条不同）。(实际上有了)
 - **没有网络**：PCI 能枚举网卡，协议栈还没写。(实在是没时间 等着吧)
-- **USB 只支持 UHCI + 只读储存**，第一个 USB 设备必须是 U 盘，不支持热插拔。(这句删了...已经有了好吗?!)
+- **USB 控制器只支持 UHCI（全速 12 Mbps）**：USB2.0 高速（EHCI）/USB3（xHCI）尚未实现。大容量存储已支持读写 + FAT16/FAT32 挂载；不支持热插拔，第一个 USB 设备必须是盘（插 usb-kbd 时可当键盘用）。
 - **单核**：无 SMP；图形终端逐像素刷新，不适合高频动画游戏。
 - 真机兼容性有限（主要在 QEMU 验证）；详细清单见 [docs/known-issues.md](docs/known-issues.md)。(实在是没那么多钱买新设备做experiments了!)
 
