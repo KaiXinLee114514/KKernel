@@ -697,13 +697,14 @@ def main() -> int:
     tty_mode = "--tty" in argv              # TTY:两问向导 / ANSI 控制字符 / ASCII 降级
     login_mode = "--login" in argv          # 最小多用户:登录 / whoami / su / 信号权限
     sched_mode = "--sched" in argv          # 调度器:优先级 / 睡眠超时 / 栈增长 / 并发
+    jobctl_mode = "--jobctl" in argv        # 作业控制:fork+exec / 进程组 / jobs/fg/bg / ^C ^Z
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
                          "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc",
-                         "--tty", "--login", "--sched")]
+                         "--tty", "--login", "--sched", "--jobctl")]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -831,7 +832,7 @@ def main() -> int:
             rescan()
             return wait_has('type "help" for commands.', timeout)
 
-        if not tty_mode and not login_mode:
+        if not tty_mode and not login_mode and not jobctl_mode:
             auto_login_root()
 
         screen = mon.screen() if not graphics else []
@@ -993,6 +994,113 @@ def main() -> int:
             results.append(("并发输出不交错(A 行全 A / B 行全 B)",
                             has("concurtest: A[AAAA") and has("concurtest: B[BBBB"),
                             "concurtest: A[AAAA...] / B[BBBB...]"))
+            return report(results)
+
+        if jobctl_mode:
+            # ---- 作业控制(Phase B):fork+exec / 进程组 / jobs / fg / bg / ^C / ^Z ----
+            results = []
+
+            def jobctl_run(line: str, wait: float = 1.5) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            def jobctl_key(key: str, wait: float = 1.8) -> None:
+                # 先把 monitor 的键盘回显/积压读掉再发键:
+                # 不然 QEMU 的 monitor 写回显被堵住, 会迟迟不处理这条 sendkey
+                # (以前 MINE 的 ^C 靠 m_idle() 的抓屏顺带 drain, 所以没踩到)。
+                mon._drain()
+                mon.sendkey(key)
+                time.sleep(wait)
+                mon._drain()
+                rescan()
+
+            # 先登录(login: → root / root)
+            results.append(("开机出现 login: 提示", wait_has("login:", 15.0), "login:"))
+            mon.type_text("root")
+            mon.sendkey("ret")
+            time.sleep(1.0)
+            rescan()
+            mon.type_text("root")
+            mon.sendkey("ret")
+            time.sleep(1.2)
+            rescan()
+            results.append(("登录后 shell 就绪", wait_has('type "help" for commands.', 15.0),
+                            'type "help" for commands.'))
+
+            # ---- a) 后台:run SLEEPY.BIN & → 立刻回提示符(打印 [id] pid) ----
+            jobctl_run("run SLEEPY.BIN &", 1.0)
+            results.append(("后台作业:立刻回提示符并打印 [n] pid", has("[1] "), "[1] 5"))
+            # 0.25s 后作业退出;敲回车触发提示符前的收尸,应打印 [n] done
+            mon.sendkey("ret")
+            time.sleep(1.6)
+            rescan()
+            results.append(("后台作业结束通知 [n] done", has("[1] done"), "[1] done"))
+            jobctl_run("jobs", 1.2)
+            results.append(("jobs 显示 Done", has("Done") and has("SLEEPY.BIN"),
+                            "[1] Done ... SLEEPY.BIN"))
+
+            # ---- b) 前台 ^C:杀掉前台进程、收走作业 ----
+            jobctl_run("run HANG.BIN", 0.8)
+            jobctl_key("ctrl-c")
+            results.append(("前台 ^C:进程被杀,shell 回来", has("program was killed"),
+                            "program was killed, the kernel is fine"))
+            jobctl_run("jobs", 1.0)
+            results.append(("^C 之后作业表为空", has("jobs: no jobs"), "jobs: no jobs"))
+
+            # ---- c) ^Z 停住 → jobs Stopped → bg 后台跑 → fg 拉回 → ^C 杀掉 ----
+            jobctl_run("run HANG.BIN", 0.8)
+            jobctl_key("ctrl-z")
+            results.append(("前台 ^Z:作业被停住并通知", has("+ stopped"), "[n]+ stopped"))
+            jobctl_run("jobs", 1.2)
+            results.append(("jobs 显示 Stopped", has("Stopped") and has("HANG.BIN"),
+                            "[n] Stopped ... HANG.BIN"))
+            jobctl_run("bg", 1.2)
+            jobctl_run("jobs", 1.2)
+            results.append(("bg 后作业在后台继续", has("Running") and has("HANG.BIN"),
+                            "[n] Running ... HANG.BIN"))
+            jobctl_run("fg", 1.0)
+            jobctl_key("ctrl-c")
+            results.append(("fg 拉回前台后 ^C 杀掉", has("program was killed"),
+                            "program was killed, the kernel is fine"))
+
+            # ---- e) 普通前台 run 不受影响 ----
+            jobctl_run("run HELLO.BIN", 2.5)
+            results.append(("普通前台 run 照旧", wait_has("program returned to the shell", 15.0),
+                            "program returned to the shell"))
+
+            # ---- f) 错误路径 ----
+            jobctl_run("fg %99", 1.2)
+            results.append(("fg 不存在的作业", has("fg: no such job"), "fg: no such job"))
+            jobctl_run("bg %99", 1.2)
+            results.append(("bg 不存在的作业", has("bg: no such job"), "bg: no such job"))
+            jobctl_run("run NOSUCH.BIN", 1.6)
+            results.append(("run 不存在的程序", has("file not found"), "file not found"))
+
+            # ---- d) 两个后台进程同时输出:console_lock 串行,行不交错 ----
+            jobctl_run("run HANG.BIN &", 0.6)
+            jobctl_run("run HANG.BIN &", 0.6)
+            rescan()
+            time.sleep(3.0)
+            rescan()
+            if graphics:
+                text = "\n".join(screen_text(shot, glyphs))
+            else:
+                text = "\n".join(mon.screen())
+            spin_lines = [ln for ln in text.splitlines() if "still spinning" in ln]
+            bad = [ln for ln in spin_lines if ln.count("still spinning") != 1]
+            results.append(("后台输出串行:每行只有一份输出(共 %d 行)" % len(spin_lines),
+                            len(spin_lines) >= 2 and not bad,
+                            "每行一条 still spinning..., 不交错"))
+            jobctl_run("jobs", 1.2)
+            if graphics:
+                text = "\n".join(screen_text(shot, glyphs))
+            else:
+                text = "\n".join(mon.screen())
+            running = [ln for ln in text.splitlines() if "Running" in ln and "HANG.BIN" in ln]
+            results.append(("jobs 列出两个后台 Running 作业", len(running) >= 2,
+                            "[n] Running ... HANG.BIN 两行"))
             return report(results)
 
         if usb_mode:
