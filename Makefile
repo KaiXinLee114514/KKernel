@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-swap test-usb test-usb-kbd test-usb-rw div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -378,7 +378,7 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-tty test-login test-sched test-jobctl test-swap
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-tty test-login test-sched test-jobctl test-swap
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -398,6 +398,12 @@ test-usb-rw: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 上的 FAT16:mount/umount + 读写 U 盘 + host 侧持久化校验 ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --usb-rw
+
+# U3 加分项:同一个内核 + 同一个 blkdev/FAT 抽象,把 U 盘换成 FAT32 再跑一遍。
+test-usb-rw32: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── USB 上的 FAT32:mount/umount + 读写 U 盘 + host 侧持久化校验 ──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --usb-rw32
 
 test-fda: $(IMG)
 	@echo "── 作为软盘启动(BIOS 无 LBA,应走 CHS 退回)──"

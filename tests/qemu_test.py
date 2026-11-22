@@ -774,6 +774,107 @@ def make_usb_fat16_image(path: str, size_mib: int = 8) -> None:
         f.write(img)
 
 
+def make_usb_fat32_image(path: str, size_mib: int = 64) -> None:
+    """造一个「带 MBR 的 FAT32 U 盘镜像」(--usb-rw32 测试,对应 U3 的 FAT32 加分项)。
+
+    和 make_usb_fat16_image 同一套路,只是 BPB 换成 FAT32 格式:
+    根目录也是一条簇链(首簇 2),文件数据从簇 3 开始。
+    """
+    sector = 512
+    total = size_mib * 2048
+    part_start = 2048
+    part_secs = total - part_start
+    spc, reserved, nfats = 1, 32, 2          # FAT32 常见:32 扇区保留区
+
+    # 迭代求每份 FAT 的扇区数(FAT32 每项 4 字节)
+    fat_secs = 1
+    while True:
+        data_secs = part_secs - reserved - nfats * fat_secs
+        clusters = data_secs // spc
+        need = ((clusters + 2) * 4 + sector - 1) // sector
+        if need <= fat_secs:
+            break
+        fat_secs = need
+    clusters = (part_secs - reserved - nfats * fat_secs)// spc
+    if clusters < 65525:
+        raise ValueError(f"FAT32 簇数不足: {clusters}(得 >= 65525)")
+
+    img = bytearray(total * sector)
+    # ---- MBR ----
+    entry = (b"\x00\x00\x00\x00\x06\x00\x00\x00"
+             + part_start.to_bytes(4, "little") + part_secs.to_bytes(4, "little"))
+    img[446:462] = entry
+    img[510:512] = b"\x55\xAA"
+
+    base = part_start * sector
+    bs = bytearray(sector)
+    bs[0:3] = b"\xEB\x58\x90"
+    bs[3:11] = b"KKRNLUSB"
+    bs[11:13] = sector.to_bytes(2, "little")
+    bs[13] = spc
+    bs[14:16] = reserved.to_bytes(2, "little")
+    bs[16] = nfats
+    bs[17:19] = (0).to_bytes(2, "little")            # FAT32 根目录项数 = 0
+    bs[19:21] = (0).to_bytes(2, "little")            # FAT32 总扇区数用 32 位字段
+    bs[21] = 0xF8
+    bs[22:24] = (0).to_bytes(2, "little")            # = 0 ⇒ FAT32
+    bs[24:26] = (63).to_bytes(2, "little")
+    bs[26:28] = (255).to_bytes(2, "little")
+    bs[28:32] = part_start.to_bytes(4, "little")
+    bs[32:36] = part_secs.to_bytes(4, "little")
+    bs[36:40] = fat_secs.to_bytes(4, "little")       # 每张 FAT 的扇区数(32 位)
+    bs[40:42] = (0).to_bytes(2, "little")            # ExtFlags
+    bs[42:44] = (0).to_bytes(2, "little")            # FSVersion
+    bs[44:48] = (2).to_bytes(4, "little")            # 根目录首簇 = 2
+    bs[48:50] = (1).to_bytes(2, "little")            # FSInfo 扇区
+    bs[50:52] = (6).to_bytes(2, "little")            # 备份引导扇区
+    bs[64] = 0x80
+    bs[66] = 0x29
+    bs[67:71] = (0x4B4B5553).to_bytes(4, "little")
+    bs[71:82] = b"KKERNEL USB"
+    bs[82:90] = b"FAT32   "
+    bs[510:512] = b"\x55\xAA"
+    img[base:base + sector] = bs
+
+    # FSInfo 扇区(sector 1):内核暂时不用,但写全显得正经
+    fsi = base + sector
+    img[fsi:fsi + 4] = (0x41615252).to_bytes(4, "little")
+    img[fsi + 484:fsi + 488] = (0x61417272).to_bytes(4, "little")
+    img[fsi + 488:fsi + 492] = (0xFFFFFFFF).to_bytes(4, "little")
+    img[fsi + 492:fsi + 496] = (0xFFFFFFFF).to_bytes(4, "little")
+    img[fsi + 508:fsi + 512] = (0xAA550000).to_bytes(4, "little")
+
+    # ---- 两份相同的 FAT32:根目录簇 2、文件数据簇 3 ----
+    fat = bytearray(fat_secs * sector)
+    def fat32_set(cl: int, val: int) -> None:
+        fat[cl * 4:cl * 4 + 4] = (val & 0x0FFFFFFF).to_bytes(4, "little")
+    fat32_set(0, 0x0FFFFFF8)
+    fat32_set(1, 0x0FFFFFFF)
+    fat32_set(2, 0x0FFFFFFF)                 # 根目录簇 = EOC
+    fat32_set(3, 0x0FFFFFFF)                 # USB_HI.TXT 的数据簇 = EOC
+    fat_off = base + reserved * sector
+    for i in range(nfats):
+        img[fat_off + i * fat_secs * sector:fat_off + (i + 1) * fat_secs * sector] = fat
+
+    # 数据区起点(root_ents=0 ⇒ 紧跟 FAT 之后)
+    data_lba = fat_off // sector + nfats * fat_secs
+    data = USB_RW_INIT_TEXT
+    root_off = (data_lba + (2 - 2) * spc) * sector
+    ent = bytearray(32)
+    ent[0:8] = b"USB_HI  "
+    ent[8:11] = b"TXT"
+    ent[11] = 0x20
+    ent[26:28] = (3).to_bytes(2, "little")           # 首簇低 16 位
+    ent[20:22] = (0).to_bytes(2, "little")           # 首簇高 16 位
+    ent[28:32] = len(data).to_bytes(4, "little")
+    img[root_off:root_off + 32] = ent
+    data_off = (data_lba + (3 - 2) * spc) * sector
+    img[data_off:data_off + len(data)] = data
+
+    with open(path, "wb") as f:
+        f.write(img)
+
+
 def _mbr_fat_part_lba(raw: bytes) -> int:
     """从 MBR 里找第一个 FAT 分区的起始 LBA;没有就返回 0。"""
     for i in range(4):
@@ -821,7 +922,7 @@ def _fat_walk_issues(fs) -> list:
     return issues
 
 
-def check_usb_fat16_image(path: str) -> list:
+def check_usb_fat_image(path: str, want_fat32: bool = False) -> list:
     """--usb-rw 离线校验:用**独立**的 Python FAT 解析器读 U 盘镜像,
     证明内核的 write/cp/mkdir/rm 真的写到了盘上(而不是只在内存里骗自己)。"""
     results: list = []
@@ -834,7 +935,8 @@ def check_usb_fat16_image(path: str) -> list:
     results.append(("离线:U 盘镜像仍是 MBR + FAT 分区", True, f"分区起点 LBA {plba}"))
 
     fs = Fat16(path, plba)
-    results.append(("离线:U 盘分区确实是 FAT16", not fs.fat32,
+    want = "FAT32" if want_fat32 else "FAT16"
+    results.append((f"离线:U 盘分区确实是 {want}", fs.fat32 == want_fat32,
                     f"每 FAT 扇区数={fs.fat_sectors},每簇扇区数={fs.spc}"))
 
     def content_of(name: str) -> bytes:
@@ -885,6 +987,7 @@ def main() -> int:
     usb_mode = "--usbdisk" in argv          # USB 大容量储存:QEMU 挂一个假 U 盘
     usb_kbd_mode = "--usb-kbd" in argv      # USB 键盘:QEMU 只插 usb-kbd(PS/2 收不到 sendkey)
     usb_rw_mode = "--usb-rw" in argv        # USB 上的 FAT16:mount/umount + 读写 U 盘 + host 侧校验
+    usb_rw32_mode = "--usb-rw32" in argv      # 同上但 U 盘镜像用 FAT32(U3 加分项)
     mine_mode = "--mine" in argv            # 扫雷(BIN/MINE.BIN):菜单/棋盘/光标/旗子/退出
     proc_mode = "--proc" in argv            # 进程地基:ps/fork/wait/exit/kill/信号三元组
     tty_mode = "--tty" in argv              # TTY:两问向导 / ANSI 控制字符 / ASCII 降级
@@ -901,7 +1004,7 @@ def main() -> int:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
-                         "--fontdisk", "--fat32", "--usbdisk", "--usb-kbd", "--usb-rw",
+                         "--fontdisk", "--fat32", "--usbdisk", "--usb-kbd", "--usb-rw", "--usb-rw32",
                          "--mine", "--proc",
                          "--tty", "--login", "--sched", "--jobctl",
                          "--swap", "--swap-cold")]
@@ -934,12 +1037,14 @@ def main() -> int:
     # USB 大容量储存测试:挂一个 usb-storage 设备,里面是已知内容的假 U 盘
     usb_args: list = []
     usb_img = None
-    if usb_mode or usb_rw_mode:
+    if usb_mode or usb_rw_mode or usb_rw32_mode:
         usb_img = os.path.join(tempfile.gettempdir(), f"kkernel-usbstick-{os.getpid()}.img")
         if usb_mode:
             make_usb_stick_image(usb_img)          # 只读裸盘探测用的假 U 盘
-        else:
+        elif usb_rw_mode:
             make_usb_fat16_image(usb_img, 8)       # U3 读写测试:带 MBR 的 FAT16 文件系统
+        else:
+            make_usb_fat32_image(usb_img, 64)      # U3 加分项:FAT32 文件系统
         usb_args = ["-device", "usb-storage,drive=kkstick",
                     "-drive", f"if=none,id=kkstick,format=raw,file={usb_img}"]
     # USB 键盘测试:只插 usb-kbd(不插 PS/2 之外的键盘)。QEMU 一旦有 USB 键盘,
@@ -1351,12 +1456,14 @@ def main() -> int:
                             "swap: enabled ... used<=1(极端时序可能残留 1 槽,--swap 已知限制)"))
             return report(results)
 
-        if usb_rw_mode:
+        if usb_rw_mode or usb_rw32_mode:
             # ---- USB 上的 FAT16(U3):mount → 读写 U 盘 → umount → host 侧校验持久化 ----
             # 镜像里预置了一个 FAT16 分区(USB_HI.TXT);内核切到 USB 块设备后,
             # shell 的 ls/cat/write/cp/mkdir/rm 应该直接操作 U 盘;umount 后回到 ATA。
             results: list = []
             time.sleep(1.0)
+            want = "FAT32" if usb_rw32_mode else "FAT16"
+            total_sectors = 131072 if usb_rw32_mode else 16384
 
             def rw_run(line: str, timeout: float = 15.0, expect: str | None = None) -> None:
                 """敲一条命令;给了 expect 就等它出现在屏幕上(比死等固定秒数稳)。"""
@@ -1377,9 +1484,9 @@ def main() -> int:
             results.append(("挂载前 FAT 设备是 ATA", has("not mounted (FAT device: ATA)"),
                             "usbdisk: status: not mounted (FAT device: ATA)"))
 
-            rw_run("usbdisk mount", timeout=20.0, expect="mounted FAT16 at LBA 2048")
-            results.append(("mount:U 盘 FAT16 挂载成功", has("mounted FAT16 at LBA 2048"),
-                            "usbdisk: mounted FAT16 at LBA 2048, 16384 sectors"))
+            rw_run("usbdisk mount", timeout=20.0, expect=f"mounted {want} at LBA 2048")
+            results.append((f"mount:U 盘 {want} 挂载成功", has(f"mounted {want} at LBA 2048"),
+                            f"usbdisk: mounted {want} at LBA 2048, {total_sectors} sectors"))
             rw_run("ls", expect="USB_HI.TXT")
             results.append(("mount 后 ls 看到的是 U 盘根目录", has("USB_HI.TXT"),
                             "ls 输出里有 USB_HI.TXT"))
@@ -1412,9 +1519,9 @@ def main() -> int:
             results.append(("umount 后 ls 又看到 ATA 根目录", has("BIN") and not has("USB_HI.TXT"),
                             "ATA 根目录有 BIN,且已经没有 USB_HI.TXT"))
 
-            rw_run("usbdisk mount", timeout=20.0, expect="mounted FAT16 at LBA 2048")
-            results.append(("重新 mount 成功", has("mounted FAT16 at LBA 2048"),
-                            "usbdisk: mounted FAT16 at LBA 2048, 16384 sectors"))
+            rw_run("usbdisk mount", timeout=20.0, expect=f"mounted {want} at LBA 2048")
+            results.append((f"重新 mount 成功", has(f"mounted {want} at LBA 2048"),
+                            f"usbdisk: mounted {want} at LBA 2048, {total_sectors} sectors"))
             rw_run("clear")
             rw_run("ls", expect="NEW.TXT")
             results.append(("重新 mount 后 U 盘内容还在(NEW.TXT / USBDIR)",
@@ -1434,7 +1541,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 qemu.kill()
             time.sleep(0.3)
-            results += check_usb_fat16_image(usb_img)
+            results += check_usb_fat_image(usb_img, want_fat32=usb_rw32_mode)
             results.append(("ATA 磁盘镜像在 mount/umount 期间一字节未变",
                             open(img, "rb").read() == hd_before,
                             "USB 文件系统操作没有误写内部 ATA 盘"))
