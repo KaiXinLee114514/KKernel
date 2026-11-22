@@ -78,6 +78,7 @@ evt_log:
 ; ============================================================================
 rc_load:
     pushad
+    call fs_lock                        ; 本函数直接读 FAT/ATA 全局状态,自己上锁
     mov eax, [fat_dir]                  ; 读完要把"当前目录"还给 shell(别让它停在 SYS)
     mov [rc_saved_dir], eax
     mov dword [rc_ok], 0
@@ -109,6 +110,7 @@ rc_load:
     call rc_print_boot
     mov eax, [rc_saved_dir]
     mov [fat_dir], eax
+    call fs_unlock
     popad
     ret
 

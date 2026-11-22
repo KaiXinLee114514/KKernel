@@ -5008,7 +5008,10 @@ cmd_style:
 
 ; ---- A4:哪些命令碰文件系统(分派时自动加 fs 锁)----
 fs_cmd_names    dd n_ls, n_cat, n_write, n_cp, n_mv, n_rm, n_mkdir, n_rmdir
-                dd n_cd, n_info, n_rc, 0
+                dd n_cd, n_info, 0
+; ★ rc 不在这里:rc start 要 fork/exec 子进程,子进程 exec 时会拿 fs 锁,
+;   外层若还捏着 fs 锁就会父等子、子等父死锁(2026-11-22 回归 hang 的根因)。
+;   rc 自己碰 FAT 的路径(rc_load)内部自行加锁。
 disp_word       dd 0                    ; 分派时暂存:命令词指针
 disp_len        dd 0                    ; 命令词长度
 disp_handler    dd 0                    ; 命令处理函数

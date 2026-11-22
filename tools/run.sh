@@ -75,7 +75,9 @@ fi
 # 镜像没构建(或源码更新了)就先构建
 make -s "$IMG"
 
-CMD=("$QEMU_BIN" -m "${QEMU_MEM:-1024}" "${DRIVE[@]}")
+# -rtc base=localtime:QEMU 默认把 CMOS 时钟设成 UTC,guest 里 date 会比墙上钟少 8 小时(UTC+8)。
+# Makefile 的 run/hd/hd32 目标也带这个参数;测试台(qemu_test.py)故意不加,它按 UTC 断言。
+CMD=("$QEMU_BIN" -m "${QEMU_MEM:-1024}" -rtc base=localtime "${DRIVE[@]}")
 [ -n "${QEMU_DISPLAY:-}" ] && CMD+=(-display "$QEMU_DISPLAY")
 [ ${#EXTRA[@]} -gt 0 ] && CMD+=("${EXTRA[@]}")
 
