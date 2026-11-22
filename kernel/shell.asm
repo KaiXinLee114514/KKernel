@@ -3054,7 +3054,7 @@ cmd_run:
     ja .toobig
     mov [run_prog_size], eax
     ; ---- 作业载荷:一页,偏移 0 = 名字(≤63B),偏移 64 = 参数(≤2048B) ----
-    mov eax, 1
+    mov ecx, 1                          ; ★ pmem_alloc_pages 的页数在 ecx(这里曾误写 eax,按残留 ecx 分配,泄漏 53 页)
     call pmem_alloc_pages
     test eax, eax
     jz .nomem

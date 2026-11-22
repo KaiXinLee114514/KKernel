@@ -159,6 +159,7 @@ process_clear_tcb:
 process_fork:
     pushad
     mov [pf_frame], ebx
+    mov dword [pf_cow_marked], 0        ; 失败回滚用:窗口 COW/stage 引用加过了没
 
     ; ---- 0) 快照父进程的关键字段(后面几次函数调用会毁寄存器)----
     call process_cur_tcb
@@ -293,6 +294,7 @@ process_fork:
     dec ecx
     jnz .stage_inc
 .no_stage:
+    mov dword [pf_cow_marked], 1        ; 现在失败必须回滚这些引用
 
     ; ---- 7.5) 子进程的 guard 页:单独给一页(不和父进程共享)----
     ;   两边空间各自收摊,free_window 各还各的页;共享会变成双重释放。
@@ -431,8 +433,37 @@ process_fork:
     mov eax, [pf_result]
     ret
 
-    ; ---- 失败:把已经拿到的页按相反顺序还回去 ----
+    ; ---- 失败:先撤销已经加过的共享引用,再把拿到的页按相反顺序还回去 ----
 .fail_all:
+    cmp dword [pf_cow_marked], 0
+    je .fa_free
+    ; 窗口页:标 COW 时每页 pmem_ref_inc 过,这里各 pmem_free 一次减回去
+    ; (引用计数感知:还有别的地址空间引用就只减不还;父 PTE 保持 COW 也不会
+    ;  错,下次写会照常触发复制)。guard 页不参与 COW,跳过。
+    mov esi, [pf_parent_pt]
+    mov ebx, (SPACE_IMG_VA >> 12) & 0x3FF
+    mov ecx, [pf_parent_tcb]
+    mov ecx, [ecx + TCB_SP_WINDOWPAGES]
+.fa_cow_undo:
+    cmp ebx, [pf_guard_idx]
+    je .fa_cow_next
+    mov eax, [esi + ebx * 4]
+    test eax, PAGE_P
+    jz .fa_cow_next
+    and eax, 0xFFFFF000
+    call pmem_free
+.fa_cow_next:
+    inc ebx
+    dec ecx
+    jnz .fa_cow_undo
+    ; 镜像暂存区:fork 时也每页 +1,这里用引用计数感知的 pmem_free_pages 减回
+    mov esi, [pf_parent_tcb]
+    mov eax, [esi + TCB_SP_STAGE_PA]
+    mov ecx, [esi + TCB_SP_STAGE_PAGES]
+    test eax, eax
+    jz .fa_free
+    call pmem_free_pages
+.fa_free:
     mov eax, [pf_child_pt]
     call pmem_free
     mov eax, [pf_child_pd]
@@ -707,7 +738,20 @@ process_terminate:
     cmp eax, ST_ALIVE
     je .alive
     cmp eax, ST_STOPPED
+    je .alive
+    cmp eax, ST_SLEEPING
     jne .deny
+    ; ---- 睡着的进程:先把它从睡眠态摘出来,再走普通收尸路径 ----
+    ;   不能只 sched_wakeup:唤醒会把它放回就绪队列,IRQ0 可能在我们标僵尸
+    ;   之前就调度到它。这里直接转成 ST_STOPPED(不在就绪队列、调度器不挑),
+    ;   后面 .zombie 路径看到 state != ALIVE 就不会再去摘一次队列。
+    ;   无父的内核线程睡着时维持原语义(收尸路径假设它有父进程 wait)。
+    cmp dword [edx + TCB_PARENT], 0
+    je .deny
+    mov dword [edx + TCB_STATE], ST_STOPPED
+    mov dword [edx + TCB_WCHAN], 0
+    mov dword [edx + TCB_SLEEPTICKS], 0
+    mov dword [edx + TCB_SLEEPFLAG], 0
 .alive:
     ; 算槽号:(tcb - tcb_table) / TCB_SIZE
     mov eax, edx
@@ -1592,6 +1636,7 @@ pf_child_guard_pa dd 0                  ; 子进程自己那页 guard
 pf_child_pd     dd 0
 pf_child_pt     dd 0
 pf_child_frame  dd 0
+pf_cow_marked   dd 0                    ; fork 失败回滚:窗口 COW/stage 引用已加
 pf_result       dd 0
 
 pw_pid          dd 0

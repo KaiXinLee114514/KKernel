@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 196               ; 每个 TCB 196 字节(A2/A3+B+C:身份/优先级/睡眠/进程组/大堆,见 /4、imul)
+TCB_SIZE          equ 200               ; 每个 TCB 200 字节(A2/A3+B+C:身份/优先级/睡眠/进程组/大堆,见 /4、imul)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -109,7 +109,9 @@ TCB_KBWAIT        equ 192               ; 1 = 正阻塞在 getkey/getchar(交互
 ; ---- C(Phase C swap):用户大匿名堆的 brk ----
 ;   USER_HEAP_VA 起按需映射的大块匿名内存;UBRK = 下次分配的起点(0/未用 = 从
 ;   USER_HEAP_VA 开始)。fork 不继承大堆(子进程的 UBRK 重置)。
-TCB_UBRK          equ 192               ; 大匿名堆的 brk
+; ★ 曾经踩过:UBRK 和 TCB_KBWAIT 都写 192,getchar 置/清 KBWAIT 时顺手把 brk
+;   冲掉(重发已分配的 VA / 退出时大堆整块泄漏)。加字段时务必别和 192 撞。
+TCB_UBRK          equ 196               ; 大匿名堆的 brk
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))

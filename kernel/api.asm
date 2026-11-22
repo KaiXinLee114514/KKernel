@@ -77,32 +77,33 @@ api_stub:
     mov fs, ax
     mov gs, ax
     mov eax, ebp                        ; 恢复功能号
-    ; ★ 保存程序原来的 EBX / ESI:只有"确实用它们返回数据"的功能(11 屏幕尺寸、
-    ;   12 取参数)才允许改;其余功能必须原样还回去 —— 否则编译器把值放在
-    ;   EBX/ESI 里的代码(比如 SWAPTEST 在 fork 之后 EBX 还存着子 pid)会被
-    ;   内核的中间实现污掉,程序拿到垃圾参数。
-    mov [api_func], eax
-    mov [api_orig_ebx], ebx
-    mov [api_orig_esi], esi
+    ; ★ 功能号必须存在**本线程的栈上**,不能放全局:
+    ;   本中断可能在里面睡眠(wait/getchar/sleep),此时别的线程又会进来把
+    ;   全局冲掉;睡醒后再读全局就会拿错功能号/错寄存器恢复 —— 真踩过:
+    ;   fork+wait 之后程序的 EBX/ESI 变成别的线程的垃圾(PRIO 第二个 wait
+    ;   拿到垃圾 pid、TCC 跑 static ELF 后 shell 卡死都是这一类)。
+    push eax                            ; [esp] = 本线程的功能号
     call api_dispatch
-    cmp dword [api_func], 11
-    je .wb_ok
-    cmp dword [api_func], 12
-    je .wb_ok
-    mov ebx, [api_orig_ebx]
-    mov esi, [api_orig_esi]
-.wb_ok:
+    ; 返回值写回 pushad 帧的 eax 槽。此刻 [esp]=功能号槽,往上依次是
+    ; gs/fs/es/ds 四个段槽,再 +20 才是 pushad 帧基址,帧内 eax 在 +28。
+    mov [esp + 20 + 28], eax
+    pop edx                             ; 取回本线程的功能号(EDX 待会儿 popad 恢复)
     pop gs
     pop fs
     pop es
     pop ds
-    ; ★ 把返回值写回"待会儿 popad 要还给程序的那三个槽位"。
-    ;   pushad 压栈顺序是 eax,ecx,edx,ebx,esp,ebp,esi,edi(edi 在栈顶),
-    ;   所以 popad 读的是 [esp+0]=edi [esp+4]=esi [esp+8]=ebp [esp+16]=ebx [esp+28]=eax。
-    ;   不写回去的话,程序调用 int 0x30 拿不到任何返回值。
-    mov [esp + 28], eax                 ; 返回值:对 eax
-    mov [esp + 16], ebx                 ;          ebx
-    mov [esp + 4], esi                  ;          esi
+    ; ★ 只有"确实用 EBX/ESI 返回数据"的功能(11 屏幕尺寸、12 取参数)才改
+    ;   pushad 帧里的槽;其余功能不写 —— popad 会自然恢复程序原值。
+    cmp edx, 11
+    je .wb_ebx
+    cmp edx, 12
+    jne .wb_done
+.wb_ebx:
+    mov [esp + 16], ebx                 ; pushad 帧的 ebx 槽
+    mov [esp + 4], esi                  ; pushad 帧的 esi 槽
+.wb_done:
+    ; pushad 压栈顺序是 eax,ecx,edx,ebx,esp,ebp,esi,edi(edi 在栈顶),
+    ; popad 读的是 [esp+0]=edi [esp+4]=esi ... [esp+16]=ebx ... [esp+28]=eax。
     popad
     iret
 
@@ -378,7 +379,7 @@ api_install:
 ; ---- 18 fork():复制当前进程的地址空间(写时复制),子进程也回到 ring 3 ----
 ;  ebx = api_stub 的栈帧基址(那里存着程序的 pushad 现场和 iret 帧)
 api_h_fork:
-    lea ebx, [esp + 20]                 ; 20 = api_dispatch 返回地址 4 + 4 个段寄存器 16
+    lea ebx, [esp + 24]                 ; 24 = 返回地址 4 + 功能号槽 4 + 4 个段寄存器 16
     call process_fork
     ret
 
@@ -546,6 +547,4 @@ api_max     dd 0
 api_saved_dir dd 0                      ; 文件 API 调用前的 [fat_dir](调完恢复)
 
 ; --- api_stub 的寄存器保存(Phase C:防止 EBX/ESI 被中间实现污掉)---
-api_func        dd 0
-api_orig_ebx    dd 0
-api_orig_esi    dd 0
+; (api_stub 不再用跨线程全局保存功能号,见其注释)
