@@ -72,6 +72,35 @@ jobctl_key_allowed:
 ;    出:CF=1 已消费(不要再进缓冲) / CF=0 照常进缓冲(eax/al 原样保留)
 ;    警告:必须保留 eax——调用方 kbd_push 还指着 al 存字符呢!
 ; ---------------------------------------------------------------------------
+jobctl_fg_running:
+    push ecx
+    push edx
+    xor ecx, ecx
+    mov edx, tcb_table
+.loop:
+    cmp ecx, SCHED_MAX
+    jae .none
+    cmp dword [edx + TCB_STATE], ST_EMPTY
+    je .next
+    mov eax, [edx + TCB_PGRP]
+    cmp eax, [tty_fg_pgrp]
+    jne .next
+    cmp dword [edx + TCB_SP_RUNNING], 0
+    je .next
+    mov eax, edx
+    pop edx
+    pop ecx
+    ret
+.next:
+    add edx, TCB_SIZE
+    inc ecx
+    jmp .loop
+.none:
+    xor eax, eax
+    pop edx
+    pop ecx
+    ret
+
 jobctl_kbd_filter:
     push eax
     push ebx
@@ -86,24 +115,26 @@ jobctl_kbd_filter:
     mov ebx, [tty_fg_pgrp]
     cmp ebx, SHELL_PGRP
     je .pass                            ; shell 自己跑内置命令:^C 只清行
+    ; 注意:当前被中断的线程不一定是前台作业(别的 shell 线程也在轮转,
+    ; 前台作业可能正处于被抢占状态)——必须按**进程组**去扫 TCB,
+    ; 不能把 space_cur 当作目标(踩过:^C 十次有八次落在别的 shell 上,全丢)。
+    call jobctl_fg_running
+    test eax, eax
+    jz .consumed                        ; 前台组里没有 ring3 程序在跑:吃掉按键
     ; 前台作业最近 1 秒(100 tick)读过键盘 = 交互程序,^C 交给它自己处理
-    call process_cur_tcb
     mov ecx, [pit_ticks]
     sub ecx, [eax + TCB_KBUSY]
     cmp ecx, 100
     jb .pass
-    mov eax, [space_cur]                ; 当前 ring3 线程的 TCB
-    cmp dword [eax + TCB_SP_RUNNING], 0
-    je .pass
     mov dword [eax + TCB_SP_KILLREQ], 1 ; IRQ0 在它自己的现场上收摊
     jmp .consumed
 .stop:
     mov ebx, [tty_fg_pgrp]
     cmp ebx, SHELL_PGRP
     je .pass                            ; shell 自己:^Z 当普通按键(忽略)
-    mov eax, [space_cur]
-    cmp dword [eax + TCB_SP_RUNNING], 0
-    je .pass
+    call jobctl_fg_running
+    test eax, eax
+    jz .consumed
     mov dword [eax + TCB_STOPREQ], 1    ; IRQ0 里标 STOPPED + 唤醒父 shell
     jmp .consumed
 .pass:

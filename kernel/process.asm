@@ -581,10 +581,10 @@ process_wait2:
     jne .child_next
     mov eax, [pw_pid]
     cmp eax, -1
-    je .sleep
+    je .have_child
     lea ecx, [esi + 1]
     cmp eax, ecx
-    je .sleep
+    je .have_child
 .child_next:
     inc esi
     cmp esi, SCHED_MAX

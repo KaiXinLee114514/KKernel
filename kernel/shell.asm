@@ -102,6 +102,7 @@ shell_main:
 ; ---------------------------------------------------------------------------
 shell_print_prompt:
     pushad
+    call shell_job_scan                    ; 提示符前收尸:打印 [n] done / stopped
     cmp dword [sh_style], 4
     je .kao
     cmp dword [sh_style], 3
@@ -2491,6 +2492,434 @@ str_same_path:
 ;    搬到恒等映射顶部了,这个静态上限只是保守值)。
 ; ---------------------------------------------------------------------------
 ; ===========================================================================
+;  作业表(Phase B):shell 记住自己 fork 出去、还没收尸的后台/停止子进程
+;    状态:0=空 1=Running 2=Stopped 3=Done(jobs 里显示一次后清掉);id 单调递增
+;    表是全局的(4 条 shell 共享),上限 SH_JOBS;满了打印 "jobs: table full"。
+;    后台进程读 tty 的策略见 kernel/jobctl.asm 的 jobctl_key_allowed(给 EOF)。
+; ===========================================================================
+; shell_job_add:登记作业。入:eax=pid, ebx=pgrp, esi=名字;出:eax=id,-1=表满
+shell_job_add:
+    pushad
+    mov [jb_pid], eax
+    mov [jb_pgrp], ebx
+    mov [jb_name], esi
+    xor ecx, ecx
+.find:
+    cmp ecx, SH_JOBS
+    jae .full
+    cmp dword [job_state + ecx*4], 0
+    je .got
+    inc ecx
+    jmp .find
+.got:
+    mov [jb_slot], ecx
+    mov eax, [job_next]
+    mov [jb_id], eax
+    inc dword [job_next]
+    mov [job_id + ecx*4], eax
+    mov eax, [jb_pid]
+    mov [job_pid + ecx*4], eax
+    mov eax, [jb_pgrp]
+    mov [job_pgrp + ecx*4], eax
+    mov dword [job_state + ecx*4], 1
+    mov edi, ecx
+    shl edi, 4
+    add edi, job_name
+    mov esi, [jb_name]
+    mov ecx, 15
+.name:
+    mov al, [esi]
+    test al, al
+    jz .name_done
+    mov [edi], al
+    inc esi
+    inc edi
+    dec ecx
+    jnz .name
+.name_done:
+    mov byte [edi], 0
+    mov eax, [jb_id]
+    mov [jb_ret], eax
+    jmp .out
+.full:
+    mov dword [jb_ret], -1
+.out:
+    popad
+    mov eax, [jb_ret]
+    ret
+
+; shell_job_find:按 id 找槽。入:eax=id;出:eax=槽号 / -1
+shell_job_find:
+    pushad
+    mov [jb_id], eax
+    xor ecx, ecx
+.loop:
+    cmp ecx, SH_JOBS
+    jae .none
+    cmp dword [job_state + ecx*4], 0
+    je .next
+    mov eax, [jb_id]
+    cmp [job_id + ecx*4], eax
+    jne .next
+    mov [jb_ret], ecx
+    jmp .out
+.next:
+    inc ecx
+    jmp .loop
+.none:
+    mov dword [jb_ret], -1
+.out:
+    popad
+    mov eax, [jb_ret]
+    ret
+
+; shell_job_last:最近一个作业(按 id 最大)的槽号。出:eax=槽号 / -1
+shell_job_last:
+    pushad
+    mov dword [jb_ret], -1
+    mov dword [jb_id], 0
+    xor ecx, ecx
+.loop:
+    cmp ecx, SH_JOBS
+    jae .out
+    cmp dword [job_state + ecx*4], 0
+    je .next
+    mov eax, [job_id + ecx*4]
+    cmp eax, [jb_id]
+    jbe .next
+    mov [jb_id], eax
+    mov [jb_ret], ecx
+.next:
+    inc ecx
+    jmp .loop
+.out:
+    popad
+    mov eax, [jb_ret]
+    ret
+
+; shell_job_notify_prefix:按 [jb_slot] 打印 "[<id>]"
+shell_job_notify_prefix:
+    pushad
+    mov al, COL_OK
+    call term_set_color
+    mov al, '['
+    call term_putc
+    mov ecx, [jb_slot]
+    mov eax, [job_id + ecx*4]
+    call term_print_dec
+    mov al, ']'
+    call term_putc
+    popad
+    ret
+
+; shell_job_notify_done / _stopped:按 [jb_slot] 打印通知
+shell_job_notify_done:
+    pushad
+    call shell_job_notify_prefix
+    mov al, COL_HEADER
+    call term_set_color
+    mov esi, msg_job_done
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+
+shell_job_notify_stopped:
+    pushad
+    call shell_job_notify_prefix
+    mov al, COL_HEADER
+    call term_set_color
+    mov esi, msg_job_stopped
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+
+; shell_job_table_full:统一的 "jobs: table full" 报错
+shell_job_table_full:
+    pushad
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_jobs_full
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    popad
+    ret
+
+; shell_job_scan:提示符前扫一遍作业,收尸 + 通知(done / stopped)
+shell_job_scan:
+    pushad
+    mov dword [jb_slot], 0
+.loop:
+    mov ecx, [jb_slot]
+    cmp ecx, SH_JOBS
+    jae .out
+    mov eax, [job_state + ecx*4]
+    test eax, eax
+    jz .next
+    cmp eax, 3
+    je .next                            ; Done:留给 jobs 显示
+    cmp eax, 2
+    je .next                            ; 已经是 Stopped:不重复查/报
+    mov eax, [job_pid + ecx*4]
+    mov ebx, WT_WNOHANG | WT_WUNTRACED
+    call process_wait2
+    cmp eax, 0
+    je .event
+    cmp eax, -1
+    jne .next
+    ; 子进程已不在(被别的路径收掉了):静默清槽
+    mov ecx, [jb_slot]
+    mov dword [job_state + ecx*4], 0
+    jmp .next
+.event:
+    mov ecx, [jb_slot]
+    cmp dword [proc_wait_status], 1
+    je .stopped
+    mov dword [job_state + ecx*4], 3    ; 3 = Done
+    call shell_job_notify_done
+    jmp .next
+.stopped:
+    mov dword [job_state + ecx*4], 2    ; 2 = Stopped
+    call shell_job_notify_stopped
+.next:
+    inc dword [jb_slot]
+    jmp .loop
+.out:
+    popad
+    ret
+
+; cmd_jobs:列出作业;Done 的显示一次后清掉
+cmd_jobs:
+    call shell_job_scan
+    mov dword [jb_count], 0
+    mov dword [jb_slot], 0
+.count:
+    mov ecx, [jb_slot]
+    cmp ecx, SH_JOBS
+    jae .count_done
+    cmp dword [job_state + ecx*4], 0
+    je .count_next
+    inc dword [jb_count]
+.count_next:
+    inc dword [jb_slot]
+    jmp .count
+.count_done:
+    cmp dword [jb_count], 0
+    jne .list_start
+    mov al, COL_NORMAL
+    call term_set_color
+    mov esi, msg_jobs_empty
+    call term_print
+    ret
+.list_start:
+    mov dword [jb_slot], 0
+.list:
+    mov ecx, [jb_slot]
+    cmp ecx, SH_JOBS
+    jae .out
+    mov eax, [job_state + ecx*4]
+    test eax, eax
+    jz .next
+    ; "[id] "
+    mov al, COL_OK
+    call term_set_color
+    mov al, '['
+    call term_putc
+    mov ecx, [jb_slot]
+    mov eax, [job_id + ecx*4]
+    call term_print_dec
+    mov al, ']'
+    call term_putc
+    mov al, ' '
+    call term_putc
+    ; 状态名
+    mov al, COL_NORMAL
+    call term_set_color
+    mov ecx, [jb_slot]
+    mov eax, [job_state + ecx*4]
+    cmp eax, 1
+    je .st_run
+    cmp eax, 2
+    je .st_stop
+    mov esi, msg_job_state_done
+    jmp .st_have
+.st_run:
+    mov esi, msg_job_state_run
+    jmp .st_have
+.st_stop:
+    mov esi, msg_job_state_stop
+.st_have:
+    call term_print
+    ; pid / pgrp / 名字
+    mov esi, msg_jobs_pid
+    call term_print
+    mov ecx, [jb_slot]
+    mov eax, [job_pid + ecx*4]
+    call term_print_dec
+    mov esi, msg_jobs_pgrp
+    call term_print
+    mov ecx, [jb_slot]
+    mov eax, [job_pgrp + ecx*4]
+    call term_print_dec
+    mov esi, msg_jobs_gap
+    call term_print
+    mov ecx, [jb_slot]
+    shl ecx, 4
+    add ecx, job_name
+    mov esi, ecx
+    call term_print
+    mov al, 10
+    call term_putc
+    ; Done 显示过一次就清掉
+    mov ecx, [jb_slot]
+    cmp dword [job_state + ecx*4], 3
+    jne .next
+    mov dword [job_state + ecx*4], 0
+.next:
+    inc dword [jb_slot]
+    jmp .list
+.out:
+    mov al, COL_NORMAL
+    call term_set_color
+    ret
+
+; shell_job_find_arg:从 [cmd_arg] 解析作业号(fg / fg %3 / fg 3;空=最近一个)
+;   出:eax=槽号 / -1
+shell_job_find_arg:
+    pushad
+    mov esi, [cmd_arg]
+.skip:
+    cmp byte [esi], ' '
+    jne .pct
+    inc esi
+    jmp .skip
+.pct:
+    cmp byte [esi], '%'
+    jne .digit
+    inc esi
+.digit:
+    mov al, [esi]
+    cmp al, '0'
+    jb .empty
+    cmp al, '9'
+    ja .empty
+    xor eax, eax
+.parse:
+    movzx edx, byte [esi]
+    sub edx, '0'
+    imul eax, eax, 10
+    add eax, edx
+    inc esi
+    mov dl, [esi]
+    cmp dl, '0'
+    jb .got
+    cmp dl, '9'
+    ja .got
+    jmp .parse
+.got:
+    call shell_job_find
+    mov [jb_ret], eax
+    jmp .out
+.empty:
+    call shell_job_last
+    mov [jb_ret], eax
+.out:
+    popad
+    mov eax, [jb_ret]
+    ret
+
+; cmd_fg:把(停住的)作业拉回前台:恢复、tty 前台交给它的进程组、等它
+cmd_fg:
+    call shell_job_find_arg
+    cmp eax, -1
+    jne .go
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_fg_nosuch
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    ret
+.go:
+    mov [jb_slot], eax
+    mov ecx, eax
+    cmp dword [job_state + ecx*4], 2
+    jne .no_cont
+    mov eax, [job_pid + ecx*4]
+    mov ebx, 0x00040000                 ; super:cont:0
+    call process_signal_send_kernel
+.no_cont:
+    mov ecx, [jb_slot]
+    mov dword [job_state + ecx*4], 1    ; 1 = Running
+    mov eax, [job_pgrp + ecx*4]
+    call tty_setpgrp
+.wait:
+    mov ecx, [jb_slot]
+    mov eax, [job_pid + ecx*4]
+    mov ebx, WT_WUNTRACED
+    call process_wait2
+    mov ecx, [jb_slot]
+    cmp dword [proc_wait_status], 1
+    je .stopped
+    ; 退出:通知 done、清槽、前台还给 shell
+    mov eax, SHELL_PGRP
+    call tty_setpgrp
+    mov ecx, [jb_slot]
+    mov dword [job_state + ecx*4], 0
+    call shell_job_notify_done
+    ret
+.stopped:
+    mov dword [job_state + ecx*4], 2
+    mov eax, SHELL_PGRP
+    call tty_setpgrp
+    call shell_job_notify_stopped
+    ret
+
+; cmd_bg:让停住的作业在后台继续
+cmd_bg:
+    call shell_job_find_arg
+    cmp eax, -1
+    jne .go
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_bg_nosuch
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    ret
+.go:
+    mov [jb_slot], eax
+    mov ecx, eax
+    cmp dword [job_state + ecx*4], 1
+    je .running
+    mov eax, [job_pid + ecx*4]
+    mov ebx, 0x00040000                 ; super:cont:0
+    call process_signal_send_kernel
+    mov ecx, [jb_slot]
+    mov dword [job_state + ecx*4], 1    ; 1 = Running
+    call shell_job_notify_prefix
+    mov al, ' '
+    call term_putc
+    mov ecx, [jb_slot]
+    mov eax, [job_pid + ecx*4]
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    ret
+.running:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_bg_already
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    ret
+
+; ===========================================================================
 ;  run <文件> [参数]:把程序作为**前台子进程**跑
 ;
 ;  Phase B 起,run 不再是"shell 线程自己 iret 进 ring3",而是:
@@ -2513,6 +2942,7 @@ cmd_run:
     mov [cmd_saved_dir], eax
     ; ---- 装载锁:解析/prog 名字校验/建 bundle/spawn 这一段用的都是全局缓冲 ----
     call loader_lock
+    mov dword [run_background], 0
     ; ★ 这里**不能**调 strip_name(它会把第一个空格改 0,参数就没了)
     mov esi, [cmd_arg]
     cmp byte [esi], 0
@@ -2576,11 +3006,48 @@ cmd_run:
     mov byte [edi + 3], 'N'
     mov byte [edi + 4], 0
 .have_name:
+    ; ---- 参数末尾的 '&' = 后台作业(POSIX shell 的 & 一个意思) ----
+    mov esi, PROG_ARG_STR
+    xor ecx, ecx
+.bg_len:
+    cmp byte [esi + ecx], 0
+    je .bg_trim
+    inc ecx
+    jmp .bg_len
+.bg_trim:
+    test ecx, ecx
+    jz .bg_done
+    dec ecx
+.bg_trim2:
+    cmp byte [esi + ecx], ' '
+    jne .bg_last
+    mov byte [esi + ecx], 0
+    test ecx, ecx
+    jz .bg_done
+    dec ecx
+    jmp .bg_trim2
+.bg_last:
+    cmp byte [esi + ecx], '&'
+    jne .bg_done
+    mov dword [run_background], 1
+    mov byte [esi + ecx], 0
+    test ecx, ecx
+    jz .bg_done
+.bg_trim3:
+    dec ecx
+    cmp byte [esi + ecx], ' '
+    jne .bg_done
+    mov byte [esi + ecx], 0
+    test ecx, ecx
+    jnz .bg_trim3
+.bg_done:
     ; ---- 先校验一遍(只 stat,不读文件):找不到/太大还是老的文案 ----
     call fs_lock
     call run_lookup                    ; eax = 大小,-1 = 没找到
+    push eax                           ; run_restore_dir/fs_unlock 会踩 eax,先存
     call run_restore_dir
     call fs_unlock
+    pop eax
     cmp eax, -1
     je .notfound
     cmp eax, (SPACE_IMG_PAGES - 1) * 4096
@@ -2645,7 +3112,43 @@ cmd_run:
     mov dword [edx + TCB_SID], SHELL_SID
     popfd
     call loader_unlock
+    ; ---- 后台作业(POSIX 的 run X &):登记作业表,立刻回提示符 ----
+    ;   管道里的 run 不走后台(pipe_active != 0 时一律按前台顺序跑)。
+    cmp dword [pipe_active], 0
+    jne .fg_start
+    cmp dword [run_background], 0
+    je .fg_start
+    mov eax, [run_child]
+    mov ebx, [run_child]
+    mov esi, name_buf
+    call shell_job_add
+    cmp eax, -1
+    je .bg_full
+    mov [job_added], eax
+    mov al, COL_OK
+    call term_set_color
+    mov al, '['
+    call term_putc
+    mov eax, [job_added]
+    call term_print_dec
+    mov esi, msg_bg_sep
+    call term_print
+    mov eax, [run_child]
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    mov al, COL_NORMAL
+    call term_set_color
+    ret
+.bg_full:
+    ; 作业表满:把刚起的作业杀掉,报错回提示符
+    mov eax, [run_child]
+    mov ebx, 0x00010000                 ; super:kill:0
+    call process_signal_send_kernel
+    call shell_job_table_full
+    ret
     ; ---- 前台作业:tty 认它,shell 等它(退出 / 被信号停住) ----
+.fg_start:
     mov eax, [run_child]
     call tty_setpgrp
 .wait_loop:
@@ -2654,14 +3157,24 @@ cmd_run:
     call process_wait2
     cmp dword [proc_wait_status], 1
     jne .wait_done
-    ; Phase B 还没有作业表:被 ^Z 停住就先打印一声,恢复后杀掉,别把 shell 挂住。
-    ; (下一步 commit C 会换成真正的 stopped 作业 + bg/fg)
-    mov al, COL_HEADER
-    call term_set_color
-    mov esi, msg_run_stopped
-    call term_print
-    mov al, COL_NORMAL
-    call term_set_color
+    ; ---- 被 ^Z 停住:登记为 Stopped 作业,前台还给 shell,回提示符 ----
+    mov eax, SHELL_PGRP
+    call tty_setpgrp
+    mov eax, [run_child]
+    mov ebx, [run_child]
+    mov esi, name_buf
+    call shell_job_add
+    cmp eax, -1
+    je .stopped_full
+    mov [job_added], eax
+    mov ecx, eax
+    mov dword [job_state + ecx*4], 2     ; 2 = Stopped
+    mov [jb_slot], ecx
+    call shell_job_notify_stopped
+    ret
+.stopped_full:
+    ; 作业表满:恢复它再杀掉,别把 shell 挂住
+    call shell_job_table_full
     mov eax, [run_child]
     mov ebx, 0x00040000                 ; super:cont:0
     call process_signal_send_kernel
@@ -4379,6 +4892,9 @@ n_spawn  db 'spawn', 0
 n_kill   db 'kill', 0
 n_rc     db 'rc', 0
 n_prio   db 'prio', 0
+n_jobs   db 'jobs', 0
+n_fg     db 'fg', 0
+n_bg     db 'bg', 0
 n_fmt_ymd  db 'ymd', 0
 n_fmt_mdy  db 'mdy', 0
 n_fmt_dmy  db 'dmy', 0
@@ -4534,6 +5050,9 @@ cmd_table:
     dd n_su,     cmd_su
     dd n_login,  cmd_login
     dd n_prio,   cmd_prio
+    dd n_jobs,   cmd_jobs
+    dd n_fg,     cmd_fg
+    dd n_bg,     cmd_bg
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -4686,6 +5205,9 @@ msg_help db \
     'wait [pid]    reap a zombie child and print its exit code', 10, \
     'spawn [who]   start a demo kernel thread (no arg = alpha, then beta)', 10, \
     'prio [pid] [0-15]  show or set a thread priority (0 = highest, 15 = lowest)', 10, \
+    'jobs          list background jobs (Running / Stopped / Done)', 10, \
+    'fg [%n]       bring a stopped job back to the foreground', 10, \
+    'bg [%n]       resume a stopped job in the background', 10, \
     'kill <pid> [class:action:level]  signal a process (default super:kill:0)', 10, \
     'shell [n]     list the 4 shells, or jump to one (Ctrl+Left / Ctrl+Right)', 10, \
     'rc <what>     rc.conf: list / get KEY / start N / log / reload (event log)', 10, \
@@ -4794,6 +5316,20 @@ msg_write_usage db 'usage: write <name> <text>', 10, 0
 msg_write_fail  db 'write failed (disk full?)', 10, 0
 msg_running     db 'running ', 0
 msg_run_stopped db 'job stopped (no job control yet: resuming then killing it)', 10, 0
+msg_bg_sep      db '] ', 0
+msg_jobs_empty  db 'jobs: no jobs', 10, 0
+msg_jobs_full   db 'jobs: table full', 10, 0
+msg_job_done    db ' done', 10, 0
+msg_job_stopped db '+ stopped', 10, 0
+msg_job_state_run  db 'Running', 0
+msg_job_state_stop db 'Stopped', 0
+msg_job_state_done db 'Done', 0
+msg_jobs_pid    db ' pid=', 0
+msg_jobs_pgrp   db ' pgrp=', 0
+msg_jobs_gap    db '  ', 0
+msg_fg_nosuch   db 'fg: no such job', 10, 0
+msg_bg_nosuch   db 'bg: no such job', 10, 0
+msg_bg_already  db 'bg: job already running', 10, 0
 msg_prog_done   db 'program returned to the shell', 10, 0
 msg_prog_killed db 'program was killed, the kernel is fine', 10, 0
 msg_prog_toobig db 'program too big for the load area', 10, 0
@@ -4849,6 +5385,24 @@ run_last_pfrun dd 0
 run_last_pfimg dd 0
 run_last_pfheap dd 0
 run_last_firstpa dd 0
+run_background dd 0                     ; 1 = 这次 run 是后台作业(参数末尾带 &)
+job_added      dd 0                     ; 刚登记的作业 id
+
+; ---- 后台作业表(Phase B) ----
+SH_JOBS equ 16                          ; 作业表上限(满了打印 "jobs: table full")
+job_id     times SH_JOBS dd 0
+job_pid    times SH_JOBS dd 0
+job_pgrp   times SH_JOBS dd 0
+job_state  times SH_JOBS dd 0           ; 0=空 1=Running 2=Stopped 3=Done
+job_name   times SH_JOBS * 16 db 0
+job_next   dd 1
+jb_pid     dd 0
+jb_pgrp    dd 0
+jb_name    dd 0
+jb_slot    dd 0
+jb_ret     dd 0
+jb_id      dd 0
+jb_count   dd 0
 prog_name_ptr dd 0                      ; run 用的:去掉目录部分之后的程序名
 prog_size   dd 0                        ; run 用的:程序文件多大(按它往私有页里拷)
 prog_entry  dd 0                        ; run 用的:进 ring 3 的入口(平铺=0x120000, ELF 用 e_entry)
