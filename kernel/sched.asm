@@ -104,6 +104,7 @@ TCB_SID           equ 176               ; 会话号(最小实现:所有 shell/�
 TCB_EXECBUF       equ 180               ; 子进程 exec 载荷页(名字+参数;0 = 没有)
 TCB_STOPREQ       equ 184               ; 1 = ^Z 要求这条线程在 ring3 现场停下
 TCB_KBUSY         equ 188               ; 最近一次读键盘的 tick(判"交互程序"用)
+TCB_KBWAIT        equ 192               ; 1 = 正阻塞在 getkey/getchar(交互程序:^C 交给它自己)
 
 ; ---- C(Phase C swap):用户大匿名堆的 brk ----
 ;   USER_HEAP_VA 起按需映射的大块匿名内存;UBRK = 下次分配的起点(0/未用 = 从
@@ -167,6 +168,7 @@ sched_init:
     mov dword [edi + TCB_PGRP], SHELL_PGRP
     mov dword [edi + TCB_SID], SHELL_SID
     mov dword [edi + TCB_UBRK], 0       ; C:内核线程不起用户大堆
+    mov dword [edi + TCB_KBWAIT], 0     ; 没在读键盘
     mov [space_cur], edi                ; 现在跑的就是 0 号线程
     mov dword [tss_blk + TSS_ESP0], 0   ; ring3 进来时才设,先清掉开机时的旧值
     mov dword [sched_cur], 0

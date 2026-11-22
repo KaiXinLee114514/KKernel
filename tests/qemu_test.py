@@ -2584,6 +2584,35 @@ def main() -> int:
             # ---- shell:真敲命令,看输出 ----
             results = []
 
+            # 动态内存布局(阶段 1):从开机打印的机器可读 layout 行解析。
+            # ★ 这些 helper 原先只在 hd_mode 分支里定义,shell 模式单独跑时
+            #   引用会 UnboundLocalError(踩过:make test 在 test-shell 里挂住整条链)。
+            rescan()
+            raw_boot = ("\n".join(screen_text(shot, glyphs))
+                        if graphics else "\n".join(mon.screen()))
+            layout = {}
+            for line in raw_boot.splitlines():
+                for tok in line.replace("layout:", " ").split():
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        layout[k] = v
+            def layout_val(key, unit=1):
+                v = layout.get(key, "")
+                m = re.match(r"^0x([0-9a-fA-F]+)$", v)
+                if m:
+                    return int(m.group(1), 16)
+                m = re.match(r"^(\d+)([Mm])?$", v)
+                if m:
+                    n = int(m.group(1))
+                    return n * (0x100000 if m.group(2) else 1) * unit
+                return -1
+
+            # pool 行 = "0x起点-0x终点" → 页池 MiB(debug pmem 打印的就是它)
+            _pm = re.match(r"^0x([0-9a-fA-F]+)-0x([0-9a-fA-F]+)$",
+                           layout.get("pool", ""))
+            pool_mib = ((int(_pm.group(2), 16) - int(_pm.group(1), 16)) >> 20
+                        if _pm else -1)
+
             def wait_idle(max_wait=6.0):
                 """等屏幕不再变(内核画字走 MMIO,一屏要好几秒)。
 
@@ -2610,9 +2639,13 @@ def main() -> int:
                 wait_idle(6.0)
                 rescan()
 
+            run("clear")
             run("help")
-            results.append(("help 列出命令", has("show this list") and has("debug <what>"),
-                            "help 输出里有 show this list / debug <what>"))
+            # help 输出比一屏长(20+ 行),开头几行必然被滚屏顶掉;
+            # 断言看**结尾**那几条(pipe/devices/demo texts),它们稳定在屏底。
+            results.append(("help 列出命令",
+                            has("pipe: A | B") and has("devices: cat DEV/DEVICES"),
+                            "help 输出结尾:pipe / devices / demo texts"))
 
             run("debug")
             results.append(("debug 不带子命令会打用法", has("usage: debug <what>"),
@@ -2639,8 +2672,13 @@ def main() -> int:
             run("debug pmem")
             _pool_pages = layout_val("pages")
             _pool_mib = (layout_val("ident") - 0x400000) // 0x100000
-            results.append(("pmem 页池", has(f"{_pool_pages} total") and has(f"({_pool_mib} MiB)"),
-                            f"{_pool_pages} 页 / {_pool_mib} MiB"))
+            # debug pmem 实际输出:
+            #   pages       : <n> total (4 KiB each)
+            #   pool        : 0x... - 0x... (<pool_mib> MiB)
+            results.append(("pmem 页池",
+                            has(f"pages       : {_pool_pages} total")
+                            and has(f"({pool_mib} MiB)"),
+                            f"{_pool_pages} 页 / {pool_mib} MiB"))
 
             run("debug pmap 0x8000000")
             results.append(("pmap 自动建页表", has("mapped") and has("0x08000000"),

@@ -209,7 +209,11 @@ api_dispatch:
     call process_cur_tcb
     mov ecx, [pit_ticks]
     mov [eax + TCB_KBUSY], ecx
+    mov dword [eax + TCB_KBWAIT], 1     ; 正阻塞等键盘:交互程序
+    push eax
     call kbd_getchar                    ; 返回 al
+    pop ecx
+    mov dword [ecx + TCB_KBWAIT], 0
     ret
 .getchar_bg:
     mov eax, 0x04                       ; Ctrl-D = EOF
@@ -325,7 +329,11 @@ api_dispatch:
     call process_cur_tcb
     mov ecx, [pit_ticks]
     mov [eax + TCB_KBUSY], ecx
+    mov dword [eax + TCB_KBWAIT], 1     ; 正阻塞等键盘:交互程序
+    push eax
     call kbd_getkey
+    pop ecx
+    mov dword [ecx + TCB_KBWAIT], 0
     ret
 .getkey_bg:
     xor eax, eax                        ; 后台:没有按键事件

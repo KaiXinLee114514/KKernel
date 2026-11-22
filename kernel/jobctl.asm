@@ -121,7 +121,12 @@ jobctl_kbd_filter:
     call jobctl_fg_running
     test eax, eax
     jz .consumed                        ; 前台组里没有 ring3 程序在跑:吃掉按键
-    ; 前台作业最近 1 秒(100 tick)读过键盘 = 交互程序,^C 交给它自己处理
+    ; ★ 正阻塞在 getkey/getchar 等键盘 = 交互程序(如游戏):^C 交给它自己处理。
+    ;   只靠"最近 1 秒读过键"不够 —— 玩家长时间不按键时 tick 早就过期了,
+    ;   而这时程序还卡在内核的 hlt 轮询里,KILLREQ 也收不到(踩过:MINE 的 ^C 失效)。
+    cmp dword [eax + TCB_KBWAIT], 0
+    jne .pass
+    ; 否则:前台作业最近 1 秒(100 tick)读过键盘也算交互程序
     mov ecx, [pit_ticks]
     sub ecx, [eax + TCB_KBUSY]
     cmp ecx, 100
