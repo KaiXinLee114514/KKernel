@@ -3687,6 +3687,77 @@ cmd_pmem:
     ret
 
 ; ---------------------------------------------------------------------------
+;  meminfo:物理页池 + swap 的全景(Phase C 新增;测试也认这一行)
+; ---------------------------------------------------------------------------
+cmd_meminfo:
+    mov esi, msg_meminfo_head
+    call term_print
+    mov esi, msg_meminfo_pool
+    call term_print
+    mov eax, [pmem_total]
+    call term_print_dec
+    mov esi, msg_meminfo_total
+    call term_print
+    mov eax, [pmem_free_count]
+    call term_print_dec
+    mov esi, msg_meminfo_free
+    call term_print
+    mov esi, msg_meminfo_swap
+    call term_print
+    mov eax, [swap_slots_total]
+    call term_print_dec
+    mov esi, msg_meminfo_slots
+    call term_print
+    mov eax, [swap_slots_used]
+    call term_print_dec
+    mov esi, msg_meminfo_used
+    call term_print
+    mov esi, msg_meminfo_io
+    call term_print
+    mov eax, [swap_out_count]
+    call term_print_dec
+    mov esi, msg_meminfo_out
+    call term_print
+    mov eax, [swap_in_count]
+    call term_print_dec
+    mov esi, msg_meminfo_in
+    call term_print
+    ret
+
+; ---------------------------------------------------------------------------
+;  swap:swap 区状态(Phase C;--swap 测试读这一行)
+; ---------------------------------------------------------------------------
+cmd_swap:
+    mov esi, msg_swap_head
+    call term_print
+    cmp dword [swap_enabled], 0
+    jne .on
+    mov esi, msg_swap_off
+    call term_print
+    ret
+.on:
+    ; 单行输出方便 --swap 测试断言:swap: enabled total=4096 used=0 out=0 in=0
+    mov esi, msg_swap_on
+    call term_print
+    mov eax, [swap_slots_total]
+    call term_print_dec
+    mov esi, msg_swap_used_lbl
+    call term_print
+    mov eax, [swap_slots_used]
+    call term_print_dec
+    mov esi, msg_swap_out_lbl
+    call term_print
+    mov eax, [swap_out_count]
+    call term_print_dec
+    mov esi, msg_swap_in_lbl
+    call term_print
+    mov eax, [swap_in_count]
+    call term_print_dec
+    mov esi, msg_swap_end
+    call term_print
+    ret
+
+; ---------------------------------------------------------------------------
 ;  pmap <va>:从页池拿一页映到虚拟地址 va —— 页表不存在就现建一张(动态建表)
 ; ---------------------------------------------------------------------------
 cmd_pmap:
@@ -4874,6 +4945,8 @@ n_rm     db 'rm', 0
 n_fault  db 'fault', 0
 n_reboot db 'reboot', 0
 n_pmem   db 'pmem', 0
+n_meminfo db 'meminfo', 0
+n_swap   db 'swap', 0
 n_pmap   db 'pmap', 0
 n_pumap  db 'pumap', 0
 n_ptest  db 'ptest', 0
@@ -5056,6 +5129,8 @@ cmd_table:
     dd n_jobs,   cmd_jobs
     dd n_fg,     cmd_fg
     dd n_bg,     cmd_bg
+    dd n_meminfo, cmd_meminfo
+    dd n_swap,   cmd_swap
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -5211,6 +5286,8 @@ msg_help db \
     'jobs          list background jobs (Running / Stopped / Done)', 10, \
     'fg [%n]       bring a stopped job back to the foreground', 10, \
     'bg [%n]       resume a stopped job in the background', 10, \
+    'meminfo       memory overview: physical page pool + swap slots', 10, \
+    'swap          swap status: enabled / total / used / swapout / swapin', 10, \
     'kill <pid> [class:action:level]  signal a process (default super:kill:0)', 10, \
     'shell [n]     list the 4 shells, or jump to one (Ctrl+Left / Ctrl+Right)', 10, \
     'rc <what>     rc.conf: list / get KEY / start N / log / reload (event log)', 10, \
@@ -5268,6 +5345,23 @@ msg_page_npte    db '  PTE not present -> would page-fault', 10, 0
 msg_page_phys    db 'physical     = ', 0
 
 ; ---- pmem / pmap / pumap / ptest ----
+msg_meminfo_head db '--- meminfo ---', 10, 0
+msg_meminfo_pool db 'pool        : ', 0
+msg_meminfo_total db ' pages total, ', 0
+msg_meminfo_free db ' free', 10, 0
+msg_meminfo_swap db 'swap        : ', 0
+msg_meminfo_slots db ' slots total, ', 0
+msg_meminfo_used db ' used', 10, 0
+msg_meminfo_io   db 'swap i/o    : ', 0
+msg_meminfo_out  db ' out, ', 0
+msg_meminfo_in   db ' in', 10, 0
+msg_swap_head    db 'swap: ', 0
+msg_swap_off     db 'disabled (no KSWP header on this disk)', 10, 0
+msg_swap_on      db 'enabled total=', 0
+msg_swap_used_lbl db ' used=', 0
+msg_swap_out_lbl db ' out=', 0
+msg_swap_in_lbl  db ' in=', 0
+msg_swap_end     db 10, 0
 msg_pmem_head    db '--- pmem: physical page pool ---', 10, 0
 msg_pmem_pool    db 'pool        : ', 0
 msg_pmem_dash    db ' - ', 0

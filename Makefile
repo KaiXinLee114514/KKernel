@@ -83,7 +83,7 @@ CRT_TCC_OBJ := $(BUILD)/crt_tcc.o
 ifeq ($(CC_OK),yes)
 C_PROGS     := CHELLO.BIN PLAY.BIN RNGTEST.BIN P2TEST.BIN FPU.BIN FCALC.BIN ECHO.BIN MEMTEST.BIN IOTEST.BIN \
                WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN FORK.BIN \
-               PRIO.BIN SLEEPY.BIN CONCUR.BIN
+               PRIO.BIN SLEEPY.BIN CONCUR.BIN SWAPTEST.BIN
 else
 C_PROGS     :=
 endif
@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-swap div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -378,7 +378,7 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-tty test-login test-sched test-jobctl
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-tty test-login test-sched test-jobctl test-swap
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -421,6 +421,23 @@ test-jobctl: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── 作业控制:fork+exec / 进程组 / jobs/fg/bg / ^C ^Z --jobctl ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --jobctl
+
+# ---------------------------------------------------------------------------
+#  Phase C 测试:swap 镜像 = 普通 HD 镜像 + 末尾 16 MiB swap 区(KSWP 头)。
+#  跑两次:
+#    -m 16:物理页池 12 MiB,SWAPTEST 申请 18 MiB → 必须触发换出;
+#    -m 64:对照,物理内存够 → 全程不换出(out=0)。
+# ---------------------------------------------------------------------------
+SWAP_IMG := $(BUILD)/kkernel-swap.img
+
+$(SWAP_IMG): $(HDIMG) tools/mkswap.py
+	python3 tools/mkswap.py $(HDIMG) $(SWAP_IMG) --size-mib 16
+
+test-swap: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── swap:页换出/换入 + 大匿名堆 --swap ──"
+	$(MAKE) -s -B $(SWAP_IMG)
+	python3 -u tests/qemu_test.py $(SWAP_IMG) --hda --fontdisk --font font/full-kkf.bin --swap --mem 16
+	python3 -u tests/qemu_test.py $(SWAP_IMG) --hda --fontdisk --font font/full-kkf.bin --swap-cold --mem 64
 
 # 扫雷:PROGS 在 /BIN 里,测试只读盘,不 -B 重建(那会把整盘重做一遍)
 test-mine: $(HDIMG)

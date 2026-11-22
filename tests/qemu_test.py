@@ -698,13 +698,22 @@ def main() -> int:
     login_mode = "--login" in argv          # 最小多用户:登录 / whoami / su / 信号权限
     sched_mode = "--sched" in argv          # 调度器:优先级 / 睡眠超时 / 栈增长 / 并发
     jobctl_mode = "--jobctl" in argv        # 作业控制:fork+exec / 进程组 / jobs/fg/bg / ^C ^Z
+    swap_mode = "--swap" in argv            # swap:页换出/换入 + 大匿名堆(默认 -m 16)
+    swap_cold_mode = "--swap-cold" in argv  # swap 对照:大内存下全部驻留(-m 64,不换出)
+    mem_mib = 128                           # QEMU 物理内存(-m):swap 测试用 16/64
+    if "--mem" in argv:
+        mem_mib = int(argv[argv.index("--mem") + 1])
     font_path = FONT_PATH                   # 比像素用的模板字库(硬盘模式换成完整字库)
     if "--font" in argv:
         font_path = argv[argv.index("--font") + 1]
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
                          "--fontdisk", "--fat32", "--usbdisk", "--mine", "--proc",
-                         "--tty", "--login", "--sched", "--jobctl")]
+                         "--tty", "--login", "--sched", "--jobctl",
+                         "--swap", "--swap-cold")]
+    if "--mem" in argv:
+        i = argv.index("--mem")
+        del argv[i:i + 2]
     if "--font" in argv:
         i = argv.index("--font")
         del argv[i:i + 2]
@@ -743,6 +752,7 @@ def main() -> int:
         os.unlink(qmp_sock)
     qemu = subprocess.Popen(
         ["qemu-system-i386", *drive,
+         "-m", str(mem_mib),
          "-display", "none", "-no-reboot",
          # 挂一个 USB 控制器给 PCI 枚举断言用(以后 USB 驱动也用它)。
          # 用 `-usb` 而不是 `-device piix3-usb-uhci`:前者把机器自带的 UHCI 挂在
@@ -1101,6 +1111,42 @@ def main() -> int:
             running = [ln for ln in text.splitlines() if "Running" in ln and "HANG.BIN" in ln]
             results.append(("jobs 列出两个后台 Running 作业", len(running) >= 2,
                             "[n] Running ... HANG.BIN 两行"))
+            return report(results)
+
+        if swap_mode or swap_cold_mode:
+            # ---- Phase C:swap 页换出/换入 + 大匿名堆 ----
+            results = []
+
+            def swap_run(line: str, wait: float = 2.0) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            results.append(("登录后 shell 就绪", has('type "help" for commands.'),
+                            'type "help" for commands.'))
+            swap_run("swap", 1.2)
+            results.append(("swap:启用且有 KSWP 头", has("swap: enabled total="),
+                            "swap: enabled total=4096 used=0 out=0 in=0"))
+            swap_run("meminfo", 1.2)
+            results.append(("meminfo 同时显示页池与 swap", has("--- meminfo ---") and has("swap"),
+                            "--- meminfo --- / pool ... / swap ..."))
+            # 大匿名堆:申请 8 MiB 逐页写/读;-m16 物理池不够,必须换出/换入
+            swap_run("run SWAPTEST.BIN", 2.0)
+            ok = wait_has("swaptest: PASS", 180.0)
+            results.append(("大匿名堆 8 MiB + fork 子进程换页", ok,
+                            "swaptest: PASS size=8388608 children=2"))
+            swap_run("clear", 0.8)   # 先清屏,避免旧命令的 "out=0" 干扰断言
+            swap_run("swap", 1.2)
+            if swap_mode:
+                results.append(("物理页池不够 → 确实发生过换出(out>0)",
+                                has(" out=") and not has(" out=0"),
+                                "swap: enabled total=... used=0 out=N in=N (N>0)"))
+            else:
+                results.append(("对照(-m 64):全程没有换出(out=0)",
+                                has(" out=0"), "swap: enabled total=... used=0 out=0 in=0"))
+            results.append(("程序退出后 swap 占用回落(used<=1)", (has(" used=0 out=") or has(" used=1 out=")),
+                            "swap: enabled ... used<=1(极端时序可能残留 1 槽,--swap 已知限制)"))
             return report(results)
 
         if usb_mode:
