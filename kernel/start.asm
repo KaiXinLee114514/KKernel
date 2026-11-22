@@ -16,6 +16,10 @@
 [BITS 32]
 [ORG 0x10000]
 
+; ---- 跨模块共享的常量(定义在所有 include 之前,谁都能用)--------------------
+BLK_FAT_STATE_BUF equ 0x3C6000          ; blkdev:USB 挂载时保存 ATA FAT 挂载状态的缓冲
+BLK_FAT_STATE_MAX equ 4096              ; 状态区上限(4 KiB)
+
 kmain:                                  ; 32 位内核入口(stub 里 jmp 0x10000 跳过来)
 ;  ⚠️ 第一个被 include 的文件决定 0x10000 处的第一条指令 —— 因为 `kmain:` 本身不占字节。
 ;     所以入口代码必须排在第一个,别的模块(哪怕是被前面引用的)都放后面。
@@ -27,6 +31,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "usbdisk.asm"                    ; USB 大容量储存(只读裸盘)
 %include "fontdisk.asm"                  ; 从磁盘加载完整字库
 %include "fat.asm"                       ; FAT16 文件系统
+%include "blkdev.asm"                    ; 块设备抽象层(ATA / USB 统一 read/write sector)
 %include "dev.asm"                       ; /DEV 设备抽象层(虚拟设备:NULL/ZERO/RTC/...)
 %include "pipe.asm"                      ; 顺序管道:输出捕获 + stdin 读管
 %include "api.asm"                    ; 程序接口 int 0x30

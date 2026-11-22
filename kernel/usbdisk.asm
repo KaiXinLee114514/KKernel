@@ -1,12 +1,14 @@
 ; ============================================================================
-;  KKernel — USB 大容量储存(第一步:只读裸盘)
+;  KKernel — USB 大容量储存(U2/U3:读写 + 上面挂 FAT)
 ;
-;  在 usb.asm 的 UHCI 底座上补三块:
+;  在 usb.asm 的 UHCI 底座上补四块:
 ;    1) bulk 端点传输:每个 TD 发一个包(≤64B),toggle 显式给,3 秒超时
 ;    2) Bulk-Only Transport(BOT):CBW 31 字节 / CSW 13 字节
 ;    3) SCSI 最小集:INQUIRY / TEST UNIT READY / READ CAPACITY(10) / READ(10)
-;        + REQUEST SENSE(失败时给点人话)
-;  只读:不实现 WRITE,也不往上接 FAT —— 先能把扇区读出来、看 MBR、hexdump。
+;        / WRITE(10) / SYNCHRONIZE CACHE(10) / REQUEST SENSE
+;       WRITE 失败会先发 REQUEST SENSE 再重试(最多 3 次)。
+;    4) `usbdisk mount/umount`:把块设备层(blkdev.asm)的当前设备从 ATA 切到
+;       USB,让同一个 FAT 驱动去读写 U 盘;umount 时原样恢复 ATA 的挂载状态。
 ;
 ;  ── 只支持一个 USB 设备 ──────────────────────────────────────────────────
 ;  usb.asm 的枚举只认第一个设备(地址 1)。所以 U 盘能用的前提是:它是这台
@@ -30,6 +32,7 @@ USB_BOT_CSW    equ 0x3C1820       ; 13 B
 USB_MSD_CDB    equ 0x3C1840       ; 16 B CDB
 USB_MSD_TMP    equ 0x3C1860       ; 64 B(INQUIRY 36B / READ CAP 8B / SENSE 18B)
 USB_MSD_DATA   equ 0x3C2000       ; 4 KiB 数据缓冲(最多 8 扇区)
+USB_MSD_BACKUP equ 0x3C1A00       ; 512 B:usbdisk write 自测时备份原扇区
 
 USB_MAX_TD     equ 80
 
@@ -59,6 +62,8 @@ usbdisk_init:
     test eax, eax
     jnz .out
     mov byte [usbdisk_ready], 1
+    mov eax, [usbdisk_lba]
+    call blkdev_set_usb_sectors         ; 块设备层:USB 设备总扇区数
 .out:
     popad
     ret
@@ -490,6 +495,73 @@ usb_scsi_sense:
     mov eax, [usb_xfer_ret]
     ret
 
+; WRITE(10):CDB 2A 00 LBA(BE32) 00 长度(BE16) 00
+;   eax = LBA,ecx = 扇区数(1..8),edi = 数据缓冲;返回 eax=0 成功
+;   失败先发 REQUEST SENSE 看原因,再重试(最多 3 次 —— U2 验收要求)。
+;   注意 USB_MSD_DATA 是唯一的 USB 数据缓冲,重试之间不能有别人碰它;
+;   调用方(blkdev 后端)保证一次只发一条命令。
+usb_scsi_write:
+    pushad
+    mov [usb_write_lba], eax
+    mov [usb_write_cnt], ecx
+    mov [usb_write_buf], edi
+    mov dword [usb_write_try], 0
+.try:
+    ; ---- 填 CDB:WRITE(10) ----
+    mov edi, USB_MSD_CDB
+    xor eax, eax
+    mov ecx, 4
+    rep stosd
+    mov byte [USB_MSD_CDB], 0x2A              ; WRITE(10)
+    mov eax, [usb_write_lba]
+    bswap eax
+    mov [USB_MSD_CDB + 2], eax
+    mov ax, [usb_write_cnt]
+    xchg al, ah
+    mov [USB_MSD_CDB + 7], ax
+
+    mov esi, USB_MSD_CDB
+    mov ecx, [usb_write_cnt]
+    shl ecx, 9                                ; ×512
+    mov edi, [usb_write_buf]
+    xor edx, edx                              ; 0 = 数据阶段 OUT(主机 → 设备)
+    mov ebx, 10
+    call usb_bot
+    test eax, eax
+    jz .ok
+    ; ---- 失败:问一次 SENSE(错误码留在 USB_MSD_TMP,`usbdisk sense` 能看),再重试 ----
+    mov [usb_xfer_ret], eax
+    call usb_scsi_sense
+    inc dword [usb_write_try]
+    cmp dword [usb_write_try], 3
+    jb .try
+    popad
+    mov eax, -1
+    ret
+.ok:
+    popad
+    xor eax, eax
+    ret
+
+; SYNCHRONIZE CACHE(10):CDB 35 00 00 00 00 00 00 00 00 00(无数据阶段)
+usb_scsi_sync:
+    pushad
+    mov edi, USB_MSD_CDB
+    xor eax, eax
+    mov ecx, 4
+    rep stosd
+    mov byte [USB_MSD_CDB], 0x35
+    mov esi, USB_MSD_CDB
+    xor ecx, ecx
+    xor edi, edi
+    xor edx, edx
+    mov ebx, 10
+    call usb_bot
+    mov [usb_xfer_ret], eax
+    popad
+    mov eax, [usb_xfer_ret]
+    ret
+
 ; ===========================================================================
 ;  打印辅助
 ; ===========================================================================
@@ -665,11 +737,66 @@ usbd_parse_lba:
     stc
     ret
 
+; usbd_find_part:从读进来的 LBA0 缓冲(ebx)里找 FAT 分区起始 LBA
+;   eax = 分区起始 LBA;CF=1 = 没有可识别的 FAT 分区
+;   规则:先扫 MBR 4 个分区项,认 FAT 类型(0x04/0x06/0x0B/0x0C/0x0E);
+;   没有分区表 → 当超级软盘(分区起点 0),要求它是合法 FAT 引导扇区。
+usbd_find_part:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    cmp word [ebx + 510], 0xAA55
+    jne .notfound
+    mov ecx, 4
+    lea esi, [ebx + 446]
+.scan:
+    movzx eax, byte [esi + 4]                 ; 分区类型
+    cmp al, 0x04
+    je .hit
+    cmp al, 0x06
+    je .hit
+    cmp al, 0x0B
+    je .hit
+    cmp al, 0x0C
+    je .hit
+    cmp al, 0x0E
+    je .hit
+    add esi, 16
+    dec ecx
+    jnz .scan
+    ; 没有 FAT 分区项:看看是不是"超级软盘"(引导扇区直接就是 FAT)
+    cmp word [ebx + 11], 512
+    jne .notfound
+    cmp word [ebx + 22], 0
+    je .notfound                              ; FAT32 的超级软盘也认(但少见)
+    xor eax, eax
+    clc
+    jmp .out
+.hit:
+    mov eax, [esi + 8]                        ; 分区起始 LBA(小端)
+    clc
+    jmp .out
+.notfound:
+    stc
+.out:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
 ; ===========================================================================
 ;  shell 的 usbdisk 命令
-;    usbdisk                 设备信息
+;    usbdisk                 设备信息 + 当前挂载状态
+;    usbdisk mount           找 U 盘上的 FAT 分区,挂到 FAT 驱动上(切块设备)
+;    usbdisk umount          恢复 ATA 的 FAT 挂载状态
+;    usbdisk status          看当前挂的是 U 盘还是 ATA
 ;    usbdisk read <lba>      读一个扇区并转储前 64 字节
 ;    usbdisk hexdump <lba>   读一个扇区并全量转储(512B,会滚屏)
+;    usbdisk write <lba>     写测试扇区(先备份→写图案→读回比对→恢复原内容)
 ;    usbdisk mbr             读 LBA0 并解析 4 个分区表项
 ;    usbdisk sense           发 REQUEST SENSE 看错误码
 ; ===========================================================================
@@ -729,6 +856,17 @@ cmd_usbdisk:
     mov esi, msg_usbd_kib
     call term_print
 
+    ; ---- 当前挂的是谁(ATA 硬盘 / U 盘)----
+    cmp byte [usb_mounted], 0
+    je .info_ata
+    mov esi, msg_usbd_state_usb
+    call term_print
+    jmp .info_dispatch
+.info_ata:
+    mov esi, msg_usbd_state_ata
+    call term_print
+.info_dispatch:
+
     ; ---- 有参数就继续分发 ----
     call usbd_first_word
     test ecx, ecx
@@ -750,6 +888,22 @@ cmd_usbdisk:
     call str_eq
     test eax, eax
     jnz .do_sense
+    mov edx, n_usbd_mount
+    call str_eq
+    test eax, eax
+    jnz .do_mount
+    mov edx, n_usbd_umount
+    call str_eq
+    test eax, eax
+    jnz .do_umount
+    mov edx, n_usbd_status
+    call str_eq
+    test eax, eax
+    jnz .do_status
+    mov edx, n_usbd_write
+    call str_eq
+    test eax, eax
+    jnz .do_write
     jmp .usage
 
 ; ---- usbdisk read <lba>:读 1 扇区,转储前 64 字节 ----
@@ -853,6 +1007,188 @@ cmd_usbdisk:
     jmp .done
 
 
+; ---- usbdisk mount:保存 ATA 的 FAT 状态 → 切块设备到 USB → 找分区 → fat_mount ----
+.do_mount:
+    cmp byte [usb_mounted], 0
+    jne .mount_busy
+    call fat_state_save                      ; ATA 的挂载状态先存起来
+    call blkdev_select_usb
+    mov eax, [usbdisk_lba]
+    call blkdev_set_usb_sectors
+    ; 读 LBA0(MBR / 超级软盘引导扇区)
+    xor eax, eax
+    mov ecx, 1
+    mov edi, USB_MSD_DATA
+    call usb_scsi_read
+    test eax, eax
+    jnz .mount_ioerr
+    mov ebx, USB_MSD_DATA
+    call usbd_find_part
+    jc .mount_nofs
+    call fat_set_part_base                   ; eax = 分区起始 LBA
+    call fat_mount
+    test eax, eax
+    jnz .mount_nofs
+    mov byte [usb_mounted], 1
+    call shell_reset_cwd                     ; shell 的 cwd 回根(新文件系统)
+    ; 挂载成功信息:FAT 类型 + 分区起点 + 总扇区数
+    mov esi, msg_usbd_mounted
+    call term_print
+    call fat_type
+    call term_print_dec
+    mov esi, msg_usbd_at
+    call term_print
+    call fat_get_part_base
+    call term_print_dec
+    mov esi, msg_usbd_comma
+    call term_print
+    call blkdev_get_sectors
+    call term_print_dec
+    mov esi, msg_usbd_sectors
+    call term_print
+    jmp .done
+.mount_busy:
+    mov esi, msg_usbd_mountbusy
+    call term_print
+    jmp .done
+.mount_ioerr:
+    call fat_state_restore
+    call blkdev_select_ata
+    call shell_reset_cwd
+    mov esi, msg_usbd_mountioerr
+    call term_print
+    jmp .done
+.mount_nofs:
+    call fat_state_restore
+    call blkdev_select_ata
+    call shell_reset_cwd
+    mov esi, msg_usbd_mountnofs
+    call term_print
+    jmp .done
+
+; ---- usbdisk umount:同步设备缓存 → 恢复 ATA 挂载状态 → 块设备切回 ATA ----
+.do_umount:
+    cmp byte [usb_mounted], 0
+    je .umount_no
+    call usb_scsi_sync
+    call fat_state_restore
+    call blkdev_select_ata
+    mov byte [usb_mounted], 0
+    call shell_reset_cwd
+    mov esi, msg_usbd_umounted
+    call term_print
+    call fat_type
+    call term_print_dec
+    mov esi, msg_usbd_at
+    call term_print
+    call fat_get_part_base
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    jmp .done
+.umount_no:
+    mov esi, msg_usbd_umountno
+    call term_print
+    jmp .done
+
+; ---- usbdisk status:当前挂的是谁 ----
+.do_status:
+    cmp byte [usb_mounted], 0
+    je .status_ata
+    mov esi, msg_usbd_status_usb
+    call term_print
+    call fat_type
+    call term_print_dec
+    mov esi, msg_usbd_at
+    call term_print
+    call fat_get_part_base
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    jmp .done
+.status_ata:
+    mov esi, msg_usbd_status_ata
+    call term_print
+    jmp .done
+
+; ---- usbdisk write <lba>:写路径自测 ----
+; 先读原扇区到备份缓冲 → 写 512 字节测试图案 → 读回逐字节比对 → 恢复原内容。
+; 这样既能验证 WRITE(10)/CSW/重试链路,又不会把盘上的 FAT 文件系统弄坏。
+.do_write:
+    call usbd_parse_lba
+    jc .usage
+    mov eax, [usb_read_lba]
+    cmp eax, [usbdisk_lba]
+    jae .usage
+    ; 1) 备份原扇区
+    mov ecx, 1
+    mov edi, USB_MSD_BACKUP
+    call usb_scsi_read
+    test eax, eax
+    jnz .write_fail
+    ; 2) 造测试图案:字节 i = i XOR 0xA5
+    mov edi, USB_MSD_DATA
+    xor edx, edx
+.write_fill:
+    mov eax, edx
+    xor al, 0xA5
+    mov [edi], al
+    inc edi
+    inc edx
+    cmp edx, 512
+    jb .write_fill
+    ; 3) 写设备
+    mov eax, [usb_read_lba]
+    mov ecx, 1
+    mov edi, USB_MSD_DATA
+    call usb_scsi_write
+    test eax, eax
+    jnz .write_fail
+    ; 4) 读回比对
+    mov eax, [usb_read_lba]
+    mov ecx, 1
+    mov edi, USB_MSD_DATA
+    call usb_scsi_read
+    test eax, eax
+    jnz .write_fail
+    mov esi, USB_MSD_DATA
+    xor edx, edx
+.write_cmp:
+    mov eax, edx
+    xor al, 0xA5
+    cmp [esi], al
+    jne .write_bad
+    inc esi
+    inc edx
+    cmp edx, 512
+    jb .write_cmp
+    ; 5) 恢复原内容(自测用的扇区不能真的改坏)
+    mov eax, [usb_read_lba]
+    mov ecx, 1
+    mov edi, USB_MSD_BACKUP
+    call usb_scsi_write
+    test eax, eax
+    jnz .write_fail
+    mov esi, msg_usbd_wr_ok
+    call term_print
+    mov eax, [usb_read_lba]
+    call term_print_dec
+    mov al, 10
+    call term_putc
+    jmp .done
+.write_bad:
+    mov eax, [usb_read_lba]
+    mov ecx, 1
+    mov edi, USB_MSD_BACKUP
+    call usb_scsi_write
+    mov esi, msg_usbd_wr_bad
+    call term_print
+    jmp .done
+.write_fail:
+    mov esi, msg_usbd_wr_fail
+    call term_print
+    jmp .done
+
 .read_fail:
     mov esi, msg_usbd_readfail
     call term_print
@@ -880,6 +1216,7 @@ cmd_usbdisk:
 ;  数据
 ; ---------------------------------------------------------------------------
 usbdisk_ready   db 0
+usb_mounted     db 0                    ; 1 = FAT 驱动当前挂在 U 盘上
 usb_bot_tag     dd 0x4B4B0001
 usb_bot_status  db 0
 usb_bot_residue dd 0
@@ -903,6 +1240,11 @@ usb_read_lba    dd 0
 usb_read_cnt    dd 0
 usb_read_buf    dd 0
 
+usb_write_lba   dd 0
+usb_write_cnt   dd 0
+usb_write_buf   dd 0
+usb_write_try   dd 0
+
 usbd_i          dd 0
 usbd_retry      dd 0
 usbd_saved_arg  dd 0
@@ -924,6 +1266,10 @@ n_usbd_read     db 'read', 0
 n_usbd_hexdump  db 'hexdump', 0
 n_usbd_mbr      db 'mbr', 0
 n_usbd_sense    db 'sense', 0
+n_usbd_mount    db 'mount', 0
+n_usbd_umount   db 'umount', 0
+n_usbd_status   db 'status', 0
+n_usbd_write    db 'write', 0
 
 ; 消息
 msg_usbd_dev      db 'usbdisk: ', 0
@@ -935,7 +1281,23 @@ msg_usbd_kib      db ' KiB', 10, 0
 msg_usbd_nodev    db 'usbdisk: no USB mass storage device (first USB device must be the disk)', 10, 0
 msg_usbd_notready db 'usbdisk: device found but SCSI init failed (try `usbdisk sense`)', 10, 0
 msg_usbd_readfail db 'usbdisk: read failed (see `usbdisk sense`)', 10, 0
-msg_usbd_usage    db 'usbdisk: usage: usbdisk [read <lba> | hexdump <lba> | mbr | sense]', 10, 0
+msg_usbd_usage    db 'usbdisk: usage: usbdisk [mount | umount | status | read <lba> | hexdump <lba> | write <lba> | mbr | sense]', 10, 0
+msg_usbd_state_ata    db 'usbdisk: FAT device: ATA (internal disk)', 10, 0
+msg_usbd_state_usb    db 'usbdisk: FAT device: USB (USB mass storage)', 10, 0
+msg_usbd_mounted      db 'usbdisk: mounted FAT', 0
+msg_usbd_umounted     db 'usbdisk: unmounted, FAT device back to ATA FAT', 0
+msg_usbd_at           db ' at LBA ', 0
+msg_usbd_comma        db ', ', 0
+msg_usbd_sectors      db ' sectors', 10, 0
+msg_usbd_mountbusy    db 'usbdisk: already mounted (run `usbdisk umount` first)', 10, 0
+msg_usbd_mountioerr   db 'usbdisk: mount failed: cannot read MBR/boot sector', 10, 0
+msg_usbd_mountnofs    db 'usbdisk: mount failed: no FAT16/FAT32 filesystem found on the USB disk', 10, 0
+msg_usbd_umountno     db 'usbdisk: not mounted (nothing to unmount)', 10, 0
+msg_usbd_status_usb   db 'usbdisk: status: mounted FAT', 0
+msg_usbd_status_ata   db 'usbdisk: status: not mounted (FAT device: ATA)', 10, 0
+msg_usbd_wr_ok        db 'usbdisk: write test ok (backup/verify/restore, LBA ', 0
+msg_usbd_wr_bad       db 'usbdisk: write test FAILED: readback mismatch (original restored)', 10, 0
+msg_usbd_wr_fail      db 'usbdisk: write test failed (see `usbdisk sense`)', 10, 0
 msg_hexdump_colon db ': ', 0
 msg_hexdump_pad   db '   ', 0
 msg_mbr_p         db 'p', 0

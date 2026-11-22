@@ -33,10 +33,10 @@ FAT_BUF      equ 0x100000               ; 1 MiB:扇区缓冲(挂载/目录/FAT �
 ; ---------------------------------------------------------------------------
 fat_mount:
     pushad
-    mov eax, FAT_PART_LBA
+    mov eax, [fat_part_base]
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov esi, FAT_BUF
@@ -75,7 +75,7 @@ fat_mount:
 .fat16_done:
 
     ; FAT 表起始 = 分区起点 + 保留扇区
-    mov eax, FAT_PART_LBA
+    mov eax, [fat_part_base]
     add eax, [fat_reserved]
     mov [fat_fat_lba], eax
 
@@ -128,6 +128,8 @@ fat_mount:
     mov [fat_max_cluster], eax
 
     mov dword [fat_cache_lba], -1
+    mov dword [fat_dir], 0              ; 换设备/重挂后一律从根目录开始
+    mov dword [fat_next_free], 2        ; 分配提示也重置(新卷的簇上界可能更小)
     mov byte [fat_ok], 1
     popad
     xor eax, eax
@@ -851,7 +853,7 @@ fat_find:
     mov [fat_scan_lba], eax
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .not_found
     mov dword [fat_cache_lba], -1
@@ -1014,7 +1016,7 @@ fat_find_run:
     mov [frun_lba], eax
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -1107,7 +1109,7 @@ fat_write_run:
     mov [frun_lba], eax
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov edi, FAT_BUF
@@ -1119,7 +1121,7 @@ fat_write_run:
     mov eax, [frun_lba]
     mov ecx, 1
     mov esi, FAT_BUF
-    call ata_write_sectors
+    call fat_dev_write
     mov dword [fat_cache_lba], -1
     popad
     clc
@@ -1146,7 +1148,7 @@ fat_chdir:
     ; 找到的位置在 [fat_found_lba],把那一扇区重读一遍取首簇和属性
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     mov dword [fat_cache_lba], -1
     mov esi, FAT_BUF
     add esi, [fat_entry_off]
@@ -1291,7 +1293,7 @@ fat_next_cluster:
     mov [fat_cache_lba], eax
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
 .cached:
@@ -1332,7 +1334,7 @@ fat_read_file:
     ; 重新读一遍找到的那个目录项,取首簇和大小
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -1355,7 +1357,7 @@ fat_read_file:
     add eax, [fat_data_lba]
     mov ecx, [fat_spc]
     mov edi, ebx
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -1386,7 +1388,7 @@ fat_stat:
     je .fail
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -1429,7 +1431,7 @@ fat_set_entry:
     ; 读该 FAT 扇区(读失败就别改:FAT_BUF 里是上一次的内容)
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .done
     mov esi, FAT_BUF
@@ -1459,7 +1461,7 @@ fat_set_entry:
     add eax, edx
     mov ecx, 1
     mov esi, FAT_BUF
-    call ata_write_sectors
+    call fat_dev_write
     inc ebx
     jmp .copy
 .done:
@@ -1510,7 +1512,7 @@ fat_alloc_cluster:
     add eax, [fat_fat_lba]              ; 扇区号 → LBA
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail                           ; 读不到:别拿旧缓冲区找空簇
     mov esi, FAT_BUF
@@ -1651,7 +1653,7 @@ fat_write_file:
     add eax, [fat_data_lba]
     mov ecx, [fat_spc]
     mov esi, [fat_src]
-    call ata_write_sectors
+    call fat_dev_write
     mov eax, [fat_chunk_bytes]
     add [fat_src], eax
     sub [fat_left], eax
@@ -1661,7 +1663,7 @@ fat_write_file:
     mov eax, [fat_dir_lba]
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     cmp dword [wr_existing], 0
@@ -1699,7 +1701,7 @@ fat_write_file:
     mov eax, [fat_dir_lba]
     mov ecx, 1
     mov esi, FAT_BUF
-    call ata_write_sectors
+    call fat_dev_write
     mov dword [fat_cache_lba], -1
     popad
     xor eax, eax
@@ -1752,7 +1754,7 @@ fat_list:
     mov eax, [fl_lba]
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .done
     mov dword [fat_cache_lba], -1
@@ -1931,7 +1933,7 @@ fat_free_slot:
     mov eax, [fs_lba]
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     mov dword [fat_cache_lba], -1
     xor ebx, ebx
 .entry:
@@ -1993,7 +1995,7 @@ fat_zero_cluster:
     mov esi, dir_zero
     push ecx
     mov ecx, 1
-    call ata_write_sectors
+    call fat_dev_write
     pop ecx
     inc dword [zs_lba]
     dec ecx
@@ -2056,11 +2058,11 @@ fat_mkdir:
     mov eax, [mk_lba]
     mov ecx, 1
     mov esi, dir_make
-    call ata_write_sectors
+    call fat_dev_write
     mov eax, [fat_dir_lba]              ; 6) 目录项写进父目录(读失败就别写)
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -2090,7 +2092,7 @@ fat_mkdir:
     mov eax, [fat_dir_lba]
     mov ecx, 1
     mov esi, FAT_BUF
-    call ata_write_sectors
+    call fat_dev_write
     popad
     xor eax, eax
     ret
@@ -2119,7 +2121,7 @@ fat_unlink:
     mov [rm_lba], eax
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -2156,7 +2158,7 @@ fat_unlink:
     mov eax, [rm_lba]                   ; 父目录里那一项标成 0xE5
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -2183,7 +2185,7 @@ fat_unlink:
     mov eax, [rm_lba]
     mov ecx, 1
     mov esi, FAT_BUF
-    call ata_write_sectors
+    call fat_dev_write
     popad
     xor eax, eax
     ret
@@ -2207,7 +2209,7 @@ fat_rmdir:
     mov [rm_lba], eax
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -2237,7 +2239,7 @@ fat_rmdir:
     mov eax, [rm_lba2]
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -2286,7 +2288,7 @@ fat_rmdir:
     mov eax, [rm_lba]                   ; 父目录里那一项标成 0xE5
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     cmp eax, 0
     jne .fail
     mov dword [fat_cache_lba], -1
@@ -2313,7 +2315,7 @@ fat_rmdir:
     mov eax, [rm_lba]
     mov ecx, 1
     mov esi, FAT_BUF
-    call ata_write_sectors
+    call fat_dev_write
     popad
     xor eax, eax
     ret
@@ -2343,7 +2345,7 @@ fat_dotdot:
     add eax, [fat_data_lba]
     mov ecx, 1
     mov edi, FAT_BUF
-    call ata_read_sectors
+    call fat_dev_read
     mov dword [fat_cache_lba], -1
     cmp byte [FAT_BUF + 32], '.'        ; 第二项应该就是 ..
     jne .root
@@ -2362,8 +2364,40 @@ fat_dotdot:
     pop ebx
     ret
 
+; ---------------------------------------------------------------------------
+;  块设备统一入口(U1 解耦):FAT 不再直接叫 ata_*,全部走 blkdev 抽象。
+;  默认设备是 ATA 硬盘;usbdisk mount 时切到 USB,umount 时切回来。
+; ---------------------------------------------------------------------------
+; fat_type:eax = 16 / 32(当前挂载的 FAT 类型;usbdisk 打印用)
+fat_type:
+    movzx eax, byte [fat_fat32]
+    test eax, eax
+    jz .t16
+    mov eax, 32
+    ret
+.t16:
+    mov eax, 16
+    ret
+
+fat_dev_read:
+    jmp blk_read_sectors
+fat_dev_write:
+    jmp blk_write_sectors
+
+; fat_set_part_base:切换分区起始 LBA(eax = 新基址;USB 挂载/卸载时用)
+fat_set_part_base:
+    mov [fat_part_base], eax
+    ret
+
+; fat_get_part_base:eax = 当前分区起始 LBA
+fat_get_part_base:
+    mov eax, [fat_part_base]
+    ret
+
 ; ---------------------------------------------------------------- 数据
+fat_state_begin:                        ; ★ 挂载状态保存区从这里开始(usbdisk mount 用)
 fat_ok          db 0
+fat_part_base   dd FAT_PART_LBA         ; FAT 分区起始 LBA(默认 ATA;USB 挂载时改)
 fat_bps         dd 512
 fat_spc         dd 4
 fat_reserved    dd 1
@@ -2460,3 +2494,33 @@ frun_left       dd 0                    ; 固定根目录:还剩几个扇区;子
 frun_clus       dd 0
 frun_need       dd 0
 frun_new        dd 0
+
+; ---------------------------------------------------------------- 数据结束
+fat_state_end:                          ; ★ 挂载状态区到这里结束
+FAT_STATE_SIZE equ fat_state_end - fat_state_begin
+                                        ; 状态区:BPB 解析结果 + 目录簇/缓存/分配提示 + 静态缓冲
+
+; ---------------------------------------------------------------------------
+;  fat_state_save / fat_state_restore:保存/恢复整个 FAT 挂载状态
+;  usbdisk mount:保存 ATA 的挂载状态 → 切 USB → fat_mount;umount 时恢复。
+;  状态区大小必须在 BLK_FAT_STATE_MAX(4 KiB)以内,blkdev.asm 里有汇编期自检。
+; ---------------------------------------------------------------------------
+fat_state_save:
+    pushad
+    mov esi, fat_state_begin
+    mov edi, BLK_FAT_STATE_BUF
+    mov ecx, FAT_STATE_SIZE
+    cld
+    rep movsb
+    popad
+    ret
+
+fat_state_restore:
+    pushad
+    mov esi, BLK_FAT_STATE_BUF
+    mov edi, fat_state_begin
+    mov ecx, FAT_STATE_SIZE
+    cld
+    rep movsb
+    popad
+    ret
