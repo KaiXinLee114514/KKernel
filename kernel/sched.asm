@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 172               ; 每个 TCB 172 字节(A2/A3:身份/优先级/睡眠,见 /4、imul)
+TCB_SIZE          equ 192               ; 每个 TCB 192 字节(A2/A3+B:身份/优先级/睡眠/进程组,见 /4、imul)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -95,6 +95,15 @@ TCB_SP_WINDOWPAGES equ 164              ; 从 SPACE_IMG_VA 起一共几页
 ;  AGE = 这个线程在就绪队列里连续等了多少个 tick(不是自己的 tick);
 ;  等满 AGING_TICKS 就提一级优先级,保证低优先级线程不会饿死。
 TCB_AGE           equ 168               ; 就绪等太久的 tick 数(A3 aging 用)
+
+; ---- B(Phase B 作业控制):进程组/会话 + shell 作业载荷 ----
+;  进程组是"作业"的单位:shell 每个作业一个 pgrp(组长 = 首进程 pid);
+;  ^C/^Z 发给前台进程组,tcsetpgrp 记录哪个组现在占着终端。
+TCB_PGRP          equ 172               ; 进程组号(0 = 还没分配)
+TCB_SID           equ 176               ; 会话号(最小实现:所有 shell/作业同会话)
+TCB_EXECBUF       equ 180               ; 子进程 exec 载荷页(名字+参数;0 = 没有)
+TCB_STOPREQ       equ 184               ; 1 = ^Z 要求这条线程在 ring3 现场停下
+TCB_KBUSY         equ 188               ; 最近一次读键盘的 tick(判"交互程序"用)
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))
@@ -115,6 +124,8 @@ SCHED_PRIO_IDLE   equ 15                ; 最低优先级(以后空闲线程用)
 SCHED_PRIO_KERNEL equ 7                 ; 内核服务线程:比普通线程高一级
 AGING_TICKS       equ 100               ; 等 1 秒(100 tick)提一级优先级
 SCHED_CS          equ 0x08              ; 内核代码段选择子(GDT 第 2 项)
+SHELL_PGRP        equ 1                 ; shell 自己的进程组(shell 线程都属于它)
+SHELL_SID         equ 1                 ; 会话号(最小实现:全家一个会话)
 EFLAGS_IF         equ 0x202             ; eflags:IF=1,新线程一上来就能被打断
 
 ; ---------------------------------------------------------------------------
@@ -147,6 +158,9 @@ sched_init:
     mov [edi + TCB_SP_WINDOWPAGES], eax
     mov eax, [sched_default_prio]
     mov [edi + TCB_PRIO], eax
+    ; B:0 号线程 = 主 shell,它属于 shell 自己的进程组/会话
+    mov dword [edi + TCB_PGRP], SHELL_PGRP
+    mov dword [edi + TCB_SID], SHELL_SID
     mov [space_cur], edi                ; 现在跑的就是 0 号线程
     mov dword [tss_blk + TSS_ESP0], 0   ; ring3 进来时才设,先清掉开机时的旧值
     mov dword [sched_cur], 0
@@ -842,6 +856,12 @@ sched_spawn:
     mov dword [edx + TCB_PENDING], 0
     mov dword [edx + TCB_BLOCKED], 0
     mov dword [edx + TCB_PFCOW], 0
+    ; B:进程组/会话/作业载荷/停止请求也清零(空槽可能留着上一个人的)
+    mov dword [edx + TCB_PGRP], 0
+    mov dword [edx + TCB_SID], 0
+    mov dword [edx + TCB_EXECBUF], 0
+    mov dword [edx + TCB_STOPREQ], 0
+    mov dword [edx + TCB_KBUSY], 0
     ; 内核线程没有 ring3 程序,但给一个有效的 esp0 顶(真跑程序时 exec 会覆盖)
     mov eax, [spawn_stack]
     add eax, SCHED_STACK_PAGES * 4096
@@ -1068,6 +1088,38 @@ sched_abandon_current:
     sti
     hlt
     jmp .again
+
+; ---------------------------------------------------------------------------
+;  sched_check_stopreq:IRQ0 里检查"当前 ring3 线程要不要被 ^Z 暂停"
+;    由 irq0_stub 在 .no_kill_req 处调用;此时栈上是 irq0_stub 的帧,
+;    helper 又多压了个返回地址,所以中断前 CS 在 [esp+48]。
+;  做了:清 STOPREQ、STATE=ST_STOPPED、唤醒父进程(shell)。
+;  之后 irq0_stub 照常走 sched_pick —— 它会把这份中断现场存进 TCB_ESP,切走;
+;  CONT 时从这儿恢复。
+; ---------------------------------------------------------------------------
+sched_check_stopreq:
+    mov eax, [esp + 48]                 ; 中断前的 CS
+    and eax, 3
+    cmp eax, 3
+    jne .out
+    mov edx, [space_cur]
+    cmp dword [edx + TCB_STOPREQ], 0
+    je .out
+    cmp dword [edx + TCB_SP_RUNNING], 0
+    je .out
+    mov dword [edx + TCB_STOPREQ], 0
+    mov dword [edx + TCB_STATE], ST_STOPPED
+    ; 父进程(通常是 shell)可能在 wait:叫醒它,让它看到 Stopped 的作业
+    mov ecx, [edx + TCB_PARENT]
+    test ecx, ecx
+    jz .out
+    dec ecx
+    imul ecx, TCB_SIZE
+    add ecx, tcb_table
+    mov eax, ecx
+    call sched_wakeup
+.out:
+    ret
 
 ; ---------------------------------------------------------------------------
 ;  sched_kill_space:上一次 sched_kill 杀掉的线程的地址空间快照

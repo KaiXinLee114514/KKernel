@@ -59,6 +59,56 @@ process_getpid:
     ret
 
 ; ---------------------------------------------------------------------------
+;  process_setpgid / process_getpgrp:进程组(作业)最小实现
+;    setpgid:eax = pid(0 = 自己), ebx = pgrp(0 = 用 pid 当组号,即组长)→ 0/-1
+;    最小权限:调用方是内核(shell 建作业)或程序改自己/子进程;这里只做存在性检查。
+; ---------------------------------------------------------------------------
+process_setpgid:
+    pushad
+    mov dword [pg_ret], -1
+    mov ecx, eax                        ; pid
+    test ecx, ecx
+    jnz .have_pid
+    mov ecx, [sched_cur]
+    inc ecx                             ; pid = 当前
+.have_pid:
+    cmp ecx, SCHED_MAX
+    ja .out
+    lea eax, [ecx - 1]
+    imul eax, TCB_SIZE
+    add eax, tcb_table
+    cmp dword [eax + TCB_STATE], ST_EMPTY
+    je .out
+    mov edx, ebx                        ; pgrp
+    test edx, edx
+    jnz .have_pgrp
+    mov edx, ecx                        ; pgrp = 0 → 用 pid 当组号(组长)
+.have_pgrp:
+    mov [eax + TCB_PGRP], edx
+    mov dword [pg_ret], 0
+.out:
+    popad
+    mov eax, [pg_ret]
+    ret
+
+process_getpgrp:
+    call process_cur_tcb
+    mov eax, [eax + TCB_PGRP]
+    ret
+
+; ---------------------------------------------------------------------------
+;  process_signal_send_kernel:内核自己发信号(^C/^Z/fg/bg 用),跳过权限检查
+;    入:eax = 目标 pid, ebx = signal_t;出:同 process_signal_send
+; ---------------------------------------------------------------------------
+process_signal_send_kernel:
+    mov byte [ss_kernel], 1
+    call process_signal_send
+    push eax
+    mov byte [ss_kernel], 0
+    pop eax
+    ret
+
+; ---------------------------------------------------------------------------
 ;  process_alloc_slot:找一个空槽 → eax = 槽号,CF=0;满了 CF=1
 ;  空槽 = ST_EMPTY。僵尸还占着槽(等父进程收尸),不会被抢。
 ; ---------------------------------------------------------------------------
@@ -298,6 +348,11 @@ process_fork:
     mov [edx + TCB_UID], eax
     mov eax, [esi + TCB_GID]
     mov [edx + TCB_GID], eax
+    ; B:进程组/会话跟着父进程(exec 不会改它们)
+    mov eax, [esi + TCB_PGRP]
+    mov [edx + TCB_PGRP], eax
+    mov eax, [esi + TCB_SID]
+    mov [edx + TCB_SID], eax
     mov eax, [esi + TCB_SP_HEAPPAGES]
     mov [edx + TCB_SP_HEAPPAGES], eax
     mov eax, [esi + TCB_SP_ARGSVA]
@@ -395,13 +450,27 @@ process_fork:
 ;  醒来后 cli 回到内核态继续扫表 —— 表的改动全在中断里,不会撕裂。
 ;  没有孩子(或等的 pid 不是自己的娃)时立刻返回 -1,不睡。
 ; ---------------------------------------------------------------------------
-process_wait:
+; process_wait2:等子进程事件(退出 / 被信号停住),支持 WUNTRACED + WNOHANG
+;   入:eax = 子进程 pid(-1 = 任意), ebx = flags(bit0 WUNTRACED, bit1 WNOHANG)
+;   出:eax = -1 没有孩子;0 = 有事件;1 = WNOHANG 且有孩子但此刻没事件
+;   事件细节:proc_wait_status(0=正常退出,1=被停住),proc_wait_pid(=槽+1),
+;            proc_wait_code(退出码)
+;   退出事件收尸后照旧更新 proc_last_*(给 shell 打 space/demand 行)
+; ---------------------------------------------------------------------------
+WT_WUNTRACED equ 1
+WT_WNOHANG   equ 2
+process_wait2:
     pushad
     mov [pw_pid], eax
+    mov [pw_flags], ebx
     mov dword [pw_ret], -1
     mov dword [proc_last_child], 0
+    mov dword [proc_wait_status], 0
+    mov dword [proc_wait_pid], 0
+    mov dword [proc_wait_code], 0
     mov dword [pw_sleeping], 0
 .retry:
+    ; ---- 1) 先扫"已退出(ST_ZOMBIE)"的孩子 ----
     xor esi, esi
 .scan:
     mov edx, esi
@@ -429,10 +498,25 @@ process_wait:
     sti
 .reap_go:
     mov [pw_slot], esi
+    ; 收尸前把程序退出的统计快照下来 —— 清槽后 shell 还要用它打印
+    ; "address space destroyed: N page(s)" / "demand paging: ..." 那几行。
+    mov eax, [edx + TCB_SP_FREED]
+    mov [proc_last_freed], eax
+    mov eax, [edx + TCB_SP_RUNSTAT]
+    mov [proc_last_runstat], eax
+    mov eax, [edx + TCB_SP_PFRUN]
+    mov [proc_last_pfrun], eax
+    mov eax, [edx + TCB_SP_PFIMG]
+    mov [proc_last_pfimg], eax
+    mov eax, [edx + TCB_SP_PFHEAP]
+    mov [proc_last_pfheap], eax
+    mov eax, [edx + TCB_SP_FIRSTPA]
+    mov [proc_last_firstpa], eax
     mov eax, [edx + TCB_EXITCODE]
-    mov [pw_ret], eax
+    mov [proc_wait_code], eax
     lea eax, [esi + 1]
     mov [proc_last_child], eax
+    mov [proc_wait_pid], eax
     ; 内核栈(16 KiB + guard)还回去(地址空间在 exit 时已经拆了)
     mov eax, [edx + TCB_STACK]
     test eax, eax
@@ -444,13 +528,46 @@ process_wait:
     add edx, tcb_table
     call process_clear_tcb
     dec dword [sched_live]
+    mov dword [pw_ret], 0
     jmp .done
 .next:
     inc esi
     cmp esi, SCHED_MAX
     jb .scan
 
-    ; ---- 没扫到僵尸:这个 pid 还有没有活着的(或暂停的)孩子? ----
+    ; ---- 2) 没有僵尸:如果有孩子被停住且调用方要 WUNTRACED,报停止事件 ----
+    test dword [pw_flags], WT_WUNTRACED
+    jz .children
+    xor esi, esi
+.scan_stop:
+    mov edx, esi
+    imul edx, TCB_SIZE
+    add edx, tcb_table
+    cmp dword [edx + TCB_STATE], ST_STOPPED
+    jne .stop_next
+    mov eax, [sched_cur]
+    inc eax
+    cmp [edx + TCB_PARENT], eax
+    jne .stop_next
+    mov eax, [pw_pid]
+    cmp eax, -1
+    je .got_stop
+    lea ecx, [esi + 1]
+    cmp eax, ecx
+    jne .stop_next
+.got_stop:
+    lea eax, [esi + 1]
+    mov [proc_wait_pid], eax
+    mov dword [proc_wait_status], 1
+    mov dword [pw_ret], 0
+    jmp .done
+.stop_next:
+    inc esi
+    cmp esi, SCHED_MAX
+    jb .scan_stop
+
+    ; ---- 3) 还有没有活着的孩子? ----
+.children:
     xor esi, esi
 .child:
     mov edx, esi
@@ -475,6 +592,10 @@ process_wait:
 
     ; ---- 没有孩子:wait 立刻返回 -1(和 POSIX 的 ECHILD 一个意思)----
     jmp .done
+.have_child:
+    ; WNOHANG:有孩子但还没事件 → 立刻返回 1,不睡
+    test dword [pw_flags], WT_WNOHANG
+    jnz .would_block
 .sleep:
     ; ---- 睡在「父线程 TCB 指针」这个通道上;孩子 exit 时 sched_wakeup 叫醒 ----
     cmp dword [pw_sleeping], 0
@@ -489,6 +610,8 @@ process_wait:
     call sched_sleep_commit             ; 开中断睡到被叫醒(返回时 IF=1)
     mov dword [pw_sleeping], 0
     jmp .retry
+.would_block:
+    mov dword [pw_ret], 1
 .done:
     ; 不用睡了:万一还挂着"准备睡"就先撤掉,再把中断状态摆正
     cmp dword [pw_sleeping], 0
@@ -500,6 +623,21 @@ process_wait:
     sti
     popad
     mov eax, [pw_ret]
+    ret
+
+; process_wait:旧接口(阻塞等任意僵尸,返回退出码 / -1),内部调 wait2
+process_wait:
+    push ebx
+    xor ebx, ebx
+    call process_wait2
+    cmp eax, 0
+    jne .none
+    mov eax, [proc_wait_code]
+    pop ebx
+    ret
+.none:
+    mov eax, -1
+    pop ebx
     ret
 
 ; ---------------------------------------------------------------------------
@@ -527,6 +665,8 @@ process_exit:
     call sched_wakeup
 .no_parent:
     call space_destroy                  ; 当前线程的空间;没建也能调
+    mov edx, [space_cur]                ; 收尸时 process_wait 要从 TCB 里快照这个数
+    mov [edx + TCB_SP_FREED], eax
     popad
     jmp sched_abandon_current
 
@@ -564,6 +704,28 @@ process_terminate:
     mov ecx, TCB_SIZE
     div ecx
     mov [pt_slot], eax
+    ; ---- B:正在 ring3 里跑的进程不能直接标僵尸 ----
+    ;  它不在就绪队列里(正在跑),直接标僵尸会让调度器/栈现场对不上。
+    ;  和别的 shell 的 kill 一样:置 KILLREQ,IRQ0 在它自己的现场上收摊
+    ;  (run_resume_kernel → process_exit)。被 STOP 的先恢复成可运行。
+    mov edx, [pt_tcb]
+    cmp dword [edx + TCB_SP_RUNNING], 0
+    je .not_running
+    cmp dword [edx + TCB_SP_RUNESP], 0
+    je .not_running
+    cmp dword [edx + TCB_SP_RUNSTAT], 0
+    jne .not_running
+    cmp dword [edx + TCB_STATE], ST_STOPPED
+    jne .killreq_only
+    mov dword [edx + TCB_STOPREQ], 0
+    mov dword [edx + TCB_STATE], ST_ALIVE
+    mov esi, [pt_slot]
+    call sched_ready_enqueue
+    mov edx, [pt_tcb]
+.killreq_only:
+    mov dword [edx + TCB_SP_KILLREQ], 1
+    jmp .ok
+.not_running:
     cmp eax, SH_MAX
     jb .shell_slot
     mov ecx, [pt_tcb]
@@ -666,6 +828,9 @@ process_signal_send:
     ; ---- 1.5) 发送方权限检查(最小多用户)----
     ;   uid 0(super)想发什么发什么;super 类只允许 uid 0,system 类只允许
     ;   uid 0/1,user 类不限;级别 0(只查询不杀)只允许 uid 0。
+    ;   内核自己发的信号(^C/^Z/fg 等)用 process_signal_send_kernel,跳过检查。
+    cmp byte [ss_kernel], 0
+    jne .perm_ok
     call process_cur_tcb
     mov ecx, [eax + TCB_UID]
     test ecx, ecx
@@ -739,11 +904,31 @@ process_signal_send:
 
 .do_stop:
     mov edx, [ss_tcb]
+    ; 目标就是"此刻正在 ring3 里跑的那条线程":它不在就绪队列里(正在跑),
+    ; 不能直接摘;给它留个 STOPREQ,IRQ0 在它自己的中断现场上收摊。
+    cmp dword [edx + TCB_SP_RUNNING], 0
+    je .do_stop_ready
+    mov eax, [sched_cur]
+    mov ecx, [ss_slot]
+    cmp eax, ecx
+    jne .do_stop_ready
+    mov dword [edx + TCB_STOPREQ], 1
+    jmp .accept
+.do_stop_ready:
     cmp dword [edx + TCB_STATE], ST_ALIVE
     jne .accept
     mov esi, [ss_slot]
     call sched_ready_remove             ; 暂停:从就绪队列里摘掉
     mov dword [edx + TCB_STATE], ST_STOPPED
+    ; 父进程(通常是 shell)可能正 wait 着它:叫醒父进程让它看到 STOPPED
+    mov ecx, [edx + TCB_PARENT]
+    test ecx, ecx
+    jz .accept
+    dec ecx
+    imul ecx, TCB_SIZE
+    add ecx, tcb_table
+    mov eax, ecx
+    call sched_wakeup
     jmp .accept
 
 .do_cont:
@@ -1018,6 +1203,11 @@ process_spawn_kernel:
     mov [edx + TCB_UID], ecx
     mov ecx, [eax + TCB_GID]
     mov [edx + TCB_GID], ecx
+    ; B:进程组/会话从"造它的线程"继承(shell 的作业随后再改成本作业的组)
+    mov ecx, [eax + TCB_PGRP]
+    mov [edx + TCB_PGRP], ecx
+    mov ecx, [eax + TCB_SID]
+    mov [edx + TCB_SID], ecx
     pop eax
     clc
     pop ebx
@@ -1036,23 +1226,48 @@ process_spawn_kernel:
 ; ---------------------------------------------------------------------------
 process_exec:
     pushad
-    mov esi, eax
+    ; ---- Phase B:shell 的 run 会先把"名字+参数"放进子进程的 EXECBUF 页 ----
+    ;   普通调用(fork <prog>)是 eax = 名字指针;bundle 模式则从 TCB 里取。
+    mov dword [proc_exec_bundle], 0
+    mov dword [proc_exec_argsptr], 0
+    mov dword [proc_exec_quiet], 1
+    mov esi, eax                        ; 先存"名字指针"(下面 process_cur_tcb 会踩 eax)
+    call process_cur_tcb
+    mov ecx, [eax + TCB_EXECBUF]
+    test ecx, ecx
+    jz .copy_name                       ; 普通调用:esi 还是名字指针
+    mov [proc_exec_bundle], ecx
+    mov esi, ecx                        ; 作业模式:名字在 bundle 开头
+    lea eax, [ecx + 64]
+    mov [proc_exec_argsptr], eax        ; 参数在 bundle+64
+    mov dword [proc_exec_quiet], 0
+.copy_name:
+    ; 用显式 mov 拷贝,不依赖 DS/ES 与方向标志(lodsb/stosb 更娇气)
     mov edi, proc_exec_buf
     mov ecx, 60
-.copy_name:
-    lodsb
+.copy_loop:
+    mov al, [esi]
+    inc esi
     test al, al
     jz .name_done
-    stosb
+    mov [edi], al
+    inc edi
     dec ecx
-    jnz .copy_name
+    jnz .copy_loop
 .name_done:
     mov byte [edi], 0
-
+    ; 作业子进程(quiet=0)在 ps 里显示程序名;fork <prog> 保持 nm_child
+    cmp dword [proc_exec_quiet], 0
+    jne .keep_name
+    call process_cur_tcb
+    mov dword [eax + TCB_NAME], proc_exec_buf
+.keep_name:
     mov eax, [fat_dir]
     mov [proc_exec_dir], eax
 
     call loader_lock
+    call fs_lock                        ; 读 FAT 全局状态:锁顺序 loader → fs
+    mov byte [proc_exec_fs_locked], 1
 
     ; ---- 1) 找文件:先按给的路径,stat 不到再试根目录的 BIN/ ----
     ;  fat_path 只负责"按 / 分段 chdir",不检查文件在不在(和 cmd_run 一样),
@@ -1130,6 +1345,7 @@ process_exec:
 .flat_ready:
     mov eax, [proc_exec_dir]
     mov [fat_dir], eax                  ; 文件目录还给 shell 的 cwd
+    call proc_exec_fs_unlock
 
     ; ---- 3) 旧空间先拆(第一次 exec 时什么也没有)----
     call space_destroy
@@ -1156,11 +1372,45 @@ process_exec:
     shr ecx, 2
     rep movsd
 
+    ; ---- 4.5) 程序马上要跑:报一声名字(bundle 模式;管道里静音)----
+    cmp dword [proc_exec_quiet], 0
+    jne .no_run_msg
+    cmp dword [pipe_active], 0
+    jne .no_run_msg
+    mov al, COL_HEADER
+    call term_set_color
+    mov esi, msg_exec_running
+    call term_print
+    mov esi, proc_exec_buf
+    call term_print
+    mov al, 10
+    call term_putc
+    mov al, COL_NORMAL
+    call term_set_color
+.no_run_msg:
+
     ; ---- 5) 建新地址空间 ----
     call space_create
     jc .nomem
     mov eax, [proc_exec_size]
     call space_set_image
+    ; ---- 报一声自己的 CR3(旧 cmd_run 的那行;bundle 模式,管道静音)----
+    cmp dword [proc_exec_quiet], 0
+    jne .no_space_msg
+    cmp dword [pipe_active], 0
+    jne .no_space_msg
+    mov al, COL_HEADER
+    call term_set_color
+    mov esi, msg_exec_space_head
+    call term_print
+    mov edx, [space_cur]
+    mov eax, [edx + TCB_SP_PD]
+    call term_print_hex
+    mov esi, msg_exec_space_tail
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+.no_space_msg:
     call space_activate
     call space_prepare_user             ; 弹床页 + 用户栈页
     test eax, eax
@@ -1170,6 +1420,37 @@ process_exec:
     call space_user_page                ; 参数页(零 = 没有参数)
     test eax, eax
     jz .nomem
+    ; ---- 5.5) 把作业载荷里的参数搬进参数页(api get_arg 认头部 JARG 魔数)----
+    mov eax, [proc_exec_argsptr]
+    test eax, eax
+    jz .no_job_args
+    mov edx, [space_cur]
+    mov edi, [edx + TCB_SP_ARGSVA]
+    mov dword [edi], 'JARG'
+    add edi, 4
+    mov esi, eax
+    mov ecx, SPACE_ARGS_COPY - 1
+.job_arg_copy:
+    lodsb
+    stosb
+    test al, al
+    jz .job_arg_done
+    dec ecx
+    jnz .job_arg_copy
+    mov byte [edi], 0
+.job_arg_done:
+.no_job_args:
+    ; 载荷页用完就还(名字/参数已经各就各位);顺手清 TCB_EXECBUF
+    mov eax, [proc_exec_bundle]
+    test eax, eax
+    jz .no_bundle
+    mov ecx, 1
+    call pmem_free_pages
+    mov dword [proc_exec_bundle], 0
+    mov dword [proc_exec_argsptr], 0
+    call process_cur_tcb
+    mov dword [eax + TCB_EXECBUF], 0
+.no_bundle:
 
     ; ---- 6) 退出/中断要用它的内核栈顶 ----
     mov edx, [space_cur]
@@ -1199,12 +1480,14 @@ process_exec:
 .nofile:
     mov eax, [proc_exec_dir]
     mov [fat_dir], eax
+    call proc_exec_fs_unlock
     call loader_unlock
     mov esi, msg_exec_nofile
     jmp .die
 .nomem:
     mov eax, [proc_exec_dir]
     mov [fat_dir], eax
+    call proc_exec_fs_unlock
     call loader_unlock
     mov esi, msg_exec_nomem
 .die:
@@ -1217,6 +1500,26 @@ process_exec:
     call term_set_color
     mov eax, 1
     call process_exit                   ; 不返回
+
+; ---------------------------------------------------------------------------
+;  proc_exec_child2:shell 的 run(fork+exec)起的作业子进程入口
+;  入:无 —— 名字/参数在这个子进程 TCB 的 EXECBUF 载荷页里(父 shell 已挂好)。
+; ---------------------------------------------------------------------------
+proc_exec_child2:
+    call process_cur_tcb
+    mov eax, [eax + TCB_EXECBUF]
+    call process_exec
+    mov eax, 1
+    call process_exit
+
+; proc_exec_fs_unlock:exec 里的 FAT 段结束,放 fs 锁(幂等,可重复调)
+proc_exec_fs_unlock:
+    cmp byte [proc_exec_fs_locked], 0
+    je .out
+    mov byte [proc_exec_fs_locked], 0
+    call fs_unlock
+.out:
+    ret
 
 ; ---------------------------------------------------------------------------
 ;  proc_exec_child:shell 的 "fork <程序>" 起的子线程入口
@@ -1282,6 +1585,16 @@ pw_ret          dd 0
 pw_tcb          dd 0                    ; process_wait 睡眠用的通道 = 自己的 TCB 指针
 pw_sleeping     dd 0                    ; 1 = 已经 prepare 睡眠、还没 commit / 已撤回
 proc_last_child dd 0
+pw_flags        dd 0                    ; process_wait2 的 flags(WT_*)
+proc_wait_status dd 0                   ; wait2 事件:0 = 退出,1 = 被停住
+proc_wait_pid   dd 0                    ; wait2 事件涉及的 pid(槽+1)
+proc_wait_code  dd 0                    ; wait2 退出码
+proc_last_freed dd 0                    ; 收尸前快照:还回去的页数(space_destroy)
+proc_last_runstat dd 0                  ; 收尸前快照:0 正常退出 / 1 被内核干掉
+proc_last_pfrun dd 0
+proc_last_pfimg dd 0
+proc_last_pfheap dd 0
+proc_last_firstpa dd 0
 
 pt_tcb          dd 0
 pt_code         dd 0
@@ -1297,6 +1610,8 @@ ss_slot         dd 0
 ss_tcb          dd 0
 ss_bit          dd 0
 ss_ret          dd 0
+ss_kernel       db 0                    ; 1 = 内核内部发的信号(跳过权限检查)
+pg_ret          dd 0                    ; process_setpgid 返回值
 
 sp_class        dd 0
 sp_action       dd 0
@@ -1304,6 +1619,10 @@ sp_level        dd 0
 sig_buf         times 24 db 0
 
 proc_exec_name  dd 0                    ; shell "fork <程序>" 传进来的名字指针
+proc_exec_bundle dd 0                   ; 作业载荷页(名字+参数,0 = 没有)
+proc_exec_argsptr dd 0                  ; 载荷里的参数字符串指针(0 = 没参数)
+proc_exec_quiet dd 1                    ; 1 = 静音(fork <prog>;0 = 作业,要打 running/space 行)
+proc_exec_fs_locked db 0                ; exec 的 FAT 段是否拿着 fs 锁
 proc_exec_buf   times 64 db 0
 proc_exec_path  times 64 db 0
 proc_exec_dir   dd 0
@@ -1338,6 +1657,9 @@ s_none          db 'none', 0
 sig_class_strs  dd s_super, s_system, s_user
 sig_action_strs dd s_none, s_kill, s_term, s_stop, s_cont, s_intr, s_usr
 
+msg_exec_running db 'running ', 0
+msg_exec_space_head db 'address space: CR3 = ', 0
+msg_exec_space_tail db '  (own page directory + demand paging)', 10, 0
 msg_exec_nofile db 'exec: program not found', 13, 10, 0
 msg_exec_nomem  db 'exec: not enough memory to build the address space', 13, 10, 0
 msg_perm_denied db 'permission denied: need super', 13, 10, 0

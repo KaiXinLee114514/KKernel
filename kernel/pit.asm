@@ -87,6 +87,11 @@ irq0_stub:
     mov esp, [edx + TCB_SP_RUNESP]      ; 丢掉 ring 3 的中断帧,回到 cmd_run 的现场
     jmp run_resume_kernel
 .no_kill_req:
+    ; ---- ^Z:前台 ring3 进程被要求暂停 ----
+    ;  辅助函数在 sched.asm(那里有 TCB_* 常量;pit.asm 在它前面 include,
+    ;  不能在这个文件里直接引用 TCB_* 的 equ)。它看中断前的 CS 是不是
+    ;  ring 3,是就标 STOPPED、唤醒父 shell;之后照常走下面的调度。
+    call sched_check_stopreq
 
     ; ---- 抢占式多任务:要不要换人 ----
     ;  此刻 esp 指着 pushad 压出来的现场,把它交给调度器:它返回"下一个线程"

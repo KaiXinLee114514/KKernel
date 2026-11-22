@@ -400,6 +400,10 @@ kbd_push:
     push eax
     push ebx
     push ecx
+    ; Phase B:^C/^Z 先给作业控制层过一眼(前台有作业时可能变成信号,不再进缓冲)
+    ;   过滤器用 CF 表达"已消费",必须保留 al(下面还要存字符)
+    call jobctl_kbd_filter
+    jc .consumed
     mov ebx, [kbd_head]
     mov ecx, ebx
     inc ecx
@@ -413,6 +417,7 @@ kbd_push:
     mov eax, tty_chan
     call sched_wakeup
     pop eax
+.consumed:
 .full:
     pop ecx
     pop ebx

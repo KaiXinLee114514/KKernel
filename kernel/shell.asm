@@ -372,6 +372,9 @@ shell_spawn_extra:
     mov [eax + TCB_UID], ecx
     mov ecx, [login_gid]
     mov [eax + TCB_GID], ecx
+    ; B:每条 shell 线程都属于 shell 自己的进程组/会话
+    mov dword [eax + TCB_PGRP], SHELL_PGRP
+    mov dword [eax + TCB_SID], SHELL_SID
     inc ebp
     jmp .next
 .done:
@@ -2487,36 +2490,44 @@ str_same_path:
 ;    镜像窗口只有 384 KiB,程序再大就直接拒绝(见 PROG_MAX_SIZE;字库现在运行时
 ;    搬到恒等映射顶部了,这个静态上限只是保守值)。
 ; ---------------------------------------------------------------------------
+; ===========================================================================
+;  run <文件> [参数]:把程序作为**前台子进程**跑
+;
+;  Phase B 起,run 不再是"shell 线程自己 iret 进 ring3",而是:
+;    1) shell 解析名字/参数(全局缓冲,loader_lock 串起来),先 stat 一遍;
+;    2) 申请一页"作业载荷"(名字 + 参数),shell fork 一个内核线程(proc_exec_child2);
+;    3) 子线程调 process_exec 读文件/建空间/进 ring3,shell 自己 wait;
+;    4) 子进程退出时 process_exit → 唤醒父 shell;父 shell 按快照打印收摊信息
+;       (文案与 Phase A 的 cmd_run.after_prog 完全一致,hd 回归照旧认)。
+;
+;  为什么这么改:程序跑在自己的进程里,^C/^Z/后台才杀得掉、停得住;shell 线程
+;  在程序跑的时候也能继续响应(中断里转到别的 shell)。
+;  名字不带点就自动补 .BIN(所以 run HELLO 和 run HELLO.BIN 一样)。
+; ===========================================================================
 cmd_run:
     cmp byte [fat_ok], 0
     je cmd_ls.nomount
-    ; 找程序时 fat_path 会 chdir(比如兜底到 /BIN),但程序里的文件接口是相对
-    ; **shell 的 cwd** 的:先记下来,读完程序再还回去(不然 run EDIT DOCS/X 会存不进盘)。
+    ; 程序里的文件接口是相对 **shell 的 cwd** 的:找程序时 fat_path 会 chdir,
+    ; 先记下来,读完/校验完再还回去。
     mov eax, [fat_dir]
     mov [cmd_saved_dir], eax
-    ; ---- 装载锁:一次只让一条线程走"读文件 + 展开 + 建空间 + 拷参数" ----
-    ;  PROG_ADDR / PROG_ARG_STR / name_buf / prog_size 仍是全局的;但这不是
-    ;  "一次只许跑一个程序" —— 锁在 iret 进 ring 3 之前就放掉,程序本身并行。
+    ; ---- 装载锁:解析/prog 名字校验/建 bundle/spawn 这一段用的都是全局缓冲 ----
     call loader_lock
-    ; ★ 这里**不能**调 strip_name:它会把第一个空格改成 0,而空格后面的那截
-    ;   正是要传给程序的参数(`run EDIT NOTES.TXT`)—— 一改参数就没了(踩过)。
-    ;   文件名在下面抄进 name_buf,到空格自然就停了。
+    ; ★ 这里**不能**调 strip_name(它会把第一个空格改 0,参数就没了)
     mov esi, [cmd_arg]
     cmp byte [esi], 0
-    je .usage                           ; 光敲 run 就说说程序怎么写
-    mov dword [PROG_ARG_ADDR], 0        ; 参数先当"没有"(上一条命令可能留了残渣)
+    je .usage_locked                   ; 光敲 run 就说说程序怎么写
+    mov dword [PROG_ARG_ADDR], 0
     mov byte [PROG_ARG_STR], 0
-    ; 把名字抄进 name_buf,顺便看有没有带 '.'
-    ; (之前这里写反了方向:从空缓冲往命令参数抄,结果名字变成空的 → file not found)
-    mov esi, [cmd_arg]
+    ; 名字抄进 name_buf(到空格/结尾停),顺便看有没有带 '.'
     mov edi, name_buf
     xor ecx, ecx
-    xor edx, edx                        ; edx = 有没有点
+    xor edx, edx
 .cpy:
     lodsb
     test al, al
     jz .copied
-    cmp al, ' '                         ; 空格之后那截是"给程序的参数"
+    cmp al, ' '
     je .args
     cmp al, '.'
     jne .cpy_store
@@ -2525,25 +2536,14 @@ cmd_run:
     mov [edi], al
     inc edi
     inc ecx
-    cmp ecx, 60                         ; 8.3 是 12 个字符,但带上目录就长了(PP_MAX=64)
+    cmp ecx, 60
     jb .cpy
-
-.copied:
     mov byte [edi], 0
-    test edx, edx
-    jnz .no_ext
-    ; 没写扩展名就补 .BIN(run hello 等于 run hello.bin)
-    mov byte [edi], '.'
-    mov byte [edi + 1], 'B'
-    mov byte [edi + 2], 'I'
-    mov byte [edi + 3], 'N'
-    mov byte [edi + 4], 0
-    jmp .no_ext
-
+    jmp .copied
 .args:
-    ; 名字到这里结束,剩下的是参数:`run EDIT NOTES.TXT` 里的 NOTES.TXT
+    ; 名字到空格为止,后面是给程序的参数
     mov byte [edi], 0
-    push edx                            ; edx/edi 后面还要用来补 .BIN,先存一下
+    push edx
     push edi
 .skip_sp:
     cmp byte [esi], ' '
@@ -2563,21 +2563,170 @@ cmd_run:
     jnz .loop_args
 .args_done:
     mov byte [edi], 0
-    mov dword [PROG_ARG_ADDR], 'JARG'   ; 告诉程序"这次真有参数"
+    mov dword [PROG_ARG_ADDR], 'JARG'
     pop edi
     pop edx
-    jmp .copied
-.no_ext:
-    ; ---- 先按用户写的路径找;找不到再去 /BIN 里找 ----
-    ;   run HELLO       → HELLO.BIN 不在根目录 → /BIN/HELLO.BIN
-    ;   run DOCS/X.BIN  → 先走原路径(支持子目录)
-    ;   记录一下这次是不是已用过 /BIN 兜底,防止来回重试。
+.copied:
+    test edx, edx
+    jnz .have_name
+    ; 没写扩展名就补 .BIN
+    mov byte [edi], '.'
+    mov byte [edi + 1], 'B'
+    mov byte [edi + 2], 'I'
+    mov byte [edi + 3], 'N'
+    mov byte [edi + 4], 0
+.have_name:
+    ; ---- 先校验一遍(只 stat,不读文件):找不到/太大还是老的文案 ----
+    call fs_lock
+    call run_lookup                    ; eax = 大小,-1 = 没找到
+    call run_restore_dir
+    call fs_unlock
+    cmp eax, -1
+    je .notfound
+    cmp eax, (SPACE_IMG_PAGES - 1) * 4096
+    ja .toobig
+    mov [run_prog_size], eax
+    ; ---- 作业载荷:一页,偏移 0 = 名字(≤63B),偏移 64 = 参数(≤2048B) ----
+    mov eax, 1
+    call pmem_alloc_pages
+    test eax, eax
+    jz .nomem
+    mov [run_bundle], eax
+    ; 名字
+    mov esi, name_buf
+    mov edi, eax
+.bn_copy:
+    lodsb
+    stosb
+    test al, al
+    jz .bn_done
+    mov ecx, [run_bundle]
+    add ecx, 62
+    cmp edi, ecx
+    jb .bn_copy
+    mov byte [edi], 0
+    mov byte [edi + 1], 0
+.bn_done:
+    ; 参数
+    mov edi, [run_bundle]
+    add edi, 64
+    mov esi, PROG_ARG_STR
+    mov ecx, PROG_ARG_MAX - 1
+.ar_copy:
+    lodsb
+    stosb
+    test al, al
+    jz .ar_done
+    dec ecx
+    jnz .ar_copy
+    mov byte [edi], 0
+.ar_done:
+    ; ---- cli:spawn 子线程 + 挂载荷/进程组,别让子进程先跑起来 ----
+    pushfd
+    cli
+    mov eax, proc_exec_child2
+    mov ebx, nm_child
+    call process_spawn_kernel
+    jc .spawn_fail
+    ; process_spawn_kernel 返回的是**槽号**(TCB 下标),pid = 槽号 + 1
+    mov [run_slot], eax
+    mov edx, eax
+    imul edx, TCB_SIZE
+    add edx, tcb_table
+    ; 作业载荷(名字+参数)
+    mov ecx, [run_bundle]
+    mov [edx + TCB_EXECBUF], ecx
+    ; pid 才是 shell/进程表/进程组认的数
+    mov ecx, eax
+    inc ecx
+    mov [run_child], ecx
+    ; 建新进程组(组长 = 子进程自己)、同会话
+    mov [edx + TCB_PGRP], ecx
+    mov dword [edx + TCB_SID], SHELL_SID
+    popfd
+    call loader_unlock
+    ; ---- 前台作业:tty 认它,shell 等它(退出 / 被信号停住) ----
+    mov eax, [run_child]
+    call tty_setpgrp
+.wait_loop:
+    mov eax, [run_child]
+    mov ebx, WT_WUNTRACED
+    call process_wait2
+    cmp dword [proc_wait_status], 1
+    jne .wait_done
+    ; Phase B 还没有作业表:被 ^Z 停住就先打印一声,恢复后杀掉,别把 shell 挂住。
+    ; (下一步 commit C 会换成真正的 stopped 作业 + bg/fg)
+    mov al, COL_HEADER
+    call term_set_color
+    mov esi, msg_run_stopped
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    mov eax, [run_child]
+    mov ebx, 0x00040000                 ; super:cont:0
+    call process_signal_send_kernel
+    mov eax, [run_child]
+    mov ebx, 0x00010000                 ; super:kill:0
+    call process_signal_send_kernel
+    jmp .wait_loop
+.wait_done:
+    ; 前台组还给 shell
+    mov eax, SHELL_PGRP
+    call tty_setpgrp
+    ; 收尸统计快照到本 shell 的局部(proc_last_* 是全局的,别的 shell 的 wait
+    ; 可能把它盖掉;紧跟着拷走,窗口只有几条指令)
+    mov eax, [proc_last_freed]
+    mov [run_last_freed], eax
+    mov eax, [proc_last_runstat]
+    mov [run_last_runstat], eax
+    mov eax, [proc_last_pfrun]
+    mov [run_last_pfrun], eax
+    mov eax, [proc_last_pfimg]
+    mov [run_last_pfimg], eax
+    mov eax, [proc_last_pfheap]
+    mov [run_last_pfheap], eax
+    mov eax, [proc_last_firstpa]
+    mov [run_last_firstpa], eax
+    jmp cmd_run_after_prog
+.spawn_fail:
+    popfd
+    call run_free_bundle
+    jmp .nomem
+.notfound:
+    call loader_unlock
+    call shell_msg_nofile
+    ret
+.toobig:
+    call loader_unlock
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_prog_toobig
+    call term_print
+    ret
+.nomem:
+    call loader_unlock
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_space_nomem
+    call term_print
+    ret
+.usage_locked:
+    call loader_unlock
+.usage:
+    mov al, COL_NORMAL
+    call term_set_color
+    mov esi, api_usage
+    call term_print
+    ret
+
+; run_lookup:按 name_buf 找程序(先原路径,再 BIN/ 兜底),返回 eax = 文件大小 / -1
+;   进来时已经拿着 fs_lock;fat_dir 可能被改,调用方用 run_restore_dir 还原。
+run_lookup:
     mov dword [run_try_bin], 0
 .try_path:
     mov esi, name_buf
     cmp dword [run_try_bin], 0
     je .resolve
-    ; ---- 拼出 "BIN/<名字>",从根目录开始找 ----
     mov dword [fat_dir], 0
     mov esi, name_buf
     mov edi, run_path_buf
@@ -2603,182 +2752,57 @@ cmd_run:
 .resolve:
     call fat_path
     jc .retry_bin
-    mov [prog_name_ptr], eax            ; 前面的目录已经进去了,这截才是文件名
+    mov [prog_name_ptr], eax
     mov esi, eax
     call fat_stat
     cmp eax, -1
     je .retry_bin
-    jmp .found
+    ret
 .retry_bin:
     cmp dword [run_try_bin], 0
-    jne .notfound                       ; /BIN 也找过了 → 真没有
+    jne .missing
     mov dword [run_try_bin], 1
     jmp .try_path
-.found:
-    ; 先只看目录项里的大小:太大就别读了,免得把字库盖掉一半
-    mov [prog_size], eax
-    cmp eax, (SPACE_IMG_PAGES - 1) * 4096
-                                        ; 窗口 512 KiB,最后一页留给 ring 3 的弹床
-    ja .toobig
-    mov esi, [prog_name_ptr]
-    mov edi, PROG_ADDR
-    call fat_read_file                  ; 读进暂存区 —— 它就留在这儿当"页面来源"
-    cmp eax, -1
-    je .notfound
-    mov [prog_size], eax                ; 实际读到的字节数(ELF 展开要按它算)
-    mov dword [prog_entry], PROG_ADDR   ; 默认:平铺 BIN 的入口就是 0x120000
-    ; ---- 如果是 ELF(TCC 的产物):先展开成平铺镜像 ----
-    mov esi, PROG_ADDR
-    cmp dword [esi], 0x464C457F         ; "\x7fELF"
-    jne .flat_ready
-    mov eax, [prog_size]
-    call elf_load                       ; 返回 eax=展开后大小, edx=入口
-    test eax, eax
-    jz .toobig                          ; 格式不对/超出窗口/页池不够
-    mov [prog_size], eax
-    mov [prog_entry], edx
-.flat_ready:
-    ; 程序马上要跑:把 cwd 还给 shell 的目录(上面找程序可能进过 /BIN 或子目录)
+.missing:
+    mov eax, -1
+    ret
+
+; run_restore_dir:把 fat_dir 还给 shell 的 cwd
+run_restore_dir:
     mov eax, [cmd_saved_dir]
     mov [fat_dir], eax
-    ; ---- 把镜像拷进本线程自己的暂存区(页池里的连续页)----
-    ;  之后的按需分页都从这儿取页;别的 shell 再装程序也踩不到它。
-    mov eax, [prog_size]
-    add eax, 4095
-    shr eax, 12
-    test eax, eax
-    jz .notfound                        ; 空文件,别当程序跑
-    mov [stage_pages], eax
-    mov ecx, eax
-    call pmem_alloc_pages
-    test eax, eax
-    jz .nomem                           ; 页池不够(没占住任何东西,直接报)
-    mov edx, [space_cur]
-    mov [edx + TCB_SP_STAGE_PA], eax
-    mov ecx, [stage_pages]
-    mov [edx + TCB_SP_STAGE_PAGES], ecx
-    mov edi, eax
-    mov esi, PROG_ADDR
-    mov ecx, [prog_size]
-    add ecx, 3
-    shr ecx, 2                          ; 字节 → dword(向上取整)
-    rep movsd
-    ; ---- 管道里跑:别刷 "running ..." 这类提示,会混进数据流 ----
-    cmp dword [pipe_active], 0
-    jne .pipe_skip_run_msg
-    mov al, COL_HEADER
-    call term_set_color
-    mov esi, msg_running
-    call term_print
-    mov esi, name_buf
-    call term_print
-    mov al, 10
-    call term_putc
-    mov al, COL_NORMAL
-    call term_set_color
-.pipe_skip_run_msg:
+    ret
 
-    ; ---- 建一套空地址空间:页目录 + 页表两页,窗口里的页一页都不给 ----
-    ; 文件也不往私有页里拷了:程序第一次碰到哪一页,页错误处理才从这条线程的
-    ; 暂存区把那一页拷过去(见 paging.asm 的 page_fault_try_handle)。
-    ; ★ 顺序:先 create(建页表、重置这趟的计数),再 set_image 把镜像大小写进去。
-    ;   space_create 特意**不碰** TCB_SP_IMGBYTES —— 早期版本在 create 里顺手清它,
-    ;   结果大小被清成 0,整个镜像窗口都算成 `.bss`(零页),程序跑的是 0 字节,
-    ;   一路乱跳到野地址崩溃(见 README 6.10)。这个坑踩过。
-    call space_create
+; run_free_bundle:释放作业载荷页(只在 spawn 失败等路上用;正常时子进程 exec 后释放)
+run_free_bundle:
+    mov eax, [run_bundle]
     test eax, eax
-    jz .nomem
-    mov eax, [prog_size]
-    call space_set_image                ; 告诉分页层镜像多大(决定 `.bss` 从哪页开始)
-    cmp dword [pipe_active], 0
-    jne .pipe_skip_space_msg
-    mov al, COL_HEADER
-    call term_set_color
-    mov esi, msg_space_head
-    call term_print
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_PD]
-    call term_print_hex
-    mov esi, msg_space_tail
-    call term_print
-    mov al, COL_NORMAL
-    call term_set_color
-.pipe_skip_space_msg:
+    jz .out
+    mov ecx, 1
+    call pmem_free_pages
+    mov dword [run_bundle], 0
+.out:
+    ret
 
-    ; ---- 切到程序自己的页目录,iret 进 ring 3 ----
-    ;  程序从这之后跑在 CPL=3:看得见的只有这个空间里 U/S=1 的页(镜像 + 堆),
-    ;  内核的内存一律 U/S=0 —— 碰了就是保护违规,由 idt.asm 转给 prog_kill_from_fault。
-    ;  它正常跑完会 `ret` 到弹床页 → int 0x30 功能号 15 → api_exit 回到这儿。
-    pushad
-    call space_activate                 ; ★ 从这里开始,0x120000 是"空的"
-    call space_prepare_user             ; 弹床页 + 用户栈页;返回弹床地址(0 = 页池空)
-    test eax, eax
-    jz .nomem_user
-    ; 参数页:内核里的 PROG_ARG_ADDR(0x11F000)对 ring 3 是"别人家的内存",
-    ; 所以先现拿一页挂进程序空间,再把整个参数块原样搬过去(现在还是 ring 0,
-    ; 程序页表和内核的恒等映射都在,两边的地址都看得见)。
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_ARGSVA]
-    call space_user_page
-    test eax, eax
-    jz .nomem_user
-    mov edx, [space_cur]
-    mov esi, PROG_ARG_ADDR
-    mov edi, [edx + TCB_SP_ARGSVA]
-    mov ecx, SPACE_ARGS_COPY
-    rep movsd
-    mov edx, [space_cur]
-    ; ★ 先清掉上一条命令可能留下的 kill 请求:如果 kill 恰好赶在上一个程序
-    ;   收摊的瞬间打进来,RUNNING 已经是 0、cmd_kill 的检查会放行,标记就留在了
-    ;   TCB 里 —— 不清的话,新程序刚进 ring 3 的第一个 tick 就会被误杀。
-    mov dword [edx + TCB_SP_KILLREQ], 0
-    mov [edx + TCB_SP_RUNESP], esp      ; ★ 记住内核现场:正常退出/被杀都回到这儿
-    mov dword [edx + TCB_SP_RUNSTAT], 0
-    mov dword [edx + TCB_SP_RUNNING], 1 ; 给 ps / 状态看:这条线程在跑程序
-    ; ★ TSS.esp0:ring 3 的每一次中断都压到这条线程的内核栈上。
-    ;   以前这个值固定是开机时的 RING3_STACK_TOP,两条线程同时跑程序时,
-    ;   后被打断的那个会把前一个的现场踩掉(单程序时代看不出来)。
-    mov eax, [edx + TCB_SP_RUNESP]
-    mov [tss_blk + TSS_ESP0], eax
-    ; 参数已经拷进程序空间了,装载锁到此为止(后面的 iret 只看本线程的 TCB)
-    call loader_unlock
-    mov ax, USER_DATA_SEG
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    push dword USER_DATA_SEG            ; SS3
-    push dword [edx + TCB_SP_STACKTOP]  ; ESP3(栈顶那 4 字节就是弹床地址)
-    push dword EFLAGS_IF                ; IF=1:新程序一上来就能被定时器打断
-    push dword USER_CODE_SEG            ; CS3
-    push dword [prog_entry]             ; EIP = 程序入口(平铺 BIN / ELF 的 e_entry)
-    iret                                ; ★ 这一句之后就进 ring 3 了(再也不会往下走)
-.nomem_user:                            ; 页池不够连弹床/用户栈都建不出来
-    call space_deactivate
-    call space_destroy                  ; 把已经拿到的页还掉(以前这里会漏)
-    popad
-    jmp .nomem
-.after_prog:                            ; ← run_resume_kernel 从文件末尾跳回这里
-
+; ===========================================================================
+;  .after_prog:前台作业跑完/被杀之后的收摊信息
+;  这些数字都是 process_wait2 在收尸前从子进程 TCB 上快照下来的(proc_last_*),
+;  格式与 Phase A 的 cmd_run.after_prog 逐字一致(test-hd-font/test-hd32 认它们)。
+; ===========================================================================
+.after_prog:
+cmd_run_after_prog:
     cmp dword [pipe_active], 0
-    jne .ap_quiet                        ; 管道里:收摊信息也静音
+    jne .ap_quiet
     mov al, 10
     call term_putc
 .ap_quiet:
-    ; ---- 收摊:按需给出去的页 + 私有页表 + 页目录 + 暂存区,全还给页池 ----
-    ;  ★ .after_prog 里 IF=1,随时可能被切走;账目都从**本线程的 TCB**读,
-    ;    不往全局变量里搬(两条线程同时退出也不会串账)。
-    call space_destroy
-    mov edx, [space_cur]
-    mov [edx + TCB_SP_FREED], eax
     cmp dword [pipe_active], 0
     jne .ap_quiet2
-    mov edx, [space_cur]
     mov al, COL_OK
     mov esi, msg_prog_done
-    cmp dword [edx + TCB_SP_RUNSTAT], 0
+    cmp dword [run_last_runstat], 0
     je .done_msg
-    mov al, COL_ERR                     ; 不是正常退出:上面已经打过崩溃原因
+    mov al, COL_ERR
     mov esi, msg_prog_killed
 .done_msg:
     call term_set_color
@@ -2787,73 +2811,39 @@ cmd_run:
     call term_set_color
     mov esi, msg_space_gone
     call term_print
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_FREED]
+    mov eax, [run_last_freed]
     call term_print_dec
     mov esi, msg_space_back
     call term_print
     mov al, 10
     call term_putc
-
-    ; ---- 按需分页的账:这一趟只补了程序真正碰过的页 ----
+    ; ---- 按需分页的账 ----
     mov al, COL_HEADER
     call term_set_color
     mov esi, msg_demand
     call term_print
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_PFRUN]
+    mov eax, [run_last_pfrun]
     call term_print_dec
     mov esi, msg_demand_split
     call term_print
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_PFIMG]
+    mov eax, [run_last_pfimg]
     call term_print_dec
     mov esi, msg_demand_and
     call term_print
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_PFHEAP]
+    mov eax, [run_last_pfheap]
     call term_print_dec
     mov esi, msg_demand_first
     call term_print
-    mov edx, [space_cur]
-    mov eax, [edx + TCB_SP_FIRSTPA]
+    mov eax, [run_last_firstpa]
     call term_print_hex
     mov al, 10
     call term_putc
     mov al, COL_NORMAL
     call term_set_color
 .ap_quiet2:
-    mov edx, [space_cur]
-    mov dword [edx + TCB_SP_RUNNING], 0
-    mov eax, EV_PROG_EXIT               ; 事件账本:跑完了(附带按需补了几页)
-    mov edx, [space_cur]
-    mov ebx, [edx + TCB_SP_PFRUN]
+    mov eax, EV_PROG_EXIT
+    mov ebx, [run_last_pfrun]
     call evt_log
-    ret
-.nomem:
-    call loader_unlock                  ; 没跑起来也要放锁,别把别的 shell 锁住
-    mov al, COL_ERR
-    call term_set_color
-    mov esi, msg_space_nomem
-    call term_print
-    ret
-.notfound:
-    call loader_unlock
-    call shell_msg_nofile
-    ret
-.toobig:
-    call loader_unlock
-    mov al, COL_ERR
-    call term_set_color
-    mov esi, msg_prog_toobig
-    call term_print
-    ret
-.usage:
-    call loader_unlock
-    mov al, COL_NORMAL
-    call term_set_color
-    mov esi, api_usage
-    call term_print
     ret
 
 ; ---------------------------------------------------------------------------
@@ -4803,6 +4793,7 @@ msg_wrote       db 'wrote ', 0
 msg_write_usage db 'usage: write <name> <text>', 10, 0
 msg_write_fail  db 'write failed (disk full?)', 10, 0
 msg_running     db 'running ', 0
+msg_run_stopped db 'job stopped (no job control yet: resuming then killing it)', 10, 0
 msg_prog_done   db 'program returned to the shell', 10, 0
 msg_prog_killed db 'program was killed, the kernel is fine', 10, 0
 msg_prog_toobig db 'program too big for the load area', 10, 0
@@ -4848,6 +4839,16 @@ name_buf   times 64 db 0              ; 名字里可能带目录(DOCS/NOTE.TXT),
 run_path_buf times 72 db 0             ; run 的 PATH 兜底用:拼出 "BIN/<name>"
 run_try_bin dd 0                       ; run 的 PATH 兜底状态:0=还没试 /BIN,1=试过了
 cmd_saved_dir dd 0                      ; cmd_run 进来时 shell 的 [fat_dir],跑程序前还回去
+run_bundle     dd 0                     ; 作业载荷页(名字+参数),spawn 时挂给子进程
+run_child      dd 0                     ; 前台作业子进程 pid(槽号+1)
+run_slot       dd 0                     ; run 起的子进程 pid
+run_prog_size  dd 0                     ; 校验后的程序大小
+run_last_freed dd 0                     ; 收尸快照:还回去的页数
+run_last_runstat dd 0                   ; 收尸快照:0 正常退出 / 1 被内核干掉
+run_last_pfrun dd 0
+run_last_pfimg dd 0
+run_last_pfheap dd 0
+run_last_firstpa dd 0
 prog_name_ptr dd 0                      ; run 用的:去掉目录部分之后的程序名
 prog_size   dd 0                        ; run 用的:程序文件多大(按它往私有页里拷)
 prog_entry  dd 0                        ; run 用的:进 ring 3 的入口(平铺=0x120000, ELF 用 e_entry)
@@ -4959,4 +4960,4 @@ run_resume_kernel:
     ;   连 4 条 shell 都跟着没反应。踩过一次,别删。
     sti
     popad                               ; 恢复 cmd_run 开头 pushad 的现场
-    jmp cmd_run.after_prog
+    jmp cmd_run_after_prog

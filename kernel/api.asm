@@ -149,6 +149,15 @@ api_dispatch:
     je api_h_getprio
     cmp eax, 26
     je api_h_sleep
+    ; ---- Phase B:作业控制(功能号 27-30)----
+    cmp eax, 27
+    je api_h_setpgid
+    cmp eax, 28
+    je api_h_getpgrp
+    cmp eax, 29
+    je api_h_tcsetpgrp
+    cmp eax, 30
+    je api_h_tcgetpgrp
     ret
 .print_str:
     call term_print
@@ -176,7 +185,18 @@ api_dispatch:
     call term_set_color
     ret
 .getchar:
+    ; Phase B:后台进程读 tty 直接给 EOF(简单策略;不阻塞、不抢前台输入)
+    call jobctl_key_allowed
+    test eax, eax
+    jz .getchar_bg
+    ; 记下"最近读键盘的 tick":前台作业里读键的算交互程序,^C 交给它自己
+    call process_cur_tcb
+    mov ecx, [pit_ticks]
+    mov [eax + TCB_KBUSY], ecx
     call kbd_getchar                    ; 返回 al
+    ret
+.getchar_bg:
+    mov eax, 0x04                       ; Ctrl-D = EOF
     ret
 .clear:
     call term_clear
@@ -283,7 +303,16 @@ api_dispatch:
     call term_set_cursor
     ret
 .getkey:
+    call jobctl_key_allowed
+    test eax, eax
+    jz .getkey_bg
+    call process_cur_tcb
+    mov ecx, [pit_ticks]
+    mov [eax + TCB_KBUSY], ecx
     call kbd_getkey
+    ret
+.getkey_bg:
+    xor eax, eax                        ; 后台:没有按键事件
     ret
 .size:
     call term_size
@@ -394,6 +423,37 @@ api_h_sleep:
     call process_cur_tcb                ; eax = 当前 TCB 指针(唯一通道)
     call sched_sleep_timeout            ; eax=chan, ecx=ticks → 1=超时
     xor eax, eax                        ; 对程序只报"睡够了"
+    ret
+
+; ---------------------------------------------------------------------------
+;  Phase B:作业控制系统调用(功能号 27-30)
+;    int 0x30 参数:27 setpgid(pid=ebx, pgrp=ecx), 28 getpgrp(),
+;                  29 tcsetpgrp(pgrp=ebx), 30 tcgetpgrp()
+;    返回值写回程序 eax(由 api_stub 统一回填)。
+; ---------------------------------------------------------------------------
+api_h_setpgid:
+    push ebx
+    push ecx
+    mov eax, ebx
+    mov ebx, ecx
+    call process_setpgid
+    pop ecx
+    pop ebx
+    ret
+
+api_h_getpgrp:
+    call process_getpgrp
+    ret
+
+api_h_tcsetpgrp:
+    push ebx
+    mov eax, ebx
+    call tty_setpgrp
+    pop ebx
+    ret
+
+api_h_tcgetpgrp:
+    call tty_getpgrp
     ret
 
 
