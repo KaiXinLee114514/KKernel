@@ -797,9 +797,27 @@ process_terminate:
     ;   不能只 sched_wakeup:唤醒会把它放回就绪队列,IRQ0 可能在我们标僵尸
     ;   之前就调度到它。这里直接转成 ST_STOPPED(不在就绪队列、调度器不挑),
     ;   后面 .zombie 路径看到 state != ALIVE 就不会再去摘一次队列。
-    ;   无父的内核线程睡着时维持原语义(收尸路径假设它有父进程 wait)。
+    ;   ★ 无父的内核线程(演示线程 alpha/beta 之类)也必须能杀掉:以前这里直接
+    ;   deny,结果"睡着的内核线程"杀不掉(ps 里永远挂着一个 SLEEP 的 alpha),
+    ;   而它是 RUN 时又能杀掉 —— kill 成功与否全看运气(踩过:hd 回归偶发失败
+    ;   "kill 之后只剩 shell")。做法:先假装它变成 ALIVE 并塞回就绪队列
+    ;   (sched_kill 的 sched_ready_remove 假定目标在队列里),再走同一套收尸。
     cmp dword [edx + TCB_PARENT], 0
-    je .deny
+    jne .sleeping_parented
+    mov dword [edx + TCB_STATE], ST_ALIVE
+    mov dword [edx + TCB_WCHAN], 0
+    mov dword [edx + TCB_SLEEPTICKS], 0
+    mov dword [edx + TCB_SLEEPFLAG], 0
+    mov eax, edx
+    sub eax, tcb_table
+    xor edx, edx
+    mov ecx, TCB_SIZE
+    div ecx                             ; eax = 槽号
+    mov esi, eax
+    call sched_ready_enqueue
+    mov edx, [pt_tcb]                   ; div 把 edx 冲了,恢复目标 TCB
+    jmp .alive
+.sleeping_parented:
     mov dword [edx + TCB_STATE], ST_STOPPED
     mov dword [edx + TCB_WCHAN], 0
     mov dword [edx + TCB_SLEEPTICKS], 0

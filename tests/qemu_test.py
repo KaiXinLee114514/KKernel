@@ -2820,6 +2820,21 @@ def main() -> int:
                             len(rows) >= 2 and ids == [5, 6] and all(t > 0 for t in ticks),
                             f"ps 表头 alive/16 slots={header_ok},alpha/beta 行与 ticks:{rows}"))
 
+            # ★ 先等到演示线程进入 SLEEP 再杀:以前"睡着的无父内核线程"直接被
+            #   deny(kill 打印 signalled 但永远不生效),kill 成不成全看运气 →
+            #   hd 回归偶发「kill 之后只剩 shell」失败。现在的内核会把睡眠线程
+            #   摘出来收尸;这里等 SLEEP 状态就是为了确定性覆盖那条路径。
+            sleep_seen = False
+            for _ in range(40):
+                run("clear")
+                run("ps", wait=1.0)
+                if has("SLEEP alpha") or has("SLEEP beta"):
+                    sleep_seen = True
+                    break
+                time.sleep(0.3)
+            results.append(("ps 能等到线程进入 SLEEP", sleep_seen,
+                            "至少一个演示线程处于 SLEEP(覆盖睡眠收尸路径)"))
+
             run("kill 5", wait=0.6)
             run("kill 6", wait=0.8)
             # ★ kill 是异步的(信号在目标线程下一次被调度/醒来时才处理),而且演示
