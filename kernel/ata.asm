@@ -313,6 +313,67 @@ ata_write_sectors:
     pop ebx
     ret
 
+; ---------------------------------------------------------------------------
+;  ata_write_sectors_nf:和 ata_write_sectors 一样,但最后**不发 FLUSH CACHE**。
+;    swap 内容不需要持久化(重启就丢,正是 swap 的语义),QEMU 端的 FLUSH
+;    每次都会 fsync 镜像,几百次换出会把测试拖到几分钟 —— 所以 swap 用这个。
+;    注意:只能给"丢了也无所谓"的数据(swap 槽)用。
+; ---------------------------------------------------------------------------
+ata_write_sectors_nf:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    push ebp
+    mov [ata_lba], eax
+    mov [ata_src], esi
+    mov [ata_left], ecx
+.loop:
+    cmp dword [ata_left], 0
+    je .done
+    mov eax, [ata_left]
+    cmp eax, ATA_MAX_CHUNK
+    jbe .use_it_w
+    mov eax, ATA_MAX_CHUNK
+.use_it_w:
+    mov [ata_chunk], al
+    call ata_setup_lba
+    mov dx, ATA_CMD
+    mov al, 0x30                        ; WRITE SECTORS
+    out dx, al
+    mov esi, [ata_src]
+    movzx ebp, byte [ata_chunk]
+.sector_w:
+    call ata_wait_drq
+    jc .fail
+    mov ecx, 256
+    mov dx, ATA_DATA
+    rep outsw
+    call ata_delay400
+    dec ebp
+    jnz .sector_w
+    movzx eax, byte [ata_chunk]
+    add [ata_lba], eax
+    imul eax, 512
+    add [ata_src], eax
+    movzx eax, byte [ata_chunk]
+    sub [ata_left], eax
+    jmp .loop
+.done:
+    xor eax, eax
+    jmp .out
+.fail:
+    mov eax, -1
+.out:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
 ; ---------------------------------------------------------------- 变量
 ata_lba    dd 0
 ata_buf    dd 0
