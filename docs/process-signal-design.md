@@ -698,8 +698,40 @@ test-proc: $(HDIMG)
 | P14 | 僵尸队列 / `reap_children` 批量收尸 | `process_wait` | 线性扫 16 槽(够用) | pid 多了再换队列 |
 | P15 | FPU 上下文、内核线程 fork、`ST_DEAD` 清理 | — | 不做 | 低优先 |
 
+## 7. wait 状态为什么不能放全局(Phase D wait-race)
+
+`process_wait2` 会**在系统调用里睡觉等子进程退出**。睡眠期间这个线程的内核栈还在
+(调度器切线程只换 `TCB_ESP`,内核栈不在睡眠期间回收),别的线程随时可能进来执行
+同一个函数。如果"这次 wait 的参数/睡眠通道/出参"放在跨线程共享的全局变量里
+(旧实现的 `pw_pid`/`pw_flags`/`pw_tcb`/`pw_sleeping` + `proc_wait_status`/
+`proc_wait_pid`/`proc_wait_code`/`proc_last_*`),两个线程同时 wait 就会互相覆盖:
+
+- 睡眠通道被改 → 唤醒丢 / `sched_sleep_cancel` 撤错睡眠;
+- 收尸对象被改 → 收到别人的孩子 / 对已经清掉的 TCB 再收一遍;
+- `proc_wait_*` 被后一个 waiter 覆盖 → 调用者拿到别人的退出码、页数。
+
+修法(当前实现):
+
+1. **睡眠期间的现场放本线程内核栈帧**。`process_wait2` 入口 `pushad` 后
+   `sub esp, PW_FRAME`,参数、`PW_SELF`(本线程 TCB 指针,兼作 sleep channel)、
+   `PW_SLEEPING` 全在帧里;`sched_sleep_prepare/commit/cancel` 只认这个通道。
+2. **事件出参写本线程 TCB**。`TCB_SIZE` 200→240,新增
+   `TCB_WAIT_STATUS`/`TCB_WAIT_PID`/`TCB_WAIT_CODE`(本次 wait 的事件)和
+   `TCB_LAST_CHILD`/`LAST_FREED`/`LAST_RUNSTAT`/`LAST_PFRUN`/`LAST_PFIMG`/
+   `LAST_PFHEAP`/`LAST_FIRSTPA`(收尸快照,给 `cmd_run` 打印作业结果用)。
+   `process_wait`、`process_wait_status_get`、`process_last_child_get`、
+   `process_last_snapshot` 都经 `process_cur_tcb()` 读当前线程的 TCB,
+   线程之间没有共享的 wait 状态。
+3. **以后同类"阻塞系统调用的现场"一律照此办理**:本线程内核栈帧 + 本线程 TCB,
+   放不下再扩 `TCB_SIZE`(所有步长走 `TCB_SIZE` 宏 / `TCB_OFF`,不要硬编码)。
+   `--wait-race` 用两个并发实例各 fork/wait 50 轮做回归:两个父线程同时卡在
+   `process_wait2` 里,任何跨线程串扰都会在退出码上暴露(顺便还会用 shell 的
+   `jobs` 扫描制造第三个并发 waiter)。
+
 ---
 
-*本稿的偏移/函数名/API 号与 `kernel/sched.asm`(SCHED_MAX=16、TCB_SIZE=132)、
+---
+
+*本稿的偏移/函数名/API 号与 `kernel/sched.asm`(SCHED_MAX=16、TCB_SIZE=240(Phase D wait-race 后))、
 `kernel/pmem.asm`(REFCOUNT_BASE=0x3D2000)、`kernel/paging.asm`(PAGE_COW=0x200)对齐。
 若实现中改了这些常量,先改本稿再改代码。*

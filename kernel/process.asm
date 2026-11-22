@@ -482,36 +482,50 @@ process_fork:
     jmp .fail_stack
 
 ; ---------------------------------------------------------------------------
-;  process_wait:等一个僵尸子进程并收尸(阻塞版)
+;  process_wait / process_wait2:等子进程事件并收尸
 ;
-;    入:eax = 子进程 pid,-1 = 任意子进程
-;    出:eax = 退出码;没有子进程可等 → -1
-;    副作用:proc_last_child = 这次收掉的是谁(给 shell 打印用)
+;  ★ Phase D(wait-race)线程安全设计:
+;    - wait 的睡眠状态(pw_*)放在**本线程内核栈帧**里。线程睡着时内核栈是保留的
+;      (调度器只切 TCB_ESP,栈内容不回收),所以天然线程私有 —— 两条 shell 同时
+;      wait 也不会互踩睡眠通道。
+;    - 事件/收尸快照(proc_wait_* / proc_last_*)改写到**调用方自己的 TCB**
+;      (TCB_WAIT_* / TCB_LAST_*),返回后同一线程读自己的 TCB,同样无共享。
+;      以前是全局变量,被另一个 waiter 覆盖后 shell 会打错作业的退出码/页数,
+;      最坏 sched_sleep_cancel 撤错睡眠、对已经清过的 TCB 再收尸。
 ;
-;  "阻塞"用 sti;hlt:INT 0x30 的门把 IF 清掉了,这里显式开中断再睡,
-;  IRQ0 的调度器就能把 CPU 让给别的线程(包括我们等的那个孩子)。
-;  醒来后 cli 回到内核态继续扫表 —— 表的改动全在中断里,不会撕裂。
-;  没有孩子(或等的 pid 不是自己的娃)时立刻返回 -1,不睡。
+;  process_wait2:
+;    入:eax = 子进程 pid(-1 = 任意), ebx = flags(bit0 WUNTRACED, bit1 WNOHANG)
+;    出:eax = -1 没有孩子;0 = 有事件;1 = WNOHANG 且有孩子但此刻没事件
+;    事件细节(读自己的 TCB):TCB_WAIT_STATUS(0=退出,1=停住)、TCB_WAIT_PID、
+;      TCB_WAIT_CODE;收尸快照 TCB_LAST_*。
+;  process_wait:旧接口(阻塞等任意僵尸,返回退出码 / -1),内部调 wait2
 ; ---------------------------------------------------------------------------
-; process_wait2:等子进程事件(退出 / 被信号停住),支持 WUNTRACED + WNOHANG
-;   入:eax = 子进程 pid(-1 = 任意), ebx = flags(bit0 WUNTRACED, bit1 WNOHANG)
-;   出:eax = -1 没有孩子;0 = 有事件;1 = WNOHANG 且有孩子但此刻没事件
-;   事件细节:proc_wait_status(0=正常退出,1=被停住),proc_wait_pid(=槽+1),
-;            proc_wait_code(退出码)
-;   退出事件收尸后照旧更新 proc_last_*(给 shell 打 space/demand 行)
-; ---------------------------------------------------------------------------
+
+; process_wait2 的栈帧布局(相对 esp;pushad 之上再开 PW_FRAME 字节)
+PW_PID      equ 0
+PW_FLAGS    equ 4
+PW_RET      equ 8
+PW_SELF     equ 12                       ; 本线程 TCB 指针(睡眠通道 + 事件/快照输出)
+PW_SLEEPING equ 16
+PW_SLOT     equ 20                       ; 收尸时记下的槽号(调用之后还要用)
+PW_FRAME    equ 32
+
 WT_WUNTRACED equ 1
 WT_WNOHANG   equ 2
 process_wait2:
     pushad
-    mov [pw_pid], eax
-    mov [pw_flags], ebx
-    mov dword [pw_ret], -1
-    mov dword [proc_last_child], 0
-    mov dword [proc_wait_status], 0
-    mov dword [proc_wait_pid], 0
-    mov dword [proc_wait_code], 0
-    mov dword [pw_sleeping], 0
+    sub esp, PW_FRAME
+    mov [esp + PW_PID], eax
+    mov [esp + PW_FLAGS], ebx
+    mov dword [esp + PW_RET], -1
+    mov dword [esp + PW_SLEEPING], 0
+    call process_cur_tcb
+    mov [esp + PW_SELF], eax
+    ; 清掉本线程上一次的事件/快照(只影响自己)
+    mov dword [eax + TCB_WAIT_STATUS], 0
+    mov dword [eax + TCB_WAIT_PID], 0
+    mov dword [eax + TCB_WAIT_CODE], 0
+    mov dword [eax + TCB_LAST_CHILD], 0
 .retry:
     ; ---- 1) 先扫"已退出(ST_ZOMBIE)"的孩子 ----
     xor esi, esi
@@ -525,7 +539,7 @@ process_wait2:
     inc eax
     cmp [edx + TCB_PARENT], eax          ; 只收自己的娃
     jne .next
-    mov eax, [pw_pid]
+    mov eax, [esp + PW_PID]
     cmp eax, -1
     je .reap
     lea ecx, [esi + 1]
@@ -533,45 +547,47 @@ process_wait2:
     jne .next
 .reap:
     ; 可能是在"准备睡"的关中断复查里发现僵尸:先撤回睡眠状态(中断还关着)
-    cmp dword [pw_sleeping], 0
+    cmp dword [esp + PW_SLEEPING], 0
     je .reap_go
-    mov eax, [pw_tcb]
+    mov eax, [esp + PW_SELF]
     call sched_sleep_cancel
-    mov dword [pw_sleeping], 0
+    mov dword [esp + PW_SLEEPING], 0
     sti
 .reap_go:
-    mov [pw_slot], esi
+    mov [esp + PW_SLOT], esi
     ; 收尸前把程序退出的统计快照下来 —— 清槽后 shell 还要用它打印
     ; "address space destroyed: N page(s)" / "demand paging: ..." 那几行。
+    ; 写进**本线程 TCB**(线程私有;别的 shell 的 wait 盖不掉)。
+    mov ecx, [esp + PW_SELF]
     mov eax, [edx + TCB_SP_FREED]
-    mov [proc_last_freed], eax
+    mov [ecx + TCB_LAST_FREED], eax
     mov eax, [edx + TCB_SP_RUNSTAT]
-    mov [proc_last_runstat], eax
+    mov [ecx + TCB_LAST_RUNSTAT], eax
     mov eax, [edx + TCB_SP_PFRUN]
-    mov [proc_last_pfrun], eax
+    mov [ecx + TCB_LAST_PFRUN], eax
     mov eax, [edx + TCB_SP_PFIMG]
-    mov [proc_last_pfimg], eax
+    mov [ecx + TCB_LAST_PFIMG], eax
     mov eax, [edx + TCB_SP_PFHEAP]
-    mov [proc_last_pfheap], eax
+    mov [ecx + TCB_LAST_PFHEAP], eax
     mov eax, [edx + TCB_SP_FIRSTPA]
-    mov [proc_last_firstpa], eax
+    mov [ecx + TCB_LAST_FIRSTPA], eax
     mov eax, [edx + TCB_EXITCODE]
-    mov [proc_wait_code], eax
+    mov [ecx + TCB_WAIT_CODE], eax
     lea eax, [esi + 1]
-    mov [proc_last_child], eax
-    mov [proc_wait_pid], eax
+    mov [ecx + TCB_LAST_CHILD], eax
+    mov [ecx + TCB_WAIT_PID], eax
     ; 内核栈(16 KiB + guard)还回去(地址空间在 exit 时已经拆了)
     mov eax, [edx + TCB_STACK]
     test eax, eax
     jz .nostack
     call kstack_free
 .nostack:
-    mov edx, [pw_slot]
+    mov edx, [esp + PW_SLOT]
     imul edx, TCB_SIZE
     add edx, tcb_table
     call process_clear_tcb
     dec dword [sched_live]
-    mov dword [pw_ret], 0
+    mov dword [esp + PW_RET], 0
     jmp .done
 .next:
     inc esi
@@ -579,7 +595,7 @@ process_wait2:
     jb .scan
 
     ; ---- 2) 没有僵尸:如果有孩子被停住且调用方要 WUNTRACED,报停止事件 ----
-    test dword [pw_flags], WT_WUNTRACED
+    test dword [esp + PW_FLAGS], WT_WUNTRACED
     jz .children
     xor esi, esi
 .scan_stop:
@@ -592,7 +608,7 @@ process_wait2:
     inc eax
     cmp [edx + TCB_PARENT], eax
     jne .stop_next
-    mov eax, [pw_pid]
+    mov eax, [esp + PW_PID]
     cmp eax, -1
     je .got_stop
     lea ecx, [esi + 1]
@@ -600,9 +616,10 @@ process_wait2:
     jne .stop_next
 .got_stop:
     lea eax, [esi + 1]
-    mov [proc_wait_pid], eax
-    mov dword [proc_wait_status], 1
-    mov dword [pw_ret], 0
+    mov ecx, [esp + PW_SELF]
+    mov [ecx + TCB_WAIT_PID], eax
+    mov dword [ecx + TCB_WAIT_STATUS], 1
+    mov dword [esp + PW_RET], 0
     jmp .done
 .stop_next:
     inc esi
@@ -622,7 +639,7 @@ process_wait2:
     inc eax
     cmp [edx + TCB_PARENT], eax
     jne .child_next
-    mov eax, [pw_pid]
+    mov eax, [esp + PW_PID]
     cmp eax, -1
     je .have_child
     lea ecx, [esi + 1]
@@ -637,35 +654,35 @@ process_wait2:
     jmp .done
 .have_child:
     ; WNOHANG:有孩子但还没事件 → 立刻返回 1,不睡
-    test dword [pw_flags], WT_WNOHANG
+    test dword [esp + PW_FLAGS], WT_WNOHANG
     jnz .would_block
 .sleep:
     ; ---- 睡在「父线程 TCB 指针」这个通道上;孩子 exit 时 sched_wakeup 叫醒 ----
-    cmp dword [pw_sleeping], 0
+    cmp dword [esp + PW_SLEEPING], 0
     jne .sleep_commit
-    call process_cur_tcb
-    mov [pw_tcb], eax
-    mov eax, [pw_tcb]                   ; 通道 = 自己的 TCB 指针
+    mov eax, [esp + PW_SELF]
     call sched_sleep_prepare            ; 关中断,标成 ST_SLEEPING
-    mov dword [pw_sleeping], 1
+    mov dword [esp + PW_SLEEPING], 1
     jmp .retry                          ; ★ 关中断再扫一遍:防"检查后、睡下前"孩子恰好退出
 .sleep_commit:
     call sched_sleep_commit             ; 开中断睡到被叫醒(返回时 IF=1)
-    mov dword [pw_sleeping], 0
+    mov dword [esp + PW_SLEEPING], 0
     jmp .retry
 .would_block:
-    mov dword [pw_ret], 1
+    mov dword [esp + PW_RET], 1
 .done:
     ; 不用睡了:万一还挂着"准备睡"就先撤掉,再把中断状态摆正
-    cmp dword [pw_sleeping], 0
+    cmp dword [esp + PW_SLEEPING], 0
     je .done_sti
-    mov eax, [pw_tcb]
+    mov eax, [esp + PW_SELF]
     call sched_sleep_cancel
-    mov dword [pw_sleeping], 0
+    mov dword [esp + PW_SLEEPING], 0
 .done_sti:
     sti
+    mov eax, [esp + PW_RET]
+    mov [esp + PW_FRAME + 28], eax       ; 写回 pushad 帧的 eax 槽(popad 后就是返回值)
+    add esp, PW_FRAME
     popad
-    mov eax, [pw_ret]
     ret
 
 ; process_wait:旧接口(阻塞等任意僵尸,返回退出码 / -1),内部调 wait2
@@ -675,12 +692,47 @@ process_wait:
     call process_wait2
     cmp eax, 0
     jne .none
-    mov eax, [proc_wait_code]
+    call process_cur_tcb
+    mov eax, [eax + TCB_WAIT_CODE]
     pop ebx
     ret
 .none:
     mov eax, -1
     pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  wait 事件的出参访问器(读的都是**当前线程自己**的 TCB 字段,线程私有)
+;    process_wait_status_get:eax = 最近一次 wait2 事件类型(0=退出,1=被停住)
+;    process_last_child_get :eax = 最近一次 wait2 收掉的子进程 pid
+;    process_last_snapshot  :把收尸快照 6 个 dd 拷到 edi
+;                            (freed, runstat, pfrun, pfimg, pfheap, firstpa)
+;                            只毁 eax/ecx;edi 不动
+; ---------------------------------------------------------------------------
+process_wait_status_get:
+    call process_cur_tcb
+    mov eax, [eax + TCB_WAIT_STATUS]
+    ret
+
+process_last_child_get:
+    call process_cur_tcb
+    mov eax, [eax + TCB_LAST_CHILD]
+    ret
+
+process_last_snapshot:
+    call process_cur_tcb
+    mov ecx, [eax + TCB_LAST_FREED]
+    mov [edi + 0], ecx
+    mov ecx, [eax + TCB_LAST_RUNSTAT]
+    mov [edi + 4], ecx
+    mov ecx, [eax + TCB_LAST_PFRUN]
+    mov [edi + 8], ecx
+    mov ecx, [eax + TCB_LAST_PFIMG]
+    mov [edi + 12], ecx
+    mov ecx, [eax + TCB_LAST_PFHEAP]
+    mov [edi + 16], ecx
+    mov ecx, [eax + TCB_LAST_FIRSTPA]
+    mov [edi + 20], ecx
     ret
 
 ; ---------------------------------------------------------------------------
@@ -1639,22 +1691,11 @@ pf_child_frame  dd 0
 pf_cow_marked   dd 0                    ; fork 失败回滚:窗口 COW/stage 引用已加
 pf_result       dd 0
 
-pw_pid          dd 0
-pw_slot         dd 0
-pw_ret          dd 0
-pw_tcb          dd 0                    ; process_wait 睡眠用的通道 = 自己的 TCB 指针
-pw_sleeping     dd 0                    ; 1 = 已经 prepare 睡眠、还没 commit / 已撤回
-proc_last_child dd 0
-pw_flags        dd 0                    ; process_wait2 的 flags(WT_*)
-proc_wait_status dd 0                   ; wait2 事件:0 = 退出,1 = 被停住
-proc_wait_pid   dd 0                    ; wait2 事件涉及的 pid(槽+1)
-proc_wait_code  dd 0                    ; wait2 退出码
-proc_last_freed dd 0                    ; 收尸前快照:还回去的页数(space_destroy)
-proc_last_runstat dd 0                  ; 收尸前快照:0 正常退出 / 1 被内核干掉
-proc_last_pfrun dd 0
-proc_last_pfimg dd 0
-proc_last_pfheap dd 0
-proc_last_firstpa dd 0
+; ★ Phase D(wait-race):wait 的事件/收尸快照以前是这里的全局(pw_* /
+;   proc_wait_* / proc_last_*),两条 shell 同时 wait 会互踩。现在:
+;     - 睡眠状态 pw_* 在 process_wait2 的内核栈帧里(每线程内核栈独立);
+;     - 事件/快照在 TCB 的 TCB_WAIT_* / TCB_LAST_* 字段里(sched.asm)。
+;   这里不要再加跨线程共享的 wait 状态。
 
 pt_tcb          dd 0
 pt_code         dd 0

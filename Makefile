@@ -83,7 +83,7 @@ CRT_TCC_OBJ := $(BUILD)/crt_tcc.o
 ifeq ($(CC_OK),yes)
 C_PROGS     := CHELLO.BIN PLAY.BIN RNGTEST.BIN P2TEST.BIN FPU.BIN FCALC.BIN ECHO.BIN MEMTEST.BIN IOTEST.BIN \
                WC.BIN UPPER.BIN GREP.BIN HEAD.BIN MINE.BIN FORK.BIN \
-               PRIO.BIN SLEEPY.BIN CONCUR.BIN SWAPTEST.BIN
+               PRIO.BIN SLEEPY.BIN CONCUR.BIN SWAPTEST.BIN RACEWAIT.BIN
 else
 C_PROGS     :=
 endif
@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -181,6 +181,10 @@ $(BUILD)/PLAY.o: progs/PLAY.C include/kkernel.h lib/minic.h | $(BUILD)
 
 # MINE.C 同样是大写后缀(扫雷,见 progs/MINE.C 开头的注释)
 $(BUILD)/MINE.o: progs/MINE.C include/kkernel.h lib/minic.h | $(BUILD)
+	$(CC) $(C_CFLAGS) -x c -c $< -o $@
+
+# RACEWAIT.C 同样是大写后缀(Phase D wait-race 并发 wait 压力测试)
+$(BUILD)/RACEWAIT.o: progs/RACEWAIT.C include/kkernel.h lib/minic.h | $(BUILD)
 	$(CC) $(C_CFLAGS) -x c -c $< -o $@
 
 $(BUILD)/%.BIN: $(BUILD)/%.o $(CRT0_OBJ) $(MINIC_OBJ) lib/kkernel.ld
@@ -378,7 +382,7 @@ makefile-check:
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-tty test-login test-sched test-jobctl test-swap
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-tty test-login test-sched test-jobctl test-wait-race test-swap
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -441,6 +445,14 @@ test-jobctl: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── 作业控制:fork+exec / 进程组 / jobs/fg/bg / ^C ^Z --jobctl ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --jobctl
+
+# Phase D(wait-race):wait 的睡眠状态/出参不再用跨线程全局。
+# 两个后台实例同时 fork+wait ×50 轮(它们的父线程会同时在 process_wait2 里睡/收尸),
+# 断言各自每轮都拿回自己的退出码;顺便让 shell 自己也并发扫一次作业(wait2 WNOHANG)。
+test-wait-race: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── wait 竞态:两个并发实例 fork/wait ×50,退出码不串 --wait-race ──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --fontdisk --font font/full-kkf.bin --wait-race
 
 # ---------------------------------------------------------------------------
 #  Phase C 测试:swap 镜像 = 普通 HD 镜像 + 末尾 16 MiB swap 区(KSWP 头)。

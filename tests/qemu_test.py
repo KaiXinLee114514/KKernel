@@ -994,6 +994,7 @@ def main() -> int:
     login_mode = "--login" in argv          # 最小多用户:登录 / whoami / su / 信号权限
     sched_mode = "--sched" in argv          # 调度器:优先级 / 睡眠超时 / 栈增长 / 并发
     jobctl_mode = "--jobctl" in argv        # 作业控制:fork+exec / 进程组 / jobs/fg/bg / ^C ^Z
+    wait_race_mode = "--wait-race" in argv  # wait 竞态:两个并发实例各自 fork/wait 50 轮,退出码不串
     swap_mode = "--swap" in argv            # swap:页换出/换入 + 大匿名堆(默认 -m 16)
     swap_cold_mode = "--swap-cold" in argv  # swap 对照:大内存下全部驻留(-m 64,不换出)
     mem_mib = 128                           # QEMU 物理内存(-m):swap 测试用 16/64
@@ -1006,7 +1007,7 @@ def main() -> int:
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
                          "--fontdisk", "--fat32", "--usbdisk", "--usb-kbd", "--usb-rw", "--usb-rw32",
                          "--mine", "--proc",
-                         "--tty", "--login", "--sched", "--jobctl",
+                         "--tty", "--login", "--sched", "--jobctl", "--wait-race",
                          "--swap", "--swap-cold")]
     if "--mem" in argv:
         i = argv.index("--mem")
@@ -1418,6 +1419,91 @@ def main() -> int:
             running = [ln for ln in text.splitlines() if "Running" in ln and "HANG.BIN" in ln]
             results.append(("jobs 列出两个后台 Running 作业", len(running) >= 2,
                             "[n] Running ... HANG.BIN 两行"))
+            return report(results)
+
+        if wait_race_mode:
+            # ---- Phase D(wait-race):两个并发实例各自 fork/wait 50 轮,退出码/收尸不串 ----
+            results = []
+
+            def race_run(line: str, wait: float = 1.4) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            def race_text() -> str:
+                if graphics:
+                    return "\n".join(screen_text(shot, glyphs))
+                return "\n".join(mon.screen())
+
+            results.append(("登录后 shell 就绪", has('type "help" for commands.'),
+                            'type "help" for commands.'))
+
+            # 后台起两个实例:它们的父线程会**同时**进 process_wait2 睡眠/收尸。
+            # 极端情况下开机后的头几次按键可能被吞(与内核无关),所以每发一条都等
+            # "racewait: start" 计数涨上去再发下一条,而不是盲发两次。
+            def launch_instance(expect: int, tries: int = 3, timeout: float = 6.0) -> bool:
+                for _ in range(tries):
+                    mon.type_text("run RACEWAIT.BIN &")
+                    mon.sendkey("ret")
+                    t0 = time.monotonic()
+                    while time.monotonic() - t0 < timeout:
+                        rescan()
+                        if race_text().count("racewait: start") >= expect:
+                            return True
+                        time.sleep(0.3)
+                return False
+
+            ok1 = launch_instance(1)
+            ok2 = launch_instance(2)
+            results.append(("两个 RACEWAIT 后台实例启动", ok1 and ok2,
+                            "两行 running RACEWAIT.BIN + 两条 racewait: start"))
+            # 趁它们都在跑,再让 shell 自己调一次 wait2(WNOHANG 的作业扫描),
+            # 并发 waiter 从 2 个变 3 个,跨线程全局更容易被踩出来
+            race_run("jobs", 1.0)
+
+            # 等两个实例各自打一行 PASS(每台 50 轮 fork/wait)
+            t0 = time.monotonic()
+            passes = 0
+            while time.monotonic() - t0 < 150.0:
+                rescan()
+                passes = race_text().count("racewait: PASS")
+                if passes >= 2:
+                    break
+                time.sleep(0.5)
+            rescan()
+            text = race_text()
+            starts = sum(1 for ln in text.splitlines() if "racewait: start" in ln)
+            bad = [ln.strip() for ln in text.splitlines()
+                   if "racewait: FAIL" in ln or "racewait: BAD" in ln]
+            results.append(("两个并发实例各完成 50 轮 fork/wait", passes >= 2,
+                            "两行 racewait: PASS pid=N rounds=50"))
+            results.append(("确实是两个实例并发(两条 start 行)", starts >= 2,
+                            f"{starts} 行 racewait: start pid=..."))
+            results.append(("无串扰:每轮都拿回自己的退出码(无 BAD/FAIL)",
+                            not bad, "; ".join(bad) if bad else "无 racewait: BAD / FAIL 行"))
+
+            # 收尸干净:让 shell 的作业扫描把 Done 的作业收掉,清屏后 ps 里不应再有
+            # RACEWAIT 进程,壳自己的 wait 也不该被干扰
+            time.sleep(2.0)
+            race_run("jobs", 1.0)
+            time.sleep(1.0)
+            race_run("clear", 0.8)
+            race_run("ps", 1.2)
+            text = race_text()
+            racers = [ln.strip() for ln in text.splitlines()
+                      if "RACEWAIT" in ln and ln.strip().startswith("pid ")]
+            results.append(("实例退出后没有残留 RACEWAIT 进程", not racers,
+                            "; ".join(racers) if racers else "ps 里没有 RACEWAIT"))
+            race_run("wait", 1.0)
+            results.append(("壳自己的 wait 不被并发实例干扰(无孩子→立刻返回)",
+                            has("wait: no zombie child"), "wait: no zombie child"))
+            if any(not ok for _, ok, _ in results) and graphics:
+                shot.save("build/screen-fail.png")
+                print("── 失败时的屏幕(OCR,存了 build/screen-fail.png)──")
+                for ln in race_text().splitlines():
+                    if ln.strip():
+                        print("  |", ln)
             return report(results)
 
         if swap_mode or swap_cold_mode:

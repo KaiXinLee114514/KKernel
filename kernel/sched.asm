@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 200               ; 每个 TCB 200 字节(A2/A3+B+C:身份/优先级/睡眠/进程组/大堆,见 /4、imul)
+TCB_SIZE          equ 240               ; 每个 TCB 240 字节(A2/A3+B+C + Phase D wait-race 事件/快照字段;全仓步长走 TCB_SIZE 宏)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -112,6 +112,21 @@ TCB_KBWAIT        equ 192               ; 1 = 正阻塞在 getkey/getchar(交互
 ; ★ 曾经踩过:UBRK 和 TCB_KBWAIT 都写 192,getchar 置/清 KBWAIT 时顺手把 brk
 ;   冲掉(重发已分配的 VA / 退出时大堆整块泄漏)。加字段时务必别和 192 撞。
 TCB_UBRK          equ 196               ; 大匿名堆的 brk
+
+; ---- Phase D(wait-race):wait 事件/收尸快照(线程私有,见 process_wait2)----
+;  以前这些是 process.asm 里的全局(proc_wait_* / proc_last_*),两条 shell 同时
+;  wait 时互相覆盖。现在挂在**调用方自己的 TCB** 上:process_wait2 写自己的 TCB,
+;  返回后同一线程立即读,不存在跨线程共享。
+TCB_WAIT_STATUS   equ 200               ; 最近一次 wait2 事件:0=正常退出,1=被停住
+TCB_WAIT_PID      equ 204               ; 事件涉及的 pid(槽+1)
+TCB_WAIT_CODE     equ 208               ; 退出事件:子进程退出码
+TCB_LAST_CHILD    equ 212               ; 收尸快照:收掉的子进程 pid
+TCB_LAST_FREED    equ 216               ; 收尸快照:还回去的页数(space_destroy)
+TCB_LAST_RUNSTAT  equ 220               ; 收尸快照:0=正常退出 / 1=被内核干掉
+TCB_LAST_PFRUN    equ 224               ; 收尸快照:这次运行补进来几页
+TCB_LAST_PFIMG    equ 228               ; 收尸快照:其中镜像窗口几页
+TCB_LAST_PFHEAP   equ 232               ; 收尸快照:其中堆窗口几页
+TCB_LAST_FIRSTPA  equ 236               ; 收尸快照:第一页补进来的物理页
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))

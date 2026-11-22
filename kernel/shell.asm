@@ -2677,7 +2677,8 @@ shell_job_scan:
     jmp .next
 .event:
     mov ecx, [jb_slot]
-    cmp dword [proc_wait_status], 1
+    call process_wait_status_get
+    cmp eax, 1
     je .stopped
     mov dword [job_state + ecx*4], 3    ; 3 = Done
     call shell_job_notify_done
@@ -2863,7 +2864,8 @@ cmd_fg:
     mov ebx, WT_WUNTRACED
     call process_wait2
     mov ecx, [jb_slot]
-    cmp dword [proc_wait_status], 1
+    call process_wait_status_get
+    cmp eax, 1
     je .stopped
     ; 退出:通知 done、清槽、前台还给 shell
     mov eax, SHELL_PGRP
@@ -3155,7 +3157,8 @@ cmd_run:
     mov eax, [run_child]
     mov ebx, WT_WUNTRACED
     call process_wait2
-    cmp dword [proc_wait_status], 1
+    call process_wait_status_get
+    cmp eax, 1
     jne .wait_done
     ; ---- 被 ^Z 停住:登记为 Stopped 作业,前台还给 shell,回提示符 ----
     mov eax, SHELL_PGRP
@@ -3186,20 +3189,12 @@ cmd_run:
     ; 前台组还给 shell
     mov eax, SHELL_PGRP
     call tty_setpgrp
-    ; 收尸统计快照到本 shell 的局部(proc_last_* 是全局的,别的 shell 的 wait
-    ; 可能把它盖掉;紧跟着拷走,窗口只有几条指令)
-    mov eax, [proc_last_freed]
-    mov [run_last_freed], eax
-    mov eax, [proc_last_runstat]
-    mov [run_last_runstat], eax
-    mov eax, [proc_last_pfrun]
-    mov [run_last_pfrun], eax
-    mov eax, [proc_last_pfimg]
-    mov [run_last_pfimg], eax
-    mov eax, [proc_last_pfheap]
-    mov [run_last_pfheap], eax
-    mov eax, [proc_last_firstpa]
-    mov [run_last_firstpa], eax
+    ; 收尸统计快照到本 shell 的局部(现在是**当前线程 TCB** 的字段,线程私有;
+    ; 别的 shell 的 wait 盖不掉 —— Phase D wait-race)
+    push edi
+    lea edi, [run_last_freed]
+    call process_last_snapshot
+    pop edi
     jmp cmd_run_after_prog
 .spawn_fail:
     popfd
@@ -4495,7 +4490,7 @@ cmd_fork:
     mov [fork_code], eax
     mov esi, msg_wait_pid
     call term_print
-    mov eax, [proc_last_child]
+    call process_last_child_get
     call term_print_dec
     mov esi, msg_wait_code
     call term_print
@@ -4546,7 +4541,7 @@ cmd_wait:
     call term_set_color
     mov esi, msg_wait_pid
     call term_print
-    mov eax, [proc_last_child]
+    call process_last_child_get
     call term_print_dec
     mov esi, msg_wait_code
     call term_print
