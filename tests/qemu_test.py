@@ -2822,17 +2822,30 @@ def main() -> int:
 
             run("kill 5", wait=0.6)
             run("kill 6", wait=0.8)
-            time.sleep(0.5)
+            # ★ kill 是异步的(信号在目标线程下一次被调度/醒来时才处理),而且演示
+            #   线程每秒打一行会拖慢屏幕;固定 sleep 会抓到还没收尸的 ps。等多拍。
             run("clear")
-            run("ps", wait=1.0)
-            results.append(("kill 之后只剩 shell",
-                            has("4 alive / 16 slots") and not has("alpha"),
+            grabbed = False
+            for _ in range(40):
+                run("ps", wait=1.0)
+                if has("4 alive / 16 slots") and not has("alpha"):
+                    grabbed = True
+                    break
+                time.sleep(0.5)
+            results.append(("kill 之后只剩 shell", grabbed,
                             "两个演示线程都杀掉了,ps 里只剩 4 条 shell"))
             run("kill 0", wait=0.8)
             results.append(("kill 0 被拒", has("cannot kill"),
                             "0 号是 shell 自己,杀不掉"))
-            run("debug pmem", wait=1.2)
-            results.append(("线程栈还回页池", has(f"free: {expected_free_pages()} pages"),
+            # 页池回收同样要等收尸完;轮询 free 数直到对上(最多 ~20 秒)
+            freed_ok = False
+            for _ in range(40):
+                run("debug pmem", wait=1.2)
+                if has(f"free: {expected_free_pages()} pages"):
+                    freed_ok = True
+                    break
+                time.sleep(0.5)
+            results.append(("线程栈还回页池", freed_ok,
                             f"kill 完页池还是 {expected_free_pages()} 页空闲"))
             run("echo after-sched", wait=0.8)
             results.append(("调度器没弄死 shell", has("after-sched"),
