@@ -3041,31 +3041,32 @@ def main() -> int:
                 time.sleep(wait)
                 rescan()
 
-            def ps_rows(tries=6):
-                """抓 "pid N ppid M RUN alpha ticks=T"。被线程插花了就 clear 重来。"""
-                got, head = [], False
+            def ps_rows(tries=8):
+                """抓 "pid N ppid M RUN alpha ticks=T"。被线程插花了就 clear 重来。
+
+                ★ 教训(全量跑过 2 次才稳):演示线程每秒打一行,会把 ps 输出插花;
+                  而且 ps 的行是随时间逐格画出来的,**单张截图很可能只抓到 alpha
+                  或只抓到 beta**。所以不能要求"同一张里两行都在",要跨截图按 pid
+                  做并集,凑够两条不同的 pid 行才算数。"""
+                seen, head = {}, False
                 for _ in range(tries):
                     raw_cmd("clear", 0.4)
                     mon.type_text("ps")          # 自己敲,不等屏幕静止(线程一直在刷)
                     mon.sendkey("ret")
-                    # 演示线程每秒打一行,**会插进 ps 输出中间**(实测把表头
-                    # 插成 "scheduled tialpha 6 ks= 1400"),而且 ps 那几行是
-                    # 一格一格画的。所以:短时间内多抓几张,把各张里认出来的
-                    # 行并起来看,凑够 alpha/beta 两行才算数。
                     for _ in range(8):
                         time.sleep(0.45)
                         rescan()
                         txt = ("\n".join(screen_text(shot, glyphs)) if graphics
                                else "\n".join(mon.screen()))
-                        rows = re.findall(
-                            r"pid (\d+) ppid \d+ (?:RUN|ZOMBIE|STOP) (alpha|beta)\s+ticks=(\d+)", txt)
-                        if len(rows) > len(got):
-                            got = rows
+                        for pid, name, tick in re.findall(
+                                r"pid (\d+) ppid \d+ (?:RUN|ZOMBIE|STOP) (alpha|beta)\s+ticks=(\d+)", txt):
+                            seen[(int(pid), name)] = (pid, name, tick)
                         if "alive / 16 slots" in txt:
                             head = True
-                        if len(got) >= 2 and head:
-                            return got, head
-                return got, head
+                        names = {name for (_, name) in seen}
+                        if len(names) >= 2 and head:
+                            return list(seen.values()), head
+                return list(seen.values()), head
 
             rows, header_ok = ps_rows()
             ids = sorted(int(i) for i, _, _ in rows)
