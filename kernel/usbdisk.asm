@@ -100,6 +100,19 @@ usbd_frames_ctrl:
 
 usb_bulk_xfer:
     pushad
+    cmp byte [usb_msd_ok], 0
+    je .offline                     ; 盘被拔掉: 直接失败,别碰硬件
+    cmp dword [usb_msd_ctrl], 2
+    je .to_ehci
+    jmp .go
+.to_ehci:
+    popad
+    jmp ehci_bulk_xfer              ; EHCI 高速设备走 EHCI 传输
+.offline:
+    mov dword [usb_xfer_ret], -1
+    popad
+    ret
+.go:
     mov [usb_xfer_buf], esi
     mov [usb_xfer_len], ecx
     mov [usb_xfer_ep], edi
@@ -146,7 +159,7 @@ usb_bulk_xfer:
     mov [usb_pkt_len], eax
 
     ; ---- token ----
-    mov edx, [usb_cur_dev]
+    mov edx, [usb_msd_addr]
     shl edx, 8
     cmp dword [usb_xfer_dir], 0
     jne .in_pid
@@ -249,6 +262,8 @@ usb_bulk_xfer:
     call usbd_frames_ctrl
     mov dword [usb_xfer_ret], -1
 .done:
+    mov eax, usb_mutex
+    call mutex_unlock
     popad
     mov eax, [usb_xfer_ret]
     ret
@@ -263,6 +278,10 @@ usb_bulk_xfer:
 ; ===========================================================================
 usb_bot:
     pushad
+    ; 整个 BOT 事务(多笔 bulk)串行化:防止另一线程的枚举/读写插进来
+    ; 把 CBW/CSW/数据缓冲搅乱。mutex 可重入(usb_hotplug_process 已持锁时没问题)。
+    mov eax, usb_mutex
+    call mutex_lock
     mov [usb_bot_cdb], esi
     mov [usb_bot_dlen], ecx
     mov [usb_bot_dbuf], edi
@@ -803,7 +822,18 @@ usbd_find_part:
 cmd_usbdisk:
     pushad
     cmp byte [usb_msd_ok], 0
-    je .no_dev
+    jne .have_dev
+    ; 无设备时 status 依然要报告状态(FAT 设备是 ATA / 未挂载),
+    ; 其余子命令走"没有 U 盘"提示。
+    call usbd_first_word
+    test ecx, ecx
+    jz .no_dev
+    mov edx, n_usbd_status
+    call str_eq
+    test eax, eax
+    jnz .do_status
+    jmp .no_dev
+.have_dev:
 
     ; ---- 没初始化成功:允许 sense,其它命令报错 ----
     cmp byte [usbdisk_ready], 0
@@ -1212,9 +1242,28 @@ cmd_usbdisk:
     popad
     ret
 
+; ===========================================================================
+;  usbdisk_on_unplug: U 盘被拔掉时的回调(usb2.asm 热插拔线程调)
+; ===========================================================================
+usbdisk_on_unplug:
+    pushad
+    mov byte [usbdisk_ready], 0
+    cmp byte [usb_mounted], 0
+    je .out
+    call fat_state_restore
+    call blkdev_select_ata
+    mov byte [usb_mounted], 0
+    call shell_reset_cwd
+    mov esi, msg_usbd_unplugged
+    call term_print
+.out:
+    popad
+    ret
+
 ; ---------------------------------------------------------------------------
 ;  数据
 ; ---------------------------------------------------------------------------
+msg_usbd_unplugged db 'usbdisk: removed, FAT device back to ATA FAT16', 10, 0
 usbdisk_ready   db 0
 usb_mounted     db 0                    ; 1 = FAT 驱动当前挂在 U 盘上
 usb_bot_tag     dd 0x4B4B0001
