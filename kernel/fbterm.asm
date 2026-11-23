@@ -424,9 +424,19 @@ fb_putc:
 .bs:
     mov eax, [fb_cur_x]
     test eax, eax
+    jnz .bs_col_ok
+    ; ★ 行首退格:输入行自动换行到下一行后,要能退回到上一行行尾继续编辑。
+    ;   以前这里直接 jz .done,长命令在换行处就退不动了(用户报的"缓冲区溢出
+    ;   自动换行"编辑问题)。到顶行行首就什么都不做。
+    mov eax, [fb_cur_y]
+    test eax, eax
     jz .done
-    sub eax, 8                          ; 退一格(汉字 16 宽时退半格,够用了)
-    mov [fb_cur_x], eax
+    sub eax, FB_CELL_H
+    mov [fb_cur_y], eax
+    mov eax, [fb_width]
+    mov [fb_cur_x], eax                 ; 先指到行尾外一格,下面统一减 8
+.bs_col_ok:
+    sub dword [fb_cur_x], 8             ; 退一格(汉字 16 宽时退半格,够用了)
     mov esi, blank_glyph
     mov eax, [fb_cur_x]
     mov ebx, [fb_cur_y]
