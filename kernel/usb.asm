@@ -96,7 +96,7 @@ USB_CFG_DESC   equ 0x3C1180     ; 64 B 配置描述符(含接口/端点)
 ;  没控制器时**静默返回**(没有 USB 的机器行为不变);控制器在但复位/枚举
 ;  失败才打一行,免得每次开机都多一行。
 ; ===========================================================================
-usb_init:
+usb_uhci_init:
     pushad
     mov byte [usb_ready], 0
     mov byte [usb_hid_ok], 0
@@ -121,26 +121,7 @@ usb_init:
 
     call usb_build_frames
 
-    ; 端口 1、2:谁先连上设备就枚举谁(够用了;一个键盘不需要多设备地址管理)
-    xor ebx, ebx
-.port:
-    mov ecx, ebx
-    call usb_port_reset
-    test eax, eax
-    jz .next
-    mov eax, ebx
-    inc eax
-    mov [usb_port], eax
-    call usb_enumerate
-    cmp dword [usb_state], 0
-    jne .done                       ; 找到了设备(不管是不是键盘)就停
-.next:
-    inc ebx
-    cmp ebx, 2
-    jb .port
-
-.done:
-    mov byte [usb_ready], 1
+    mov byte [usb_uhci_ok], 1       ; 控制器就绪(热插拔轮询用)
     popad
     ret
 
@@ -319,7 +300,7 @@ usb_port_reset:
 ;    edx = 1 = IN(设备→主机),0 = 无数据
 ;  返回 eax=0 成功,-1 失败/超时
 ; ===========================================================================
-usb_control:
+usb_uhci_control:
     pushad
     mov [usb_xfer_setup], esi
     mov [usb_xfer_buf], edi
@@ -337,7 +318,7 @@ usb_control:
     ; ---- SETUP TD ----
     mov ebx, USB_CTRL_TD
     mov dword [ebx + 4], TD_STATUS
-    mov eax, [usb_cur_dev]
+    mov eax, [usb_ctl_addr]
     shl eax, 8
     or eax, 0x2D | (7 << 21)        ; SETUP(0x2D),长度 8 → 字段 7
     mov [ebx + 8], eax
@@ -355,13 +336,13 @@ usb_control:
     mov ebp, 1                      ; 数据阶段从 DATA1 开始,每包翻转
 .data_loop:
     mov eax, ecx
-    mov edx, [usb_ep0_mps]
+    mov edx, [usb_ctl_mps]
     cmp eax, edx
     jbe .chunk
     mov eax, edx
 .chunk:
     mov dword [ebx + 4], TD_STATUS
-    mov edx, [usb_cur_dev]
+    mov edx, [usb_ctl_addr]
     shl edx, 8
     or edx, 0x69                    ; IN(0x69),端点 0
     mov edi, ebp
@@ -389,7 +370,7 @@ usb_control:
     jne .status_pid
     mov edx, 0xE1                   ; IN 数据 → 状态阶段是 OUT
 .status_pid:
-    mov eax, [usb_cur_dev]
+    mov eax, [usb_ctl_addr]
     shl eax, 8
     or edx, eax
     or edx, (1 << 19)               ; 状态阶段 DATA1
@@ -434,7 +415,9 @@ usb_control:
 .scan:
     mov eax, [ebx + 4]
     test eax, TD_ERRMASK
-    jnz .fail
+    jz .noerr
+    jmp .fail
+.noerr:
     add ebx, 16
     dec ecx
     jnz .scan
@@ -446,7 +429,9 @@ usb_control:
 
     call pit_get_ticks
     sub eax, [usb_deadline]
-    jns .fail
+    js .nowait
+    jmp .fail
+.nowait:
     hlt
     jmp .wait
 
@@ -476,14 +461,34 @@ usb_control:
 ; ===========================================================================
 usb_enumerate:
     pushad
-    mov dword [usb_cur_dev], 0
-    mov dword [usb_msd_ep_in], 0
-    mov dword [usb_msd_ep_out], 0
-    mov dword [usb_msd_mps_in], 0
-    mov dword [usb_msd_mps_out], 0
+    mov dword [usb_ctl_addr], 0
+    mov dword [usb_scratch_ep_in], 0
+    mov dword [usb_scratch_ep_out], 0
+    mov dword [usb_scratch_mps_in], 0
+    mov dword [usb_scratch_mps_out], 0
+    mov dword [usb_ep_addr], 0
+    mov dword [usb_ep_mps], 0
+    mov dword [usb_ep_interval], 0
 
-    ; ---- SET_ADDRESS(1) ----
-    mov dword [USB_SETUP_BUF], 0x00010500
+    ; ---- SET_ADDRESS(动态分配 1..127 回绕;多设备/热插拔需要) ----
+    mov eax, [usb_next_addr]
+    test eax, eax
+    jnz .addr_have
+    mov eax, 1
+.addr_have:
+    mov [usb_dev_addr], eax         ; 暂存本次分配的地址(下面 ecx 要用)
+    mov edx, eax
+    cmp edx, 127
+    jb .addr_inc
+    mov edx, 1                      ; 回绕到 1(0 是默认地址,不用)
+    jmp .addr_store
+.addr_inc:
+    inc edx
+.addr_store:
+    mov [usb_next_addr], edx
+    shl eax, 16                     ; wValue(高 16 位)=新地址:SETUP 包第 2-3 字节
+    or eax, 0x00000500              ; bmRequestType=0 | bRequest=SET_ADDRESS(5)
+    mov [USB_SETUP_BUF], eax
     mov dword [USB_SETUP_BUF + 4], 0
     mov esi, USB_SETUP_BUF
     xor edi, edi
@@ -491,12 +496,18 @@ usb_enumerate:
     xor edx, edx
     call usb_control
     test eax, eax
-    jnz .fail
-    mov dword [usb_dev_addr], 1
-    mov dword [usb_cur_dev], 1
+    jz .ok1
+    mov al, '1'
+    call term_putc
+    jmp .fail
+.ok1:
+    mov eax, [usb_dev_addr]         ; 恢复本次分配的地址
+    mov [usb_ctl_addr], eax
+    mov ecx, 2                      ; SET_ADDRESS 后按 USB 规范等 2ms 再谈
+    call pit_wait_ticks
 
     ; ---- 先按 8 字节读设备描述符前 8 字节,拿 bMaxPacketSize0 ----
-    mov dword [usb_ep0_mps], 8
+    mov dword [usb_ctl_mps], 8
     mov dword [USB_SETUP_BUF], 0x01000680
     mov dword [USB_SETUP_BUF + 4], 8 << 16
     mov esi, USB_SETUP_BUF
@@ -505,11 +516,15 @@ usb_enumerate:
     mov edx, 1
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok2
+    mov al, '2'
+    call term_putc
+    jmp .fail
+.ok2:
     movzx eax, byte [USB_DEV_DESC + 7]
     test eax, eax
     jz .mps_keep
-    mov [usb_ep0_mps], eax
+    mov [usb_ctl_mps], eax
 .mps_keep:
 
     ; ---- GET_DESCRIPTOR(设备,18 字节)----
@@ -521,7 +536,11 @@ usb_enumerate:
     mov edx, 1
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok3
+    mov al, '3'
+    call term_putc
+    jmp .fail
+.ok3:
 
     movzx eax, word [USB_DEV_DESC + 8]
     mov [usb_vid], eax
@@ -541,7 +560,11 @@ usb_enumerate:
     mov edx, 1
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok4
+    mov al, '4'
+    call term_putc
+    jmp .fail
+.ok4:
 
     movzx eax, word [USB_CFG_DESC + 2]
     test eax, eax
@@ -561,7 +584,11 @@ usb_enumerate:
     mov edx, 1
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok5
+    mov al, '5'
+    call term_putc
+    jmp .fail
+.ok5:
 
     ; ---- 解析:配置 / 接口 / 中断 IN 端点 ----
     movzx eax, byte [USB_CFG_DESC + 4]
@@ -612,16 +639,16 @@ usb_enumerate:
     and edx, 0x7FF
     test al, 0x80
     jz .walk_bulk_out
-    cmp dword [usb_msd_ep_in], 0
+    cmp dword [usb_scratch_ep_in], 0
     jne .next
-    mov [usb_msd_ep_in], eax
-    mov [usb_msd_mps_in], edx
+    mov [usb_scratch_ep_in], eax
+    mov [usb_scratch_mps_in], edx
     jmp .next
 .walk_bulk_out:
-    cmp dword [usb_msd_ep_out], 0
+    cmp dword [usb_scratch_ep_out], 0
     jne .next
-    mov [usb_msd_ep_out], eax
-    mov [usb_msd_mps_out], edx
+    mov [usb_scratch_ep_out], eax
+    mov [usb_scratch_mps_out], edx
 .next:
     add ebx, ecx
     jmp .walk
@@ -648,7 +675,11 @@ usb_enumerate:
     xor edx, edx
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok6
+    mov al, '6'
+    call term_putc
+    jmp .fail
+.ok6:
 
     ; SET_IDLE(0):不自动重复,省得报告刷屏
     mov dword [USB_SETUP_BUF], 0x00000A21
@@ -659,7 +690,11 @@ usb_enumerate:
     xor edx, edx
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok7
+    mov al, '7'
+    call term_putc
+    jmp .fail
+.ok7:
 
     ; SET_PROTOCOL(0 = boot protocol),报告固定 8 字节
     mov dword [USB_SETUP_BUF], 0x00000B21
@@ -670,12 +705,16 @@ usb_enumerate:
     xor edx, edx
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok8
+    mov al, '8'
+    call term_putc
+    jmp .fail
+.ok8:
 
     mov byte [usb_toggle], 0
     mov byte [usb_hid_ok], 1
     mov dword [usb_state], 2
-    call usb_arm_int
+    mov dword [esp + 28], 2         ; 返回码 2 = HID 键盘(外层填设备记录并 arm)
     popad
     ret
 
@@ -687,9 +726,9 @@ usb_enumerate:
     jne .not_msd
     cmp dword [usb_if_proto], 0x50
     jne .not_msd
-    cmp dword [usb_msd_ep_in], 0
+    cmp dword [usb_scratch_ep_in], 0
     je .not_msd
-    cmp dword [usb_msd_ep_out], 0
+    cmp dword [usb_scratch_ep_out], 0
     je .not_msd
 
     ; SET_CONFIGURATION(1)
@@ -701,17 +740,24 @@ usb_enumerate:
     xor edx, edx
     call usb_control
     test eax, eax
-    jnz .fail
+    jz .ok9
+    mov al, '9'
+    call term_putc
+    jmp .fail
+.ok9:
 
-    mov byte [usb_msd_ok], 1        ; ⚠ 必须是 byte:usb_msd_ok 是 db,写 dword 会零掉后面的 usb_msd_ep_in
+    mov byte [usb_msd_ok], 1        ; ⚠ 必须是 byte:usb_msd_ok 是 db,写 dword 会零掉后面的 usb_scratch_ep_in
     mov dword [usb_state], 3
+    mov dword [esp + 28], 3         ; 返回码 3 = 大容量储存(外层填设备记录)
     popad
     ret
 .not_msd:
+    mov dword [esp + 28], 0
     popad
     ret
 .fail:
     mov dword [usb_state], 0
+    mov dword [esp + 28], -1
     mov esi, msg_usb_enum_fail      ; 只打一行,继续开机
     call term_print
     popad
@@ -720,13 +766,13 @@ usb_enumerate:
 ; ===========================================================================
 ;  usb_arm_int:把中断 IN 的 TD 重新挂到常驻 QH 上
 ; ===========================================================================
-usb_arm_int:
+usb_uhci_arm_int:
     push eax
     push ebx
     mov dword [USB_INT_QH + 4], USB_INT_TD
     mov dword [USB_INT_TD], 1
     mov dword [USB_INT_TD + 4], TD_STATUS
-    mov eax, [usb_dev_addr]
+    mov eax, [kb_addr]              ; 键盘自己的设备地址(枚举时分配)
     shl eax, 8
     or eax, 0x69 | (1 << 15) | (7 << 21)
     movzx ebx, byte [usb_toggle]
@@ -744,7 +790,7 @@ usb_arm_int:
 ;    · 完成 → 解析 8 字节报告,翻转 toggle,重新挂上
 ;    · 出错 → 复位 toggle 重新挂(键盘不会 STALL,真出错也能自愈)
 ; ===========================================================================
-usb_poll:
+usb_uhci_poll:
     pushad
     pushf
     cmp byte [usb_ready], 0
@@ -987,168 +1033,6 @@ usb_emit:
     popad
     ret
 
-; ===========================================================================
-;  shell 的 usb 命令:控制器 / 端口 / 枚举结果 / 端点
-; ===========================================================================
-cmd_usb:
-    pushad
-
-    cmp dword [pci_usb_addr], -1
-    je .none
-    cmp dword [usb_iobase], 0
-    je .notinit
-
-    ; usb: UHCI 8086:7020 io C040 p1=0085 p2=0080
-    mov esi, msg_usb_ctrl
-    call term_print
-    mov eax, [pci_usb_id]
-    call pci_ph4
-    mov al, ':'
-    call term_putc
-    mov eax, [pci_usb_id]
-    shr eax, 16
-    call pci_ph4
-    mov esi, msg_usb_io
-    call term_print
-    mov eax, [usb_iobase]
-    call pci_ph4
-    mov esi, msg_usb_p1
-    call term_print
-    xor ecx, ecx
-    call usb_read_port
-    movzx eax, ax
-    call pci_ph4
-    mov esi, msg_usb_p2
-    call term_print
-    mov ecx, 1
-    call usb_read_port
-    movzx eax, ax
-    call pci_ph4
-    mov al, 10
-    call term_putc
-
-    cmp dword [usb_state], 0
-    je .nodev
-
-    ; usb: dev 0627:0001 class 00 cfg 1 iface 1
-    mov esi, msg_usb_dev
-    call term_print
-    mov eax, [usb_vid]
-    call pci_ph4
-    mov al, ':'
-    call term_putc
-    mov eax, [usb_pid]
-    call pci_ph4
-    mov esi, msg_usb_class
-    call term_print
-    mov eax, [usb_class]
-    call pci_ph2
-    mov esi, msg_usb_cfg
-    call term_print
-    mov eax, [usb_ncfg]
-    call term_print_dec
-    mov esi, msg_usb_ifaces
-    call term_print
-    mov eax, [usb_niface]
-    call term_print_dec
-    mov al, 10
-    call term_putc
-
-    ; usb: iface 00 class 03/01/01 HID keyboard
-    mov esi, msg_usb_iface
-    call term_print
-    mov eax, [usb_if_class]
-    call pci_ph2
-    mov al, '/'
-    call term_putc
-    mov eax, [usb_if_sub]
-    call pci_ph2
-    mov al, '/'
-    call term_putc
-    mov eax, [usb_if_proto]
-    call pci_ph2
-    cmp dword [usb_msd_ok], 0
-    je .tag_hid
-    mov esi, msg_usb_msdtag
-    call term_print
-    jmp .ep_check
-.tag_hid:
-    mov esi, msg_usb_hidtag
-    call term_print
-.ep_check:
-
-    ; usb: mass storage ep 81 IN, 02 OUT
-    cmp dword [usb_msd_ok], 0
-    je .noep
-    mov esi, msg_usb_msd
-    call term_print
-    mov eax, [usb_msd_ep_in]
-    call pci_ph2
-    mov esi, msg_usb_msdin
-    call term_print
-    mov eax, [usb_msd_mps_in]
-    call term_print_dec
-    mov esi, msg_usb_msdout
-    call term_print
-    mov eax, [usb_msd_ep_out]
-    call pci_ph2
-    mov al, ','
-    call term_putc
-    mov eax, [usb_msd_mps_out]
-    call term_print_dec
-    mov al, 10
-    call term_putc
-
-    ; usb: ep 81 IN, max 8, interval 10 ms
-    cmp dword [usb_ep_addr], 0
-    je .noep
-    mov esi, msg_usb_ep
-    call term_print
-    mov eax, [usb_ep_addr]
-    call pci_ph2
-    mov esi, msg_usb_epin
-    call term_print
-    mov eax, [usb_ep_mps]
-    call term_print_dec
-    mov esi, msg_usb_epint
-    call term_print
-    mov eax, [usb_ep_interval]
-    call term_print_dec
-    mov esi, msg_usb_ms
-    call term_print
-.noep:
-
-    cmp byte [usb_hid_ok], 0
-    je .nohid
-    mov esi, msg_usb_ok
-    call term_print
-    mov esi, msg_usb_reports
-    call term_print
-    mov eax, [usb_hid_reports]
-    call term_print_dec
-    mov al, 10
-    call term_putc
-    jmp .done
-.nohid:
-    mov esi, msg_usb_nohid
-    call term_print
-    jmp .done
-
-.nodev:
-    mov esi, msg_usb_nodev
-    call term_print
-    jmp .done
-.notinit:
-    mov esi, msg_usb_notinit
-    call term_print
-    jmp .done
-.none:
-    mov esi, msg_usb_none
-    call term_print
-.done:
-    popad
-    ret
-
 ; ecx = 0/1 → ax = PORTSC
 usb_read_port:
     mov dx, [usb_iobase]
@@ -1184,8 +1068,6 @@ usb_if_proto    dd 0
 usb_ep_addr     dd 0
 usb_ep_mps      dd 0
 usb_ep_interval dd 0
-usb_cur_dev     dd 0             ; 当前控制传输要发的设备地址(枚举时 0→新地址)
-usb_ep0_mps     dd 8             ; EP0 的 wMaxPacketSize(默认 8,枚举时从设备描述符读)
 usb_msd_ok      db 0             ; 枚举到的是不是大容量储存设备
 usb_msd_ep_in   dd 0             ; bulk IN 端点地址
 usb_msd_ep_out  dd 0             ; bulk OUT 端点地址

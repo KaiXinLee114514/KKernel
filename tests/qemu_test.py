@@ -922,9 +922,16 @@ def _fat_walk_issues(fs) -> list:
     return issues
 
 
-def check_usb_fat_image(path: str, want_fat32: bool = False) -> list:
+def check_usb_fat_image(path: str, want_fat32: bool = False,
+                        rw_layout: bool = True,
+                        extra_files: dict | None = None,
+                        extra_dirs: dict | None = None) -> list:
     """--usb-rw 离线校验:用**独立**的 Python FAT 解析器读 U 盘镜像,
-    证明内核的 write/cp/mkdir/rm 真的写到了盘上(而不是只在内存里骗自己)。"""
+    证明内核的 write/cp/mkdir/rm 真的写到了盘上(而不是只在内存里骗自己)。
+
+    EHCI / 热插拔用例复用同一套解析:rw_layout=False 关掉 --usb-rw 专属的
+    NEW.TXT / COPY.TXT / USBDIR 断言;各自写下的文件/目录用
+    extra_files(名字 → 期望字节)和 extra_dirs(目录 → 期望子项)补进来。"""
     results: list = []
     raw = open(path, "rb").read()
     if raw[510:512] != b"\x55\xAA":
@@ -948,19 +955,34 @@ def check_usb_fat_image(path: str, want_fat32: bool = False) -> list:
     results.append(("离线:原有 USB_HI.TXT 内容未变",
                     content_of("USB_HI.TXT") == USB_RW_INIT_TEXT,
                     f"USB_HI.TXT = {content_of('USB_HI.TXT')!r}"))
-    new_txt = content_of("NEW.TXT")
-    results.append(("离线:内核 write 的 NEW.TXT 在盘上(字节一致)",
-                    new_txt == b"hello-usb", f"NEW.TXT = {new_txt!r}(期望 b'hello-usb')"))
-    names = []
-    try:
-        names = [n for n, _d in fs.listdir("")]
-    except Exception as e:
-        results.append(("离线:U 盘根目录可解析", False, f"listdir 失败: {e}"))
-    results.append(("离线:rm 删除的 COPY.TXT 真的不在了",
-                    "COPY.TXT" not in names, f"根目录: {names}"))
-    inner = content_of("USBDIR/IN.TXT")
-    results.append(("离线:子目录 USBDIR/IN.TXT 内容一致",
-                    inner == b"inner-data", f"USBDIR/IN.TXT = {inner!r}"))
+    if rw_layout:
+        new_txt = content_of("NEW.TXT")
+        results.append(("离线:内核 write 的 NEW.TXT 在盘上(字节一致)",
+                        new_txt == b"hello-usb", f"NEW.TXT = {new_txt!r}(期望 b'hello-usb')"))
+        names = []
+        try:
+            names = [n for n, _d in fs.listdir("")]
+        except Exception as e:
+            results.append(("离线:U 盘根目录可解析", False, f"listdir 失败: {e}"))
+        results.append(("离线:rm 删除的 COPY.TXT 真的不在了",
+                        "COPY.TXT" not in names, f"根目录: {names}"))
+        inner = content_of("USBDIR/IN.TXT")
+        results.append(("离线:子目录 USBDIR/IN.TXT 内容一致",
+                        inner == b"inner-data", f"USBDIR/IN.TXT = {inner!r}"))
+    # 各模式自己写下的文件/目录:内容必须字节一致,目录里必须真有这些项
+    for name, want_bytes in (extra_files or {}).items():
+        got = content_of(name)
+        results.append((f"离线:{name} 内容一致", got == want_bytes,
+                        f"{name} = {got!r}(期望 {want_bytes!r})"))
+    for d, want_names in (extra_dirs or {}).items():
+        try:
+            dnames = [n for n, _is_dir in fs.listdir(d)]
+        except Exception as e:                                  # noqa: BLE001
+            results.append((f"离线:{d}/ 目录存在", False, f"listdir 失败: {e}"))
+            continue
+        missing = [n for n in want_names if n not in dnames]
+        results.append((f"离线:{d}/ 里能看到 {'/'.join(want_names)}", not missing,
+                        f"{d}/ 实际有: {dnames}"))
 
     # 两份 FAT 副本要一致(内核写 FAT 时两份都要写)
     fat_bytes = fs.fat_sectors * 512
@@ -988,6 +1010,8 @@ def main() -> int:
     usb_kbd_mode = "--usb-kbd" in argv      # USB 键盘:QEMU 只插 usb-kbd(PS/2 收不到 sendkey)
     usb_rw_mode = "--usb-rw" in argv        # USB 上的 FAT16:mount/umount + 读写 U 盘 + host 侧校验
     usb_rw32_mode = "--usb-rw32" in argv      # 同上但 U 盘镜像用 FAT32(U3 加分项)
+    usb_ehci_mode = "--usb-ehci" in argv      # EHCI(USB 2.0):高速 U 盘走 EHCI,键盘走 UHCI
+    usb_hotplug_mode = "--usb-hotplug" in argv  # 运行时用 HMP device_add/device_del 热插拔 U 盘/键盘
     mine_mode = "--mine" in argv            # 扫雷(BIN/MINE.BIN):菜单/棋盘/光标/旗子/退出
     proc_mode = "--proc" in argv            # 进程地基:ps/fork/wait/exit/kill/信号三元组
     tty_mode = "--tty" in argv              # TTY:两问向导 / ANSI 控制字符 / ASCII 降级
@@ -1006,6 +1030,7 @@ def main() -> int:
     argv = [a for a in argv
             if a not in ("--dump", "--hda", "--fault", "--pgfault", "--kbd", "--shell",
                          "--fontdisk", "--fat32", "--usbdisk", "--usb-kbd", "--usb-rw", "--usb-rw32",
+                         "--usb-ehci", "--usb-hotplug",
                          "--mine", "--proc",
                          "--tty", "--login", "--sched", "--jobctl", "--wait-race",
                          "--swap", "--swap-cold")]
@@ -1053,6 +1078,27 @@ def main() -> int:
     usb_kbd_args: list = []
     if usb_kbd_mode:
         usb_kbd_args = ["-device", "usb-kbd"]
+    # EHCI(USB 2.0)/热插拔用例:两种模式都要一张 8 MiB 的 FAT16 U 盘镜像(和 --usb-rw 同款)。
+    #   --usb-ehci   :启动时就挂好 —— 高速 U 盘接 EHCI,键盘接 UHCI(登录仍走 HID);
+    #   --usb-hotplug:启动时**什么 USB 设备都不插**(登录走 PS/2),运行时由 HMP 插拔。
+    usb_ehci_args: list = []
+    if usb_ehci_mode or usb_hotplug_mode:
+        usb_img = os.path.join(tempfile.gettempdir(), f"kkernel-usbstick-{os.getpid()}.img")
+        make_usb_fat16_image(usb_img, 8)
+        if usb_ehci_mode:
+            usb_ehci_args = [
+                "-device", "usb-ehci,id=ehci",
+                "-drive", f"if=none,id=ehcistick,format=raw,file={usb_img}",
+                "-device", "usb-storage,drive=ehcistick,bus=ehci.0,id=ehcistick",
+                "-device", "usb-kbd,bus=usb-bus.0,id=ehci_kbd",
+            ]
+        else:
+            # 只准备 backend(-drive),设备留到测试里 device_add 时再插;
+            # 别在这里加 usb-kbd:sendkey 会被它抢走,PS/2 登录就敲不进去了。
+            usb_ehci_args = [
+                "-device", "usb-ehci,id=ehci",
+                "-drive", f"if=none,id=hotusb,format=raw,file={usb_img}",
+            ]
     # 再开一个 QMP socket:Alt 码位输入要"按住 Alt 敲数字",HMP 的 sendkey 做不到,
     # 得用 QMP 的 input-send-event 分开按/放(tools/text2alt.py --send 就是干这个的)
     qmp_sock = f"{sock}.qmp"
@@ -1068,7 +1114,7 @@ def main() -> int:
          # `pci 0:1.2` 那组断言就对不上了。
          # ⚠️ 别在这里插 usb-kbd:QEMU 的 sendkey 会改投 USB 键盘,
          #    整套 PS/2 键盘用例(还有 shell 打字)会全部失灵。
-         "-usb", *usb_args, *usb_kbd_args,
+         "-usb", *usb_args, *usb_kbd_args, *usb_ehci_args,
          "-monitor", f"unix:{sock},server,nowait",
          "-qmp", f"unix:{qmp_sock},server,nowait"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -1631,6 +1677,215 @@ def main() -> int:
             results.append(("ATA 磁盘镜像在 mount/umount 期间一字节未变",
                             open(img, "rb").read() == hd_before,
                             "USB 文件系统操作没有误写内部 ATA 盘"))
+            return report(results)
+
+        if usb_ehci_mode:
+            # ---- EHCI(USB 2.0):高速 U 盘走 EHCI,键盘走 UHCI ----
+            # 启动时就挂好了(EHCI 控制器 + 8 MiB FAT16 U 盘 + UHCI usb-kbd,见上面的
+            # usb_ehci_args):登录本身就是 UHCI HID 键盘敲进来的,下面直接验证高速设备
+            # 枚举和 FAT16 读写;最后离线读 U 盘镜像,确认改动真的落盘。
+            results: list = []
+            time.sleep(1.0)
+
+            def ehci_run(line: str, timeout: float = 15.0, expect: str | None = None) -> None:
+                """敲一条命令;给了 expect 就等它出现在屏幕上(比死等固定秒数稳)。"""
+                mon.type_text(line)
+                mon.sendkey("ret")
+                if expect:
+                    wait_has(expect, timeout)
+                else:
+                    time.sleep(1.2)
+                rescan()
+
+            ehci_run("usbdisk", expect="QEMU QEMU HARDDISK")
+            results.append(("EHCI 高速 U 盘枚举 + INQUIRY",
+                            has("usbdisk: QEMU QEMU HARDDISK"),
+                            "usbdisk: QEMU QEMU HARDDISK rev ..."))
+            ehci_run("usb", expect="usb: EHCI")
+            results.append(("usb 命令检测到 EHCI 控制器", has("usb: EHCI"), "usb: EHCI"))
+            results.append(("U 盘挂在 EHCI 上、按高速 MSD 枚举",
+                            has("ctrl=EHCI") and has("class=MSD") and has("speed=high"),
+                            "ctrl=EHCI ... class=MSD ... speed=high ..."))
+            ehci_run("usbdisk mount", timeout=20.0, expect="mounted FAT16 at LBA 2048")
+            results.append(("mount:U 盘 FAT16 在 LBA 2048",
+                            has("mounted FAT16 at LBA 2048, 16384 sectors"),
+                            "usbdisk: mounted FAT16 at LBA 2048, 16384 sectors"))
+            ehci_run("ls", expect="USB_HI.TXT")
+            results.append(("mount 后 ls 看到 U 盘根目录", has("USB_HI.TXT"),
+                            "ls 输出里有 USB_HI.TXT"))
+            ehci_run("cat USB_HI.TXT", expect="hello from usb")
+            results.append(("cat 读 U 盘上的预置文件", has("hello from usb"),
+                            "cat 输出 hello from usb"))
+            ehci_run("write EHCINEW.TXT ehci-write", timeout=20.0, expect="wrote EHCINEW.TXT")
+            results.append(("write 在 EHCI U 盘上建文件", has("wrote EHCINEW.TXT"),
+                            "写成功提示 wrote EHCINEW.TXT"))
+            ehci_run("mkdir EHCIDIR", timeout=20.0, expect="created directory EHCIDIR")
+            results.append(("mkdir 在 EHCI U 盘上建目录", has("created directory EHCIDIR"),
+                            "created directory EHCIDIR"))
+            ehci_run("write EHCIDIR/IN.TXT inner-data", timeout=20.0,
+                     expect="wrote EHCIDIR/IN.TXT")
+            ehci_run("cat EHCIDIR/IN.TXT", expect="inner-data")
+            results.append(("子目录写 + 读", has("inner-data"),
+                            "cat EHCIDIR/IN.TXT 输出 inner-data"))
+            ehci_run("usbdisk umount", timeout=20.0,
+                     expect="unmounted, FAT device back to ATA FAT16")
+            results.append(("umount 把 FAT 设备切回 ATA", has("back to ATA FAT16"),
+                            "usbdisk: unmounted, FAT device back to ATA FAT16 at LBA 6144"))
+            ehci_run("clear")
+            ehci_run("ls", expect="BIN")
+            results.append(("umount 后 ls 又看到 ATA 根目录",
+                            has("BIN") and not has("USB_HI.TXT"),
+                            "ATA 根目录有 BIN,且已经没有 USB_HI.TXT"))
+
+            # ---- host 侧校验必须在 finally 删镜像之前:先收掉 QEMU,再离线读 U 盘镜像 ----
+            qemu.terminate()
+            try:
+                qemu.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                qemu.kill()
+            time.sleep(0.3)
+            results += check_usb_fat_image(
+                usb_img, rw_layout=False,
+                extra_files={"EHCINEW.TXT": b"ehci-write",
+                             "EHCIDIR/IN.TXT": b"inner-data"},
+                extra_dirs={"EHCIDIR": ("IN.TXT",)})
+            return report(results)
+
+        if usb_hotplug_mode:
+            # ---- EHCI 热插拔:运行时用 HMP device_add/device_del 插拔 U 盘和键盘 ----
+            # 内核侧有热插拔任务在轮询端口;每次插拔后等它处理完(2~3 秒)再断言,
+            # 断言前一律 wait_has + rescan,免得拍到"处理到一半"的屏幕。
+            results: list = []
+
+            def hot_cmd(line: str, settle: float = 2.5) -> None:
+                """往 HMP 里发一条插拔命令(没有屏幕回显),等内核热插拔任务处理完。"""
+                out = mon.cmd(line, wait=1.0)
+                if "error" in out.lower():
+                    print(f"  ⚠️  monitor: {line} → {out.strip()[:160]}")
+                time.sleep(settle)
+                rescan()
+
+            def hot_run(line: str, timeout: float = 15.0, expect: str | None = None) -> None:
+                """敲一条 shell 命令;给了 expect 就等它上屏,再 rescan 供断言。"""
+                mon.type_text(line)
+                mon.sendkey("ret")
+                if expect:
+                    wait_has(expect, timeout)
+                else:
+                    time.sleep(1.2)
+                rescan()
+
+            # a. 插任何设备之前:EHCI 在、没有 U 盘、FAT 设备是 ATA
+            hot_run("usb", expect="usb: EHCI")
+            results.append(("空热插拔总线:usb 仍检测到 EHCI", has("usb: EHCI"),
+                            "usb: EHCI"))
+            hot_run("usbdisk status", expect="not mounted (FAT device: ATA)")
+            results.append(("插盘前 FAT 设备是 ATA", has("not mounted (FAT device: ATA)"),
+                            "usbdisk: status: not mounted (FAT device: ATA)"))
+            hot_run("usbdisk", expect="no USB mass storage device")
+            results.append(("插盘前没有 U 盘", has("usbdisk: no USB mass storage device"),
+                            "usbdisk: no USB mass storage device"))
+
+            # b. 插一个 EHCI 高速 U 盘:内核热插拔任务应枚举到
+            hot_cmd("device_add usb-storage,drive=hotusb,id=hotstick,bus=ehci.0")
+            hot_run("usb", expect="class=MSD")
+            results.append(("热插拔 U 盘后 usb 看到 EHCI 上的 MSD",
+                            has("ctrl=EHCI") and has("class=MSD"),
+                            "ctrl=EHCI ... class=MSD ..."))
+            hot_run("usbdisk", expect="QEMU HARDDISK")
+            results.append(("热插拔 U 盘后 usbdisk 认得设备", has("QEMU HARDDISK"),
+                            "usbdisk: QEMU QEMU HARDDISK rev ..."))
+
+            # c. 挂载 + 读写
+            hot_run("usbdisk mount", timeout=20.0, expect="mounted FAT16 at LBA 2048")
+            results.append(("热插拔 U 盘 mount 成功", has("mounted FAT16 at LBA 2048"),
+                            "usbdisk: mounted FAT16 at LBA 2048, 16384 sectors"))
+            hot_run("ls", expect="USB_HI.TXT")
+            results.append(("ls 看到 U 盘根目录", has("USB_HI.TXT"),
+                            "ls 输出里有 USB_HI.TXT"))
+            hot_run("cat USB_HI.TXT", expect="hello from usb")
+            results.append(("cat 读预置文件", has("hello from usb"),
+                            "cat 输出 hello from usb"))
+            hot_run("write HOTNEW.TXT hot-write", timeout=20.0, expect="wrote HOTNEW.TXT")
+            results.append(("write 在热插拔 U 盘上建文件", has("wrote HOTNEW.TXT"),
+                            "写成功提示 wrote HOTNEW.TXT"))
+
+            # d. 拔盘:内核应自动 umount,FAT 回到 ATA,而且不能崩
+            hot_cmd("device_del hotstick")
+            # 先清屏:下面几条要证明的是拔盘之后的新状态,不是 c 段留在屏幕上的旧输出
+            hot_run("clear")
+            hot_run("usbdisk status", expect="not mounted (FAT device: ATA)")
+            results.append(("拔盘后自动 umount(FAT 回到 ATA)",
+                            has("not mounted (FAT device: ATA)"),
+                            "usbdisk: status: not mounted (FAT device: ATA)"))
+            hot_run("usbdisk", expect="no USB mass storage device")
+            results.append(("拔盘后 U 盘从设备列表消失",
+                            has("usbdisk: no USB mass storage device"),
+                            "usbdisk: no USB mass storage device"))
+            hot_run("ls", expect="BIN")
+            results.append(("拔盘后 ATA 根目录正常", has("BIN"), "ls 输出里有 BIN"))
+            # 先清屏:下面这句要证明 mount 自己拒绝,不是旧输出还留在屏幕上
+            hot_run("clear")
+            hot_run("usbdisk mount", timeout=20.0, expect="no USB mass storage device")
+            results.append(("没盘时 mount 被拒绝", has("usbdisk: no USB mass storage device"),
+                            "usbdisk: no USB mass storage device"))
+
+            # e. 插 UHCI 键盘:sendkey 改投 USB 键盘,能敲命令才算通
+            hot_cmd("device_add usb-kbd,id=hotkbd,bus=usb-bus.0")
+            hot_run("echo KBD-HOT-HI", expect="KBD-HOT-HI")
+            results.append(("UHCI 热插拔键盘可用", has("KBD-HOT-HI"),
+                            "echo KBD-HOT-HI 回显"))
+            hot_run("usb", expect="class=HID")
+            results.append(("usb 看到 UHCI 上的 HID 键盘", has("class=HID"),
+                            "class=HID ..."))
+
+            # f. 拔掉 USB 键盘:sendkey 回到 PS/2,PS/2 仍能用
+            hot_cmd("device_del hotkbd", settle=1.5)
+            hot_run("echo PS2-OK", expect="PS2-OK")
+            results.append(("拔掉 USB 键盘后 PS/2 仍能输入", has("PS2-OK"),
+                            "echo PS2-OK 回显"))
+
+            # g. 插 EHCI 高速键盘:中断传输走 EHCI
+            hot_cmd("device_add usb-kbd,id=hotkbd2,bus=ehci.0")
+            hot_run("echo KBD-EHCI-HI", expect="KBD-EHCI-HI")
+            results.append(("EHCI 高速键盘可用", has("KBD-EHCI-HI"),
+                            "echo KBD-EHCI-HI 回显"))
+
+            # h. 重新插回同一张 U 盘:数据还在(拔插不该丢盘上的文件)
+            hot_run("clear")
+            # QEMU 会在 device_del 后自动回收 -drive if=none 的后端,重插前得先
+            # 用 HMP drive_add 把后端加回来,否则 device_add 报 can't find value 'hotusb'。
+            hot_cmd(f"drive_add 0 if=none,id=hotusb,format=raw,file={usb_img}")
+            hot_cmd("device_add usb-storage,drive=hotusb,id=hotstick,bus=ehci.0")
+            # 热插拔是异步的:等内核真的枚举到 U 盘(usb 命令出现 class=MSD)再 mount。
+            # (之前直接 mount,偶尔卡在"枚举还没完成"的窗口里,属于测试时序问题)
+            for _ in range(15):
+                hot_run("usb")
+                if has("class=MSD"):
+                    break
+                time.sleep(1.0)
+            else:
+                print("  ⚠️ 重插后 15 秒仍没在 usb 输出里看到 class=MSD")
+            hot_run("usbdisk mount", timeout=20.0, expect="mounted FAT16")
+            results.append(("重新插盘能再次 mount", has("mounted FAT16"),
+                            "usbdisk: mounted FAT16 at LBA 2048, 16384 sectors"))
+            hot_run("cat HOTNEW.TXT", expect="hot-write")
+            results.append(("重插后盘上数据还在", has("hot-write"),
+                            "cat HOTNEW.TXT 输出 hot-write"))
+            hot_run("usbdisk umount", timeout=20.0, expect="back to ATA FAT16")
+            results.append(("收尾 umount 成功", has("back to ATA FAT16"),
+                            "usbdisk: unmounted, FAT device back to ATA FAT16 at LBA 6144"))
+
+            # ---- host 侧校验:先收 QEMU(缓存要落盘),再离线读 U 盘镜像 ----
+            qemu.terminate()
+            try:
+                qemu.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                qemu.kill()
+            time.sleep(0.3)
+            results += check_usb_fat_image(
+                usb_img, rw_layout=False,
+                extra_files={"HOTNEW.TXT": b"hot-write"})
             return report(results)
 
         if usb_kbd_mode:
