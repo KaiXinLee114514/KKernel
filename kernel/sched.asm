@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 240               ; 每个 TCB 240 字节(A2/A3+B+C + Phase D wait-race 事件/快照字段;全仓步长走 TCB_SIZE 宏)
+TCB_SIZE          equ 256               ; 每个 TCB 256 字节(A2/A3+B+C + Phase D/E 字段;全仓步长走 TCB_SIZE 宏)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -127,6 +127,14 @@ TCB_LAST_PFRUN    equ 224               ; 收尸快照:这次运行补进来几�
 TCB_LAST_PFIMG    equ 228               ; 收尸快照:其中镜像窗口几页
 TCB_LAST_PFHEAP   equ 232               ; 收尸快照:其中堆窗口几页
 TCB_LAST_FIRSTPA  equ 236               ; 收尸快照:第一页补进来的物理页
+
+; ---- E(文件 API 线程私有参数):read/write 文件可能在 fs_lock 上睡眠,参数不能放全局 ----
+;   以前 api_name/api_buf/api_max/api_saved_dir 是全局:两条 shell 同时读写文件时,
+;   后进去的会把先睡着的参数冲掉(踩过:并发 cat/write 内容串、cwd 跑错目录)。
+TCB_API_NAME      equ 240               ; 本次文件 API 的文件名指针
+TCB_API_BUF       equ 244               ; 本次文件 API 的缓冲区指针
+TCB_API_MAX       equ 248               ; 本次文件 API 的字节上限
+TCB_API_DIR       equ 252               ; 本次文件 API 调用前的 [fat_dir](调完恢复)
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))

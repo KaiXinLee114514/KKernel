@@ -223,100 +223,124 @@ api_dispatch:
     call term_clear
     ret
 ; ---- 读文件:esi = 名字,edi = 缓冲区,ecx = 上限 ----
+; ★ 参数不能放全局:本中断可能在 fs_lock 上睡眠,另一条线程的同类调用会把
+;   全局参数冲掉(踩过:两条 shell 同时 cat/写文件时内容串、cwd 跑错目录)。
+;   参数藏进**本线程 TCB**(TCB_API_*),睡醒后读到的还是自己的。
 .read_file:
-    mov [api_name], esi                 ; 先存原始名字(可能带目录)
-    mov [api_buf], edi
-    mov [api_max], ecx
-    mov esi, [api_name]                 ; 先问 /DEV:虚拟设备不走磁盘
+    call process_cur_tcb
+    mov [eax + TCB_API_NAME], esi
+    mov [eax + TCB_API_BUF], edi
+    mov [eax + TCB_API_MAX], ecx
+    mov esi, [eax + TCB_API_NAME]        ; 先问 /DEV:虚拟设备不走磁盘
     call dev_lookup
     test eax, eax
     jnz .read_dev
-    call fs_lock                        ; A4:串行化 FAT/ATA 全局状态
-    mov eax, [fat_dir]                  ; 记下内核当前目录:fat_path 会 chdir 进去,
-    mov [api_saved_dir], eax            ; 调完必须还回来(不然程序连存两次会跑错目录)
-    mov esi, [api_name]                 ; 支持 DOCS/NOTE.TXT(相对当前目录)
-    call fat_path
+    call fs_lock                         ; A4:串行化 FAT/ATA 全局状态
+    call process_cur_tcb
+    mov ecx, [fat_dir]
+    mov [eax + TCB_API_DIR], ecx         ; 记下内核当前目录:调完必须还回来
+    mov esi, [eax + TCB_API_NAME]
+    call fat_path                        ; 支持 DOCS/NOTE.TXT(相对当前目录)
     jc .read_fail
-    mov [api_name], eax                 ; 剩下这截才是文件名
-    mov esi, eax
-    call fat_stat                       ; 先问大小:超了就不读(免得盖掉后面的内存)
+    mov esi, eax                         ; 剩下这截才是文件名
+    call process_cur_tcb
+    mov [eax + TCB_API_NAME], esi
+    mov esi, [eax + TCB_API_NAME]
+    call fat_stat
     cmp eax, -1
     je .read_fail
-    cmp eax, [api_max]
+    push eax
+    call process_cur_tcb
+    pop ecx
+    cmp ecx, [eax + TCB_API_MAX]
     ja .read_fail
-    mov esi, [api_name]
-    mov edi, [api_buf]
+    mov esi, [eax + TCB_API_NAME]
+    mov edi, [eax + TCB_API_BUF]
     call fat_read_file
     cmp eax, -1
     je .read_fail
-    push eax                            ; 成功:恢复 cwd 再把返回值交回去
-    mov eax, [api_saved_dir]
-    mov [fat_dir], eax
+    push eax
+    call process_cur_tcb
+    mov ecx, [eax + TCB_API_DIR]
+    mov [fat_dir], ecx
     call fs_unlock
     pop eax
     ret
 .read_dev:
-    mov edx, [eax + 4]                  ; 设备读函数(0 = 这个设备不可读)
+    mov edx, [eax + 4]
     test edx, edx
     jz .read_dev_fail
-    mov edi, [api_buf]
-    mov ecx, [api_max]
+    push edx
+    call process_cur_tcb
+    mov edi, [eax + TCB_API_BUF]
+    mov ecx, [eax + TCB_API_MAX]
+    pop edx
     call edx
     ret
 .read_dev_fail:
     mov eax, -1
     ret
 .read_fail:
-    mov eax, [api_saved_dir]            ; 失败也恢复:别把 cwd 留在半路
-    mov [fat_dir], eax
+    call process_cur_tcb
+    mov ecx, [eax + TCB_API_DIR]
+    mov [fat_dir], ecx
     call fs_unlock
     mov eax, -1
     ret
 .read_pipe:
-    ; int 0x30 功能 17:读 stdin(管道输入)
-    ;   edi = 缓冲区,ecx = 最多读多少 → eax = 读到多少(0 = EOF)
     call pipe_read
     ret
 
 ; ---- 写文件:esi = 名字,edi = 数据,ecx = 字节数 ----
 .write_file:
-    mov [api_name], esi                 ; 同样支持带目录的名字
-    mov [api_buf], edi
-    mov [api_max], ecx
-    mov esi, [api_name]                 ; 先问 /DEV:虚拟设备不走磁盘
+    call process_cur_tcb
+    mov [eax + TCB_API_NAME], esi
+    mov [eax + TCB_API_BUF], edi
+    mov [eax + TCB_API_MAX], ecx
+    mov esi, [eax + TCB_API_NAME]
     call dev_lookup
     test eax, eax
     jnz .write_dev
-    call fs_lock                        ; A4:串行化 FAT/ATA 全局状态
-    mov eax, [fat_dir]                  ; 同读文件:记下 cwd,调完还回来
-    mov [api_saved_dir], eax
-    mov esi, [api_name]
+    call fs_lock
+    call process_cur_tcb
+    mov ecx, [fat_dir]
+    mov [eax + TCB_API_DIR], ecx
+    mov esi, [eax + TCB_API_NAME]
     call fat_path
     jc .write_fail
     mov esi, eax
-    mov edi, [api_buf]
-    mov ecx, [api_max]
+    call process_cur_tcb
+    mov [eax + TCB_API_NAME], esi
+    mov edi, [eax + TCB_API_BUF]
+    mov ecx, [eax + TCB_API_MAX]
     call fat_write_file
-    push eax                            ; 恢复 cwd 再交还结果
-    mov eax, [api_saved_dir]
-    mov [fat_dir], eax
+    cmp eax, -1
+    je .write_fail
+    push eax
+    call process_cur_tcb
+    mov ecx, [eax + TCB_API_DIR]
+    mov [fat_dir], ecx
     call fs_unlock
     pop eax
     ret
 .write_dev:
-    mov edx, [eax + 8]                  ; 设备写函数(0 = 这个设备不可写)
+    mov edx, [eax + 8]
     test edx, edx
     jz .write_dev_fail
-    mov esi, [api_buf]
-    mov ecx, [api_max]
+    push edx
+    call process_cur_tcb
+    mov esi, [eax + TCB_API_BUF]
+    mov ecx, [eax + TCB_API_MAX]
+    pop edx
     call edx
     ret
 .write_dev_fail:
     mov eax, -1
     ret
 .write_fail:
-    mov eax, [api_saved_dir]
-    mov [fat_dir], eax
+    call process_cur_tcb
+    mov ecx, [eax + TCB_API_DIR]
+    mov [fat_dir], ecx
     call fs_unlock
     mov eax, -1
     ret
@@ -541,10 +565,6 @@ api_usage:
 
 ; ---- 程序接口用的数据 ----
 api_empty   db 0                        ; "没有参数"时给程序的空字符串
-api_name    dd 0
-api_buf     dd 0
-api_max     dd 0
-api_saved_dir dd 0                      ; 文件 API 调用前的 [fat_dir](调完恢复)
 
 ; --- api_stub 的寄存器保存(Phase C:防止 EBX/ESI 被中间实现污掉)---
 ; (api_stub 不再用跨线程全局保存功能号,见其注释)
