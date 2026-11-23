@@ -1520,7 +1520,7 @@ def main() -> int:
                             'type "help" for commands.'))
             swap_run("swap", 1.2)
             results.append(("swap:启用且有 KSWP 头", has("swap: enabled total="),
-                            "swap: enabled total=4096 used=0 out=0 in=0"))
+                            "swap: enabled total=4095 used=0 out=0 in=0"))
             swap_run("meminfo", 1.2)
             results.append(("meminfo 同时显示页池与 swap", has("--- meminfo ---") and has("swap"),
                             "--- meminfo --- / pool ... / swap ..."))
@@ -1538,8 +1538,8 @@ def main() -> int:
             else:
                 results.append(("对照(-m 64):全程没有换出(out=0)",
                                 has(" out=0"), "swap: enabled total=... used=0 out=0 in=0"))
-            results.append(("程序退出后 swap 占用回落(used<=1)", (has(" used=0 out=") or has(" used=1 out=")),
-                            "swap: enabled ... used<=1(极端时序可能残留 1 槽,--swap 已知限制)"))
+            results.append(("程序退出后 swap 占用回落(used=0)", has(" used=0 out="),
+                            "swap: enabled ... used=0(槽全回收,无残留)"))
             return report(results)
 
         if usb_rw_mode or usb_rw32_mode:

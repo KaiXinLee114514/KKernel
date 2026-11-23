@@ -8,8 +8,8 @@
   1) 把 hd.img 原样拷成 out.img;
   2) 在 out.img 末尾(16 MiB 处)追加一块 swap 区:
      - 起始 LBA 32768(16 MiB / 512)
-     - 头 16 字节: "KSWP" + version(1) + total_slots + slot_size(4096)
-     - 其余字节为 0(slot 里原来的内容没有意义)
+     - 首 4 KiB(8 扇区)是头块:前 16 字节 = "KSWP" + version(1) + total_slots + slot_size(4096),
+       其余保留为 0;数据槽从 +8 扇区开始(避免槽 0 覆盖头,内核里叫 SWAP_HDR_SECTORS)
 
 镜像里没有这块区(或者头不合法)时,内核的 swap_init 会静默禁用 swap——
 所以普通的 hd 测试镜像完全不受影响。
@@ -41,7 +41,8 @@ def main():
         print(f"mkswap: source image not found: {src}")
         return 1
     size = size_mib * 1024 * 1024
-    total_slots = size // SLOT_SIZE
+    # 首 4 KiB 留给 KSWP 头(内核从 SWAP_LBA+8 扇区开始用槽,见 kernel/swap.asm)
+    total_slots = size // SLOT_SIZE - 1
 
     data = bytearray(open(src, "rb").read())
     if len(data) > SWAP_LBA * SECTOR:
@@ -53,8 +54,8 @@ def main():
     # swap 头 + 零填充
     data.extend(b"\x00" * 0)  # 占位:下面写头和区
     start = SWAP_LBA * SECTOR
-    blob = bytearray(b"\x00" * size)
     header = struct.pack("<4sIII", MAGIC, VERSION, total_slots, SLOT_SIZE)
+    blob = bytearray(b"\x00" * size)
     blob[0:len(header)] = header
     data = bytearray(data[:start]) + blob
     open(dst, "wb").write(data)

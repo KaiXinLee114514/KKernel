@@ -35,8 +35,9 @@
 ; ============================================================================
 
 ; ---- swap 区布局(必须和 tools/mkswap.py 一致)----
-SWAP_LBA        equ 32768              ; 16 MiB / 512
-SWAP_SLOTS      equ 4096               ; 16 MiB / 4 KiB
+SWAP_LBA        equ 32768              ; swap 区起始 LBA(16 MiB / 512)
+SWAP_HDR_SECTORS equ 8                 ; swap 区头 4 KiB(KSWP+保留):槽从它后面开始
+SWAP_SLOTS      equ 4095               ; 可用槽数(16 MiB 里扣掉首 4 KiB 头)
 SWAP_SLOT_SIZE  equ 4096
 SWAP_MAGIC      equ 0x5057534B         ; "KSWP"(小端: 'K','S','W','P')
 SWAP_VERSION    equ 1
@@ -334,7 +335,7 @@ swap_evict_one:
     ; ---- 3) 写 swap 区(8 个扇区)----
     mov eax, [ev_slot]
     shl eax, 3
-    add eax, SWAP_LBA
+    add eax, SWAP_LBA + SWAP_HDR_SECTORS
     mov ecx, 8
     mov esi, swap_bounce
     call ata_write_sectors_nf           ; swap 无需持久化:不发 FLUSH(否则 QEMU 每次 fsync)
@@ -454,7 +455,7 @@ swap_swapin:
     ; ---- 3) 读回来 ----
     mov eax, [si_slot]
     shl eax, 3
-    add eax, SWAP_LBA
+    add eax, SWAP_LBA + SWAP_HDR_SECTORS
     mov ecx, 8
     mov edi, [si_frame]
     call ata_read_sectors
@@ -598,9 +599,13 @@ swap_space_free:
     test eax, PAGE_SWAP
     jz .pte_next                       ; 空项
     shr eax, 12
-    test eax, eax
-    jz .pte_next
+    cmp eax, SWAP_SLOTS
+    jae .pte_next                      ; ★ 以前这里写成 test eax,eax/jz:槽 0 的编码
+                                       ;   shr 后正好是 0,被当"空项"跳过 → 槽 0 泄漏
+                                       ;   (--swap 的 used<=1 就是它)
     call swap_slot_free
+    cmp dword [swap_slots_used], 0
+    je .pte_next
     dec dword [swap_slots_used]
 .pte_next:
     inc dword [sf_j]
@@ -635,7 +640,7 @@ swap_in_count    dd 0
 swap_cursor      dd 0                  ; CLOCK 指针(帧号)
 swap_hdr         times 512 db 0        ; swap 头扇区
 swap_bounce      times 4096 db 0       ; 换出/换入的双缓冲(4 KiB)
-swap_slot_bitmap times 512 db 0        ; 4096 槽 = 512 字节位图
+swap_slot_bitmap times 512 db 0        ; 4095 槽 = 512 字节位图(首槽不用,见 SWAP_HDR_SECTORS)
 
 ; 临时变量(函数之间不重入,摆在全局省栈)
 sma_pa       dd 0

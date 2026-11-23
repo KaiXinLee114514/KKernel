@@ -150,7 +150,7 @@ program was killed, the kernel is fine
 用户程序完全感觉不到,只是偶尔慢一截。实现在 [kernel/swap.asm](kernel/swap.asm)。
 
 - **swap 区**:测试镜像 `build/kkernel-swap.img` 在正常 16 MiB 硬盘镜像**末尾追加 16 MiB**
-  (LBA 32768 起,4096 个 4 KiB 槽),头 16 字节 `"KSWP" + version + total_slots + slot_size`。
+  (LBA 32768 起,**4095 个 4 KiB 槽**);swap 区**首 4 KiB 是头块**(前 16 字节 `"KSWP" + version + total_slots + slot_size`,其余保留),数据槽从 +8 扇区开始,避免槽 0 覆盖头。
   普通镜像没有这个头 → swap **静默禁用**,旧测试和页数基线一点不受影响。
 - **帧元数据**:每物理帧 8 字节(标志位 + 指回它的 PTE 地址),开机时按 `pmem_total`
   从页池借几页存(`-m 128` 时 59 页元数据管 30207 帧);槽位图 512 字节静态 BSS。
