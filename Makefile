@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -381,6 +381,10 @@ makefile-check:
 	    echo "  把注释挪到单独一行,否则 shell 会把参数劈开(例如 make hd 会失败)。"; exit 1; \
 	fi
 	@echo "makefile-check: OK(变量定义里没有行尾空格)"
+
+# 文档英文化一致性检查:中英成对 / 语言切换链接 / 相对链接存在 / 英文文档无残留中文段落
+docs-check:
+	@bash tools/check-docs.sh
 
 test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug test-tty test-login test-sched test-jobctl test-wait-race test-swap
 
