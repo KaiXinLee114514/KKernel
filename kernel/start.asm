@@ -59,6 +59,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "lock.asm"                     ; 锁(A4):spin_lock / 睡眠互斥锁 / console_lock / fs_lock
 %include "jobctl.asm"                   ; Phase B:作业控制(进程组/会话 + 前台进程组 + ^C/^Z 过滤)
 %include "swap.asm"                     ; Phase C:swap 换出/换入 + 用户大匿名堆
+%include "x64.asm"                      ; x86-64:start64 命令 + 长模式切换(kernel64/K64.BIN)
 
 ; 内核区补到 256 KiB(512 扇区,和 tools/mkimg.py 的 KERNEL_SECTS 一致)——
 ; 引导扇区本来就读 256 个扇区,所以这里只是把文件补够,顺便当"超出就报错"的尺子。

@@ -4943,6 +4943,7 @@ n_reboot db 'reboot', 0
 n_pmem   db 'pmem', 0
 n_meminfo db 'meminfo', 0
 n_swap   db 'swap', 0
+n_start64 db 'start64', 0
 n_pmap   db 'pmap', 0
 n_pumap  db 'pumap', 0
 n_ptest  db 'ptest', 0
@@ -5077,6 +5078,7 @@ cmd_style:
 
 ; ---- A4:哪些命令碰文件系统(分派时自动加 fs 锁)----
 fs_cmd_names    dd n_ls, n_cat, n_write, n_cp, n_mv, n_rm, n_mkdir, n_rmdir
+                dd n_start64
                 dd n_cd, n_info, 0
 ; ★ rc 不在这里:rc start 要 fork/exec 子进程,子进程 exec 时会拿 fs 锁,
 ;   外层若还捏着 fs 锁就会父等子、子等父死锁(2026-11-22 回归 hang 的根因)。
@@ -5127,6 +5129,7 @@ cmd_table:
     dd n_bg,     cmd_bg
     dd n_meminfo, cmd_meminfo
     dd n_swap,   cmd_swap
+    dd n_start64, cmd_start64
     dd 0, 0
 
 ; ---------------------------------------------------------------------------
@@ -5295,6 +5298,7 @@ msg_help db \
     'bg [%n]       resume a stopped job in the background', 10, \
     'meminfo       memory overview: physical page pool + swap slots', 10, \
     'swap          swap status: enabled / total / used / swapout / swapin', 10, \
+    'start64       load BIN/K64.BIN and jump into the 64-bit kernel (long mode)', 10, \
     'kill <pid> [class:action:level]  signal a process (default super:kill:0)', 10, \
     'shell [n]     list the 4 shells, or jump to one (Ctrl+Left / Ctrl+Right)', 10, \
     'rc <what>     rc.conf: list / get KEY / start N / log / reload (event log)', 10, \

@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check k64 test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -144,6 +144,22 @@ NASM_DEFS := $(if $(USE_CUSTOM_FONT),-DUSE_CUSTOM_FONT=1)
 $(BUILD)/kernel.bin: $(KERNEL_SRCS) $(FONT_DEPS) | $(BUILD)
 	$(NASM) -f bin -I kernel/ $(NASM_DEFS) kernel/start.asm -o $@ -l $(BUILD)/kernel.lst
 	@printf '   内核:     %s 字节\n' "$$(stat -c %s $@)"
+
+# ---- 64 位内核(x86-64 Phase 1 MVP):独立的平铺镜像,被 FAT 镜像放进 BIN/K64.BIN ----
+# 32 位内核的 start64 命令把它读进 0x200000 再切长模式跳过去;字模从 KKF0 导出的
+# ASCII 8x16 原始点阵(tools/mkfont8x16.py)—— 64 位内核没有 VGA 文本模式可用。
+K64_SRCS    := $(wildcard kernel64/*.asm)
+K64_FONT    := $(BUILD)/font8x16.bin
+
+$(K64_FONT): font/font-kkf.bin tools/mkfont8x16.py | $(BUILD)
+	python3 tools/mkfont8x16.py font/font-kkf.bin $@
+
+$(BUILD)/K64.BIN: $(K64_SRCS) $(K64_FONT) | $(BUILD)
+	$(NASM) -f bin -I kernel64/ kernel64/start.asm -o $@ -l $(BUILD)/k64.lst
+	@printf '   64 位内核: %s 字节\n' "$$(stat -c %s $@)"
+
+k64: $(BUILD)/K64.BIN
+	@printf '   64 位内核: %s(%s 字节)\n' "$(BUILD)/K64.BIN" "$$(stat -c %s $(BUILD)/K64.BIN)"
 
 $(BUILD)/stub.bin: kernel/stub.asm | $(BUILD)
 	$(NASM) -f bin kernel/stub.asm -o $@ -l $(BUILD)/stub.lst
@@ -234,7 +250,7 @@ pinyin:
 # ---------------------------------------------------------------------------
 TCCINC_FILES := $(foreach h,$(notdir $(wildcard tccinc/*.h)),INCLUDE/$(h)=tccinc/$(h))
 
-MKFAT_FILES := BIN/ BIN/TCC.BIN=$(BUILD)/TCC.BIN \
+MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    $(foreach p,$(PROGS) $(C_PROGS),BIN/$(p)=$(BUILD)/$(p)) \
 	    LIB/ LIB/CRT_TCC.O=$(CRT_TCC_OBJ) LIB/MINIC.O=$(MINIC_OBJ) \
 	    SYS/ SYS/RC.CONF=progs/RC.CONF SYS/PINYIN.BIN=$(PINYIN_BIN) \
@@ -252,7 +268,7 @@ MKFAT_FILES := BIN/ BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    INCLUDE/ $(TCCINC_FILES)
 
 $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
-          $(PINYIN_BIN) $(BUILD)/TCC.BIN \
+          $(PINYIN_BIN) $(BUILD)/K64.BIN $(BUILD)/TCC.BIN \
           $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
           progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
           $(wildcard tccinc/*.h) \
@@ -269,7 +285,7 @@ TTY_IMG := $(BUILD)/kkernel-tty.img
 TTY_MKFAT_FILES := $(filter-out SYS/RC.CONF=progs/RC.CONF,$(MKFAT_FILES))
 
 $(TTY_IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
-          $(PINYIN_BIN) $(BUILD)/TCC.BIN \
+          $(PINYIN_BIN) $(BUILD)/K64.BIN $(BUILD)/TCC.BIN \
           $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
           progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
           $(wildcard tccinc/*.h) \
@@ -288,7 +304,7 @@ hd: $(HDIMG)
 HD32IMG := $(BUILD)/kkernel-hd32.img
 
 $(HD32IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
-            $(PINYIN_BIN) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
+            $(PINYIN_BIN) $(BUILD)/K64.BIN $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
             progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
             $(wildcard tccinc/*.h) \
             $(BUILD)/bigdir/.stamp
