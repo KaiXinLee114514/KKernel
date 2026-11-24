@@ -1,58 +1,54 @@
-# 架构与实现细节
+[简体中文](zh-CN/architecture.md)
 
-> 本文档原为 README 的 §4–§5，拆分出来方便阅读。
+# Architecture and Implementation Details
 
-## 图形模式(VBE + 帧缓冲)
+> This document used to be §4–§5 of the README; it was split out to make it easier to read.
 
-文本模式那条路只能放 63 个汉字(一个汉字要占两个 8 像素宽的字符格),所以正经中文
-得进图形模式 —— 屏幕就是一块显存,画什么全由自己决定。
+## Graphics mode (VBE + framebuffer)
 
-```
-实模式 stub    int 0x10 AX=4F00/4F01 列模式 → AX=4F02 设成 800×600×32(带线性帧缓冲)
-               → 把 帧缓冲物理地址/宽/高/pitch/色深 写进 BOOTINFO(0x8000)
-分页           帧缓冲在 0xFD000000,不在恒等映射窗口(0~ident)里
-               → 按 4 MiB 对齐算页目录项,挂一张页表把它映射进来(不映射第一次写像素就吃页错误)
-帧缓冲终端     kernel/fbterm.asm:码位 → 二分查找字库 → 逐行取位 → 往显存写 4 字节像素
-               (颜色从文本模式的属性字节换算成 RGB;滚屏就是 memmove 整块显存往上 16 行)
-```
-
-坑:16×16 的汉字一行是**两个字节**,低地址那个才是左半边 —— 一开始我用 bit15 开始往左画,
-结果**汉字左右两半反了**(每个字看着像"对折过"的样子)。修法是 `rol ax, 8` 把两个字节换回来。
-
-## 磁盘:字库、FAT16、跑程序
-
-磁盘之上还有一层很薄的「设备」抽象:`/DEV` 下的名字由内核设备表接管(见 [docs/devices.md](docs/devices.md))。
-(因为还没更新完)
-这一块单独写了一页:**[docs/filesystem.md](docs/filesystem.md)** —— 镜像的 LBA 地图、
-ATA PIO 的寄存器顺序和两个坑、磁盘字库怎么加载、FAT16 的字段和写文件流程、
-`mkfat.py` 怎么用、测试怎么用两条信道证明"字节真的落盘了"。
-
-想写程序的话看另一页:**[docs/programs.md](docs/programs.md)** —— `int 0x30` 的六个功能、
-为什么用中断而不是 `call` 内核函数、程序的内存/栈约定、怎么加进镜像。
-
-一句话版:
+The text-mode route can only fit 63 Chinese characters (a single Chinese character takes two 8-pixel-wide character cells), so proper Chinese has to go through graphics mode — the screen is just a chunk of video memory, and what gets painted on it is entirely up to you.
 
 ```
-run HELLO      → fat_stat 看大小 → fat_read_file 先读进 0x120000(暂存)
-               → space_create 建一套空地址空间(页目录 + 页表两页,窗口里的页一页都不给)
-               → 切 CR3 → call 0x120000 → 程序碰到哪页,页错误才从暂存区补哪页
-               → 程序 ret 回 shell → 切回 CR3 → 补出来的页连页表一起还给页池
-程序里:         mov eax, 0 / mov esi, 字符串 / int 0x30   ← 打印一行
+real-mode stub  int 0x10 AX=4F00/4F01 enumerate modes → AX=4F02 set 800×600×32 (with a linear framebuffer)
+                → write framebuffer physical address/width/height/pitch/color depth into BOOTINFO (0x8000)
+paging          the framebuffer sits at 0xFD000000, outside the identity-mapped window (0..ident)
+                → work out the page-directory entry on a 4 MiB boundary and hang a page table off it to map the framebuffer in (skip this and the very first pixel write takes a page fault)
+framebuffer terminal  kernel/fbterm.asm: codepoint → binary-search the font → fetch bits row by row → write 4-byte pixels into video memory
+                (color comes from converting the text-mode attribute byte to RGB; scrolling is just a memmove of the whole framebuffer up by 16 rows)
 ```
 
-### 每个程序有自己的地址空间(而且是按需给的)
+Pitfall: one row of a 16×16 Chinese glyph is **two bytes**, and the low-address byte is the left half. At first I started drawing leftwards from bit15, and the result was **Chinese characters with their left and right halves swapped** (every character looked like it had been "folded in half"). The fix was `rol ax, 8` to swap the two bytes back.
 
-跑程序之前,内核给它现搭一套页表(**见 [kernel/paging.asm](kernel/paging.asm)
-的 `space_create`**):
+## Disk: font, FAT16, running programs
+
+On top of the disk there is also a very thin "device" abstraction: names under `/DEV` are taken over by the kernel device table (see [devices.md](devices.md)).
+(it hasn't been fully updated yet)
+This area got a page of its own: **[filesystem.md](filesystem.md)** — the image's LBA map, the ATA PIO register order and its two pitfalls, how the disk font is loaded, FAT16's fields and the write-file flow, how to use `mkfat.py`, and how the tests use two channels to prove that "the bytes really landed on disk".
+
+If you want to write programs, see the other page: **[programs.md](programs.md)** — the six functions of `int 0x30`, why we use an interrupt instead of `call`ing kernel functions, the program's memory/stack conventions, and how to add one to the image.
+
+The one-line version:
 
 ```
-页目录   = 内核页目录的副本        (内核、IDT、VGA、字库、帧缓冲都还在)
-页表[0]  = PT_LOW 的副本,但 0x120000~0x1EFFFF 的 208 项**清成"不存在"**
-私有页   = 一页都不预先给 —— 程序碰到哪一页,14 号页错误才现补哪一页
+run HELLO      → fat_stat to get the size → fat_read_file reads it into 0x120000 first (staging)
+               → space_create builds a fresh empty address space (page directory + two pages of page tables; not one window page is handed out)
+               → switch CR3 → call 0x120000 → whichever page the program touches, the page fault fills it in from the staging area
+               → the program rets back to the shell → switch CR3 back → the faulted-in pages go back to the page pool along with their page tables
+inside a program: mov eax, 0 / mov esi, string / int 0x30   ← print one line
 ```
 
-所以:程序的**虚拟地址不变**(还是链接到 `0x120000`,程序自己不用改),
-**物理页每次运行都是新的一批**,而且**只有它真正走过的页才会拿到内存**:
+### Every program gets its own address space (and gets it on demand)
+
+Before running a program, the kernel builds it a fresh set of page tables (**see `space_create` in [kernel/paging.asm](../kernel/paging.asm)**):
+
+```
+page directory  = a copy of the kernel page directory     (kernel, IDT, VGA, font, framebuffer are all still there)
+page table[0]   = a copy of PT_LOW, but the 208 entries covering 0x120000~0x1EFFFF are **cleared to "not present"**
+private pages   = not a single page handed out in advance — whichever page the program touches, page fault 14 fills it in right then
+```
+
+So: the program's **virtual addresses don't change** (it's still linked at `0x120000`, and the program itself needs no changes),
+**every run gets a brand-new batch of physical pages**, and **only the pages it actually walks on get memory**:
 
 ```
 > run HELLO.BIN
@@ -64,42 +60,42 @@ address space destroyed: 3 page(s) back to the pool
 demand paging: 1 page(s) faulted in (image 1 + heap 0), first page 0x00402000
 ```
 
-249 字节的程序**只要 1 页**(以前是把整个窗口全给它)。主动去踩内存的是
-[progs/TOUCH.asm](progs/TOUCH.asm),`run TOUCH` 会一页一页碰 32 页堆 + 一页 `.bss`,
-然后回头检查每一页都还是自己写进去的标记:
+A 249-byte program **only needs 1 page** (previously the whole window was handed to it). The one that deliberately stomps on memory is
+[progs/TOUCH.asm](../progs/TOUCH.asm); `run TOUCH` touches 32 heap pages one by one plus one `.bss` page,
+then goes back and checks that every page still holds the marker it wrote:
 
 ```
 > run TOUCH.BIN
   heap: touched 32 pages (4 KiB each), wrote 0xA5 into every one of them
-  pages that were NOT zero before my write: 0     ← 现给的页必须是干净零页
-  pages that did not read back what I wrote: 0     ← 每页都真的归自己
+  pages that were NOT zero before my write: 0     ← a freshly handed page must be a clean zero page
+  pages that did not read back what I wrote: 0     ← every page really belongs to me
   page beyond the file (bss at 0x17E000): was zero, as it should be
 demand paging: 34 page(s) faulted in (image 2 + heap 32), first page 0x00425000
 ```
 
-补页的流程(都在 [kernel/paging.asm](kernel/paging.asm) 的 `page_fault_try_handle`
-和 [kernel/idt.asm](kernel/idt.asm) 的 `isr_common` 里):CR2 是出错地址 → 判断它
-落在镜像窗口还是堆窗口(窗口外就照旧红屏 panic)→ 从页池拿一页、清零 →
-镜像窗口里"文件之内"的部分从暂存区拷过来("文件之外"就是 `.bss`,留零页)→
-填页表 + `invlpg` → `iret` 回去**重执行那条指令**。程序完全感觉不到。
+The fault-in flow (all in `page_fault_try_handle` in [kernel/paging.asm](../kernel/paging.asm)
+and `isr_common` in [kernel/idt.asm](../kernel/idt.asm)): CR2 is the faulting address → decide whether it
+falls in the image window or the heap window (outside the windows it's the usual red-screen panic) → grab a page from the page pool, zero it →
+in the image window, copy the part that is "inside the file" from the staging area ("outside the file" is `.bss`, left as a zero page) →
+fill in the page table + `invlpg` → `iret` back to **re-execute that instruction**. The program never notices a thing.
 
-几个老实交代的地方:
+A few honest admissions:
 
-- 写时复制、swap 页置换、用户栈自动增长都有了(见下面两节);剩下的限制:
-  COW 共享页(引用计数 >1)不换出、swap 内容无压缩也无持久化、swap 满了返回 ENOMEM;
-- 窗口里的**空洞也会给页**(程序只是读一下 0x180000 附近的地址,也会拿到一页零页);
-- 内核窗口继续恒等映射,所以 `int 0x30` 照旧能用 —— **不需要 ring 3**,
-  程序传给内核的指针也照旧解得开(那会儿用的就是程序这套页表)。
+- Copy-on-write, swap-based page replacement, and automatic user-stack growth are all in place (see the next two sections); the remaining limits:
+  COW-shared pages (refcount > 1) are never swapped out, swap contents are neither compressed nor persisted, and a full swap returns ENOMEM;
+- **Holes in the window also get pages** (a program that merely reads an address near 0x180000 also gets a zero page);
+- The kernel window stays identity-mapped, so `int 0x30` still works — **ring 3 is not required**,
+  and pointers a program passes to the kernel still resolve (at that point the kernel is running on the program's own page tables).
 
-### 程序跑在 ring 3:内核的内存它碰不到
+### Programs run in ring 3: they can't touch the kernel's memory
 
-`RING3.BIN` 会直接问 CPU"我现在是谁"(`CS = 0x1B`、`CPL = 3`),`FAULT.BIN` 则故意去读内核内存 ——
-被内核抓住、打印原因、把这个程序干掉,机器继续跑:
+`RING3.BIN` asks the CPU directly "who am I right now" (`CS = 0x1B`, `CPL = 3`), while `FAULT.BIN` deliberately reads kernel memory —
+the kernel catches it, prints the reason, kills the program, and the machine keeps running:
 
-![ring 3:程序在 CPL=3 跑,摸内核内存会被干掉](docs/screenshot-ring3.png)
+![ring 3: the program runs at CPL=3, and touching kernel memory gets it killed](screenshot-ring3.png)
 
-程序从 `0x120000` 跑起来,但**不是内核 `call` 进去的** —— 内核用 `iret` 把它丢进用户态
-(CPL=3),它的代码段是 0x1B、栈段是 0x23。它自己能看到这件事:
+The program starts at `0x120000`, but **the kernel does not `call` into it** — the kernel uses `iret` to drop it into user mode
+(CPL=3); its code segment is 0x1B and its stack segment is 0x23. It can see this for itself:
 
 ```
 > run RING3.BIN
@@ -112,11 +108,11 @@ if CS is 0x001b and CPL is 3, this program is not the kernel any more.
 program returned to the shell
 ```
 
-`[ESP]` 那个 `0x17F000` 是内核替它压进去的**弹床页**:程序最后一句 `ret` 会跳到那儿,
-弹床里就三条指令(`mov eax,15 / int 0x30 / jmp $`)—— 喊一声"我退出了"就回 shell。
-**现成程序一个都不用改**(C 程序的 crt0 也是 `ret`)。
+The `0x17F000` in `[ESP]` is the **trampoline page** the kernel pushed for it: the program's final `ret` jumps there,
+and the trampoline is just three instructions (`mov eax,15 / int 0x30 / jmp $`) — shout "I'm out" and you're back in the shell.
+**Not one existing program needs changing** (the crt0 of C programs also ends in `ret`).
 
-想去碰内核的地盘呢:
+Now, what if it tries to touch the kernel's turf:
 
 ```
 > run FAULT.BIN
@@ -128,93 +124,92 @@ kernel, not to you
 program was killed, the kernel is fine
 ```
 
-页表是**逐级**查权限的:内核恒等映射的那些页(0~ident)U/S=0,程序页才是 U/S=1,
-所以 `mov ebx,[0x100000]` 直接页错误;内核的处理是**把程序干掉、自己接着跑**
-(以前是 panic,现在是 `program was killed`)。用户态异常也不再是内核 panic:
-`isr_common` 先看错误码里的 CS(CPL),是 3 就交给 `prog_kill_from_fault`。
+Page-table permissions are checked **level by level**: the pages of the kernel's identity mapping (0..ident) have U/S=0, program pages have U/S=1,
+so `mov ebx,[0x100000]` is an immediate page fault; the kernel's response is to **kill the program and carry on**
+(it used to panic; now it's `program was killed`). User-mode exceptions are no longer kernel panics either:
+`isr_common` first looks at CS (CPL) in the error code, and if it's 3 it hands things to `prog_kill_from_fault`.
 
-程序自己那几块地(都在它自己的地址空间里,按需补页):
+The pieces of real estate a program has (all inside its own address space, faulted in on demand):
 
-| 地址 | 干什么 |
+| Address | Purpose |
 | --- | --- |
-| `0x120000`-`0x17EFFF` | 程序镜像窗口(96 页;别拿 `0x17F000` 当数据缓冲——那是弹床页) |
-| `0x17F000` | 弹床页(单独映的 1 页:三条指令替程序喊"我退出") |
-| `0x180000`-`堆顶-1` | 堆窗口(`malloc` 从这儿长;大小看机器内存,默认约 2.1 MB) |
-| `堆顶-0x2000` | 参数页:内核里那份参数(0x11F000)对 ring 3 是"别人家的内存",装载器整块拷过来 |
-| `堆顶-0x1000` | 用户栈(栈顶 = 堆顶-4,那 4 字节是弹床地址) |
-| `0x80000000`+ | 大匿名堆(`anon_alloc` 申请的块;每 4 MiB 一张按需建的页表,冷页可换出到 swap 区) |
+| `0x120000`-`0x17EFFF` | program image window (96 pages; don't use `0x17F000` as a data buffer — that's the trampoline page) |
+| `0x17F000` | trampoline page (one separately mapped page: three instructions that shout "I'm out" on the program's behalf) |
+| `0x180000`-`heap top - 1` | heap window (`malloc` grows from here; size depends on machine memory, roughly 2.1 MB by default) |
+| `heap top - 0x2000` | argument page: the kernel's copy of the arguments (0x11F000) is "somebody else's memory" to ring 3, so the loader copies the whole block over |
+| `heap top - 0x1000` | user stack (stack top = heap top - 4; those 4 bytes are the trampoline address) |
+| `0x80000000`+ | big anonymous heap (blocks requested by `anon_alloc`; one demand-built page table per 4 MiB, cold pages can be swapped out to the swap area) |
 
-### 物理内存的下一层:swap(页换出/换入)
+### The next layer down in physical memory: swap (page out/in)
 
-物理页池(4 MiB 起,大小随机器内存)不够时会先把**冷页换出到磁盘**,再给新页 ——
-用户程序完全感觉不到,只是偶尔慢一截。实现在 [kernel/swap.asm](kernel/swap.asm)。
+When the physical page pool (starting at 4 MiB, sized according to machine memory) runs low, it first swaps **cold pages out to disk** and then hands out new pages —
+user programs never notice, they're just occasionally a bit slower. Implemented in [kernel/swap.asm](../kernel/swap.asm).
 
-- **swap 区**:测试镜像 `build/kkernel-swap.img` 在正常 16 MiB 硬盘镜像**末尾追加 16 MiB**
-  (LBA 32768 起,**4095 个 4 KiB 槽**);swap 区**首 4 KiB 是头块**(前 16 字节 `"KSWP" + version + total_slots + slot_size`,其余保留),数据槽从 +8 扇区开始,避免槽 0 覆盖头。
-  普通镜像没有这个头 → swap **静默禁用**,旧测试和页数基线一点不受影响。
-- **帧元数据**:每物理帧 8 字节(标志位 + 指回它的 PTE 地址),开机时按 `pmem_total`
-  从页池借几页存(`-m 128` 时 59 页元数据管 30207 帧);槽位图 512 字节静态 BSS。
-  只有「引用计数 == 1 的用户按需页」才会被标成可换出(ANON),COW 父子共享页、
-  内核页、页表、DMA/IO 缓冲一律不碰。
-- **PTE 编码**:换出后 PTE = `present=0` + 软件位 bit9(`PAGE_SWAP`)+ 高 20 位槽号;
-  COW 用的是 present=1 + bit9,两者靠 present 区分,不会撞。
-- **换出(CLOCK 二次机会)**:从游标扫全池,跳过非 ANON / 引用计数 >1 / PTE 不再指向
-  这一帧的;参考位 =1 先清掉跳过一圈,再遇到就选中:分配槽 → 4 KiB 拷到弹跳缓冲 →
-  `ata_write_sectors`(绕开 FLUSH CACHE,swap 不需要持久化)→ PTE 改 slot+bit9 → 刷 TLB →
-  还帧。全程关中断(ATA PIO 是轮询的,不需要中断;单核下这就是锁)。
-- **触发点**:缺页补页 / fork 分配 / 内核栈分配 / 大匿名堆扩展,统一走
-  `swap_alloc_frame`;页池满时它回收几页再试(最多 4 轮)。CLOCK 第一圈只清参考位,
-  所以回收函数要循环到真拿到页为止。
-- **换入**:缺页看到 present=0 + bit9 → `swap_swapin`:分配帧(池满先换出别的页)→
-  从磁盘读回 4 KiB → 复核 PTE 没被人动过 → 装回 `P|RW|USER` → `invlpg` → 释放槽位;
-  数据一个字节都不会错,`SWAPTEST` 的抽样重读专门验这件事。
-- **大匿名堆**:`anon_alloc(n)`(int 0x30 功能号 31)把 TCB 里的 `brk`(`TCB_UBRK`)从
-  `0x80000000` 往上推;第一次碰某 4 MiB 段时按需建页表,再按需给页。从 `fork` 出来的
-  子进程**不继承**大匿名堆(页目录对应 PDE 清空、brk 复位)—— 记在下面的已知限制里。
-- **已知限制**:COW 共享页不换出;swap 满返回 ENOMEM(不会 OOM 杀进程);swap 内容
-  不持久化(重启即失效,镜像每次重建);无压缩、无每进程配额;关中断单核假设,
-  SMP 要另外做锁;`-m 16` 时页池只有约 6 MiB,`SWAPTEST` 跑一轮约 1 分钟
-  (QEMU/TCG 下 ATA PIO 写 4 KiB 页约 20 ms,这是测试耗时的主要来源)。
+- **Swap area**: the test image `build/kkernel-swap.img` appends **16 MiB at the end** of the normal 16 MiB disk image
+  (starting at LBA 32768, **4095 4 KiB slots**); the **first 4 KiB of the swap area is a header block** (first 16 bytes `"KSWP" + version + total_slots + slot_size`, the rest reserved), and data slots start at sector +8 so that slot 0 doesn't overwrite the header.
+  A normal image has no such header → swap is **silently disabled**, and existing tests and page-count baselines are unaffected.
+- **Frame metadata**: 8 bytes per physical frame (flags + address of the PTE pointing back at it), carved out of the page pool at boot according to `pmem_total`
+  (with `-m 128`, 59 metadata pages manage 30207 frames); the slot bitmap is 512 bytes of static BSS.
+  Only "user demand pages with refcount == 1" are marked swappable (ANON); COW parent/child shared pages,
+  kernel pages, page tables, and DMA/IO buffers are never touched.
+- **PTE encoding**: after swapping out, PTE = `present=0` + software bit 9 (`PAGE_SWAP`) + top 20 bits slot number;
+  COW uses present=1 + bit9, and the two are distinguished by present, so they can't collide.
+- **Swap out (CLOCK second chance)**: sweep the whole pool from the cursor, skipping non-ANON / refcount >1 / PTEs that no longer point at
+  this frame; a set reference bit is cleared and the frame skipped for one round; the next hit is selected: allocate a slot → copy 4 KiB to the bounce buffer →
+  `ata_write_sectors` (bypassing FLUSH CACHE; swap doesn't need persistence) → PTE becomes slot+bit9 → flush TLB →
+  return the frame. Interrupts are off throughout (ATA PIO is polled and needs no interrupts; on a single core this is the lock).
+- **Trigger points**: demand fault fill-in / fork allocation / kernel stack allocation / big-anonymous-heap growth all go through
+  `swap_alloc_frame`; when the pool is full it reclaims a few pages and retries (up to 4 rounds). CLOCK's first pass only clears reference bits,
+  so the reclaim function has to loop until it actually gets a page.
+- **Swap in**: a fault sees present=0 + bit9 → `swap_swapin`: allocate a frame (swap something else out first if the pool is full) →
+  read 4 KiB back from disk → re-check that nobody touched the PTE → install `P|RW|USER` → `invlpg` → free the slot;
+  not a single byte of data goes wrong, and `SWAPTEST`'s sampled re-reads specifically verify this.
+- **Big anonymous heap**: `anon_alloc(n)` (int 0x30 function 31) pushes the TCB's `brk` (`TCB_UBRK`) up from
+  `0x80000000`; the first touch of a 4 MiB segment builds its page table on demand, then hands out pages on demand. Child processes created by `fork`
+  **do not inherit** the big anonymous heap (the corresponding PDE in the page directory is cleared and brk is reset) — noted in the known limitations below.
+- **Known limitations**: COW-shared pages are not swapped out; a full swap returns ENOMEM (no OOM killer); swap contents
+  are not persistent (gone on reboot, the image is rebuilt every time); no compression, no per-process quota; interrupts-off single-core assumption,
+  SMP would need real locks; with `-m 16` the page pool is only about 6 MiB, and one `SWAPTEST` round takes about a minute
+  (under QEMU/TCG an ATA PIO write of a 4 KiB page takes about 20 ms, which is the main source of test runtime).
 
-### 线程与调度(内核线程 + 优先级调度)
+### Threads and scheduling (kernel threads + priority scheduling)
 
-`kernel/sched.asm` 里 16 个线程槽,每槽是一个 **196 字节**的 TCB:esp / cr3 / 状态 /
-拿到过多少 tick / 被调度过几次 / 栈的物理页 / 名字 / 出生在哪条 shell 上 /
-父进程 / 退出码 / uid+gid / 进程组与会话(pgrp/sid)/ 优先级 / 睡眠通道与超时 /
-就绪队列前后指针 / aging 计数 / 大匿名堆 brk / exec 载荷页 / Ctrl-C、Ctrl-Z 标志。
-(原来是 32 字节,所以全仓都用 `shl 5` 当下标步长;加字段时改成了 `imul X, TCB_SIZE` ——
-见 [踩坑笔记](pitfalls.md) 的 6.36。)**0 号线程永远是 shell 自己** ——
-它不是被谁创建的,而是开机时把当前上下文直接填进去。
+`kernel/sched.asm` has 16 thread slots, each a **196-byte** TCB: esp / cr3 / state /
+ticks received / times scheduled / physical pages of the stack / name / which shell it was born on /
+parent process / exit code / uid+gid / process group and session (pgrp/sid) / priority / sleep channel and timeout /
+ready-queue forward and back pointers / aging counter / big anonymous heap brk / exec payload page / Ctrl-C and Ctrl-Z flags.
+(It used to be 32 bytes, which is why the whole repo used `shl 5` as the index stride; when fields were added this became `imul X, TCB_SIZE` —
+see 6.36 in the [pitfall notes](pitfalls.md).) **Thread 0 is always the shell itself** — it isn't created by anyone; at boot the current context is simply filled into its slot.
 
-抢占点在 **IRQ0(PIT,100 Hz)**:`irq0_stub` 先发 EOI,然后判断调度器开没开,开了就把
-当前 esp 交给 `sched_pick` 决定下一个该跑谁,再 `mov esp, eax` 换栈,接着 `popad` +
-`iret` 就"回到"另一个线程里去了。**换栈这件事只能在中断入口这一层做**:`iret` 要从
-栈上弹 EIP/CS/EFLAGS,在普通函数里换完 esp 再 `ret` 是回不去的(理由见 [踩坑笔记](pitfalls.md) 的 6.13)。
+The preemption point is **IRQ0 (PIT, 100 Hz)**: `irq0_stub` sends EOI first, then checks whether the scheduler is enabled; if so it hands the
+current esp to `sched_pick` to decide who runs next, then does `mov esp, eax` to switch stacks, followed by `popad` +
+`iret` and "returns" into another thread. **The stack switch can only happen at the interrupt-entry layer**: `iret` pops EIP/CS/EFLAGS
+off the stack, and switching esp in an ordinary function and then `ret`ing cannot get you back (reasoning in 6.13 of the [pitfall notes](pitfalls.md)).
 
-新线程的"现场"由 `sched_spawn` 在它自己的栈上手工摆出来:按 `irq0_stub` 的格式摆好
-EFLAGS / CS / EIP / 错误码 / 向量号 / pushad 的八个寄存器,esp 指向这摞东西的最底下。
-于是它第一次被 `iret` 上去时,看起来就像"刚被中断打断过",函数体从头开始跑。
+A new thread's "scene" is laid out by hand by `sched_spawn` on its own stack: in the same format `irq0_stub` expects,
+it places EFLAGS / CS / EIP / error code / vector number / the eight registers of pushad, with esp pointing at the bottom of the pile.
+So the first time it is `iret`ed into, it looks as if it "was just interrupted", and the function body starts from the top.
 
-局限(玩具级别的诚实说明):
-- 有优先级调度:0 最高、普通 shell 线程 8、idle 15;每级一个 FIFO 就绪队列 + 位图,
-  同级按 20 ms(2 个 tick)时间片轮转,高优先级就绪可抢占。有阻塞/唤醒原语
-  (`sched_sleep_on` / `sched_sleep_timeout` / `sched_wakeup`),`process_wait` 和
-  `tty_read_line` 都睡在通道上;aging 只把低优先级线程慢慢提到 shell 级,不会被饿死
-- 每个线程 4 页栈(16 KiB)+ 底下 1 页 guard 页(恒等映射摘掉,踩了会 #PF;
-  内核栈真溢出走到双重故障门会打印 panic,而不是重启)
-- 用户栈从堆窗口顶部划出 128 页(512 KiB)增长区,按需补页;
-  栈顶下面是参数页与 guard 页(越界会被和平杀掉)
-- `kill` 一条**正在跑程序**的线程时,会看它当时用的 cr3 是不是现在这套程序的:
-  是就把地址空间一并收摊(页目录 + 私有页表 + 已经按需补上的页全还回池子)
-- 终端、FAT 等全局状态用锁保护(`kernel/lock.asm`):spin 锁、可递归睡眠 mutex,
-  `console_lock` 保证多线程输出不插花,`fs_lock` 串行化文件命令;
-  锁顺序 `fs_mutex → console_mutex` 允许、反向禁止
-- 还是**内核态**线程:没有 ring 3、没有 TSS、也还没做到"一个线程一套地址空间"
+Limitations (toy-grade honest disclosure):
+- There is priority scheduling: 0 is highest, ordinary shell threads are 8, idle is 15; each level has a FIFO ready queue + bitmap,
+  same-level threads round-robin on a 20 ms (2 tick) slice, and a higher-priority ready thread preempts. There are block/wake primitives
+  (`sched_sleep_on` / `sched_sleep_timeout` / `sched_wakeup`); `process_wait` and
+  `tty_read_line` both sleep on channels; aging only slowly raises low-priority threads to shell level, so nothing starves
+- Each thread has a 4-page stack (16 KiB) + 1 guard page underneath (removed from the identity mapping, so stepping on it gives #PF;
+  a real kernel stack overflow that reaches the double-fault gate prints a panic instead of rebooting)
+- The user stack carves a 128-page (512 KiB) growth area off the top of the heap window, faulted in on demand;
+  below the stack top are the argument page and the guard page (going out of bounds gets you peacefully killed)
+- `kill`ing a thread that is **running a program** checks whether the cr3 it's using is the current program's:
+  if so, the address space is torn down along with it (page directory + private page tables + every faulted-in page goes back to the pool)
+- Global state such as the terminal and FAT is protected by locks (`kernel/lock.asm`): spin locks, recursive sleeping mutexes,
+  `console_lock` keeps multi-threaded output from interleaving, `fs_lock` serializes file commands;
+  the lock order `fs_mutex → console_mutex` is allowed, the reverse is forbidden
+- These are still **kernel-mode** threads: no ring 3, no TSS, and not yet "one address space per thread"
 
-自己试试:
+Try it yourself:
 
 ```
-> spawn            # 不带参数:第一次 alpha,第二次 beta
+> spawn            # no argument: first time alpha, second time beta
 spawned thread 4 (alpha)
 > spawn
 spawned thread 5 (beta)
@@ -230,25 +225,25 @@ ps: 6 alive / 16 slots, scheduled ticks 1169
 killed thread 4 (alpha)
 ```
 
-`ticks` 和 `runs` 都在涨,说明这几个线程是**真的轮流在 CPU 上跑**,而不是"登记了一下
-躺在那儿";`kill` 完再 `debug pmem`,空闲页数会回到开跑前的基线 —— 栈是借的,还得还。
-(基线数字随内存大小变:boot 常驻 19 页 + 恒等映射的页表页;4 条 shell 各占 2 页栈,
-0 号用的是开机栈,不占池子。)
+`ticks` and `runs` are both climbing, which shows these threads **really take turns on the CPU**, rather than "registering and
+lying there"; after `kill`, `debug pmem` shows the free page count back at the pre-run baseline — the stack was borrowed, and it gets returned.
+(The baseline numbers vary with memory size: boot uses 19 resident pages + page-table pages for the identity mapping; the 4 shells each use 2 stack pages,
+and thread 0 uses the boot stack, which doesn't come out of the pool.)
 
-### 多 shell:卡死一条,还有三条
+### Multiple shells: one hangs, three more carry on
 
-4 条 shell 就是 4 条内核线程(0 号是开机那条,另外 3 条在 `kmain` 里 `spawn` 出来)。
-键盘归谁用一个 `sh_active` 记着,**Ctrl+← / Ctrl+→ 的切换是在键盘中断处理里直接做的** ——
-这点很关键:如果切换要靠"活动 shell 自己响应",那条正卡在 `run HANG` 里的 shell 就永远
-换不走了;放在中断里,谁来按键谁就能把键盘交给别人。
+4 shells means 4 kernel threads (0 is the boot thread, the other 3 are `spawn`ed in `kmain`).
+Which shell owns the keyboard is tracked by a single `sh_active`, and **Ctrl+← / Ctrl+→ switching happens directly in the keyboard interrupt handler** —
+this is crucial: if switching depended on "the active shell responding", a shell stuck inside `run HANG` could never be switched away from;
+by doing it in the interrupt, whoever presses the key can hand the keyboard to somebody else.
 
-每条 shell 有自己的行缓冲和当前目录,切换时:
-- 打一条 `--- shell N ---` 当分隔,再把提示符和**你没敲完的那半行**重新画出来
-- 半行输入跟着 shell 走:1 号敲一半 → 切到 2 号干点别的 → 切回来,那半行还在,回车就执行
-- **每条 shell 各跑一个程序**(地址空间那套状态现在每线程一份):一条 `run HANG` 卡着,
-  切到另一条 `run HELLO.BIN` 照样跑,互不打架
-- shell 线程本身**杀不掉**(`kill 0`~`kill 3` 不会拆线程):键盘挂在它们身上,杀了没人收键;
-  但 `kill <线程号>` 会停掉它正在跑的程序,连 ring 3 里的死循环也能被下一次时钟中断收走
+Each shell has its own line buffer and current directory; on a switch:
+- Print `--- shell N ---` as a separator, then redraw the prompt and **the half-typed line you never finished**
+- Half-typed input follows the shell: type half a line in shell 1 → switch to shell 2 and do something else → switch back and the half line is still there; press Enter and it executes
+- **Each shell runs its own program** (all that address-space state is now per-thread): one shell sits in `run HANG`,
+  switch to another and `run HELLO.BIN` works fine, no fighting
+- Shell threads themselves **cannot be killed** (`kill 0`~`kill 3` won't tear down the thread): the keyboard hangs off them, and killing one would leave nobody to receive keys;
+  but `kill <tid>` stops the program it is running, and even an infinite loop in ring 3 gets collected by the next timer interrupt
 
 ```
 > shell
@@ -261,27 +256,27 @@ shells: 4
 Ctrl+Left / Ctrl+Right switches, or: shell <n>
 > shell 3
 --- shell 3 ---
-3> 
+3>
 ```
 
-想亲眼看"卡死也不影响别人":`run HANG`(开头报一行、**转 24 圈约 40~60 秒后自己退出**的
-演示程序),趁它占着这条 shell 的时候 `Ctrl+→` 逃到别的 shell,`echo` 照样有响应 —— 这就是
-多 shell 的意义。要提前收回卡住的那条:在别的 shell 里 `kill 0`(线程号见 `ps`),
-它会在下一次时钟中断时被内核收摊。
+To see "a hang doesn't affect the others" with your own eyes: `run HANG` (a demo program that prints a line at the start and
+**spins 24 rounds, about 40–60 seconds, then exits by itself**), and while it's hogging that shell, `Ctrl+→` escapes to another shell where `echo`
+still responds — that's the point of multiple shells. To reclaim the stuck one early: in another shell, `kill 0` (thread number from `ps`),
+and the kernel will tear it down at the next timer interrupt.
 
-> `run HANG` 为什么不是真死循环:演示程序要有始有终,测试套件才能接着用那条 shell。
-> 想试"永远回不来",把 `progs/HANG.asm` 的 `HANG_ROUNDS` 改大、或者删掉
-> `dec dword [rounds]` / `jnz .loop` 两行 —— 然后从另一条 shell `kill 0` 把它收掉。
+> Why isn't `run HANG` a real infinite loop: a demo has to have a beginning and an end, so the test suite can keep using that shell.
+> To try "never comes back", bump `HANG_ROUNDS` in `progs/HANG.asm`, or delete the two lines
+> `dec dword [rounds]` / `jnz .loop` — then collect it with `kill 0` from another shell.
 
-![4 条 shell 互相切换](docs/screenshot-shells.png)
+![4 shells switching between each other](screenshot-shells.png)
 
-`shell` 列出来,`Ctrl+→` 切到 2 号敲命令,`3> date time` 是 3 号在跑;
-最后那两行是"半行命令"的演示:在 1 号敲了 `echo half-typed line survives` 没回车就跑掉了,
-切回来时它还在(提示符下面那行),回车就能执行。
+`shell` lists them, `Ctrl+→` switches to shell 2 to type a command, `3> date time` is shell 3 running something;
+the last two lines are the "half-typed command" demo: in shell 1, `echo half-typed line survives` is typed without pressing Enter, then you switch away,
+and when you switch back it's still there (the line below the prompt); press Enter and it executes.
 
-### 拼音输入法:Shift 切中英,打拼音选字
+### Pinyin input method: Shift toggles Chinese/English, type pinyin and pick characters
 
-按一下 **Shift** 切到中文(再按一下切回英文),然后打拼音:
+Press **Shift** once to switch to Chinese (press again to switch back to English), then type pinyin:
 
 ```
 > shuang
@@ -291,35 +286,34 @@ Ctrl+Left / Ctrl+Right switches, or: shell <n>
 > 霜
 ```
 
-选字之后,拼音被原地擦掉、换成汉字,命令行**不换行也不重画**,候选条(两行)直接消失。
-候选多于一页时,第一行右侧会显示页码,按 `,` / `.` 就地翻页重画候选条:
+After picking a character, the pinyin is erased in place and replaced by the Chinese character, the command line **neither wraps nor redraws**, and the candidate bar (two lines) simply disappears.
+When there are more candidates than fit on one page, the page number appears on the right of the first line; press `,` / `.` to page in place and redraw the bar:
 
 ```
 > xiang
 （底行:1.想 2.向 3.像 4.相 5.乡 6.项 7.象 8.香 9.响  ,/. page 1/4  Esc cancel）
 ```
-(作者ps:日文韩文目前不会做 毕竟也不是我的母语 繁体中文倒是可以 但是免不了拼音了 仓颉注音我不行)
-数字 1-9 直接选**当前页**对应的候选、空格选当前页第 1 个、`,` / `.` 翻上一页 / 下一页
-(候选只有一页时提示里不显示页码)、Esc 取消;候选按**词频**排(最常用的在最前面)。
-数据在磁盘的 `/SYS/PINYIN.BIN`(6000 常用字、400 个音节,`ji` 这种音有 11 页),由
-`tools/mkpinyin.py` 用 wordfreq + pypinyin 生成;想换词表就跑 `make pinyin`(需要这两个 python 包)。
-盘上没有这个文件时输入法会自己安静地关掉,不影响其它功能。
+(author's note: Japanese and Korean aren't happening — they're not my native language anyway. Traditional Chinese would be doable, but then you can't avoid the phonetic input; Cangjie and Zhuyin are beyond me)
+Digits 1-9 pick the candidate at that position **on the current page**, space picks the first candidate on the current page, `,` / `.` go to the previous / next page
+(the page number is hidden when there is only one page of candidates), Esc cancels; candidates are ordered by **word frequency** (most common first).
+The data lives on disk at `/SYS/PINYIN.BIN` (6000 common characters, 400 syllables; a syllable like `ji` has 11 pages), generated by
+`tools/mkpinyin.py` using wordfreq + pypinyin; to swap the word list, run `make pinyin` (needs those two Python packages).
+If the file isn't on disk, the input method quietly turns itself off and nothing else is affected.
 
-![拼音输入法](docs/screenshot-ime.png)
+![Pinyin input method](screenshot-ime.png)
 
-### rc.conf:开机读配置、按配置跑服务
+### rc.conf: read config at boot, run services according to it
 
-`/SYS/RC.CONF` 就是一行行 `key=value`(BSD / OpenRC 那种写法,不是 systemd 的段)。
-开机时内核读它、把 `boot_msg` 打出来、按 `autostart` 决定要不要把启用的服务跑起来;
-`rc` 一条命令就能看配置、看服务、起服务、重读刚写下的文件,还有一本带 PIT tick 的
-事件账本。细节和全部 key 见 [docs/rc-conf.md](docs/rc-conf.md)。
-显示名默认 `KKernel`,可在 `RC.CONF` 里用 `osname = 你的名字` 自定义(开机打一行 `os: <名字>`)。
+`/SYS/RC.CONF` is just lines of `key=value` (the BSD / OpenRC style, not systemd sections).
+At boot the kernel reads it, prints `boot_msg`, and uses `autostart` to decide whether to start the enabled services;
+the single command `rc` shows the config, lists services, starts services, re-reads a file you just wrote, and there's even an event ledger with PIT ticks. Details and every key are in [rc-conf.md](rc-conf.md).
+The display name defaults to `KKernel`, and can be customized in `RC.CONF` with `osname = your name` (boot prints one line `os: <name>`).
 
-![rc.conf 服务列表与事件账本](docs/screenshot-rc.png)
+![rc.conf service list and event ledger](screenshot-rc.png)
 
-### 提示符样式:一个 `style` 命令看腻就换
+### Prompt styles: a `style` command for when you get bored
 
-天天盯着一样的 `>` 确实眼睛疼,所以提示符做成了可换的样式(0.14 版起**默认就是颜文字**):
+Staring at the same `>` every day really does hurt the eyes, so the prompt became swappable (since 0.14 the **default is a kaomoji**):
 
 ```
 (・ω・)> style
@@ -333,19 +327,18 @@ LIB  <DIR>
 (・ω・)>
 ```
 
-| 样式 | 长什么样 |
+| Style | What it looks like |
 |---|---|
-| `kao`(默认) | 黄色 `(・ω・)>` / `(・ω・)docs>`;命令出错后脸变红 `(；ω；)`,下一次输入就恢复(ps:kawaii~) |
+| `kao` (default) | yellow `(・ω・)>` / `(・ω・)docs>`; the face turns red `(；ω；)` after a failed command, and recovers on the next input (ps: kawaii~) |
 | `plain` | `>` / `docs>` / `2>` |
-| `moe` | 粉色 `かいかーねる>`,文件找不到、命令不认识也换成吐槽文案 |
+| `moe` | pink `かいかーねる>`; file-not-found and unknown-command messages also become snarky lines |
 | `dos` | `C:\>` / `C:\docs>` |
-| `c64` | `READY.`,一行一条命令,Commodore 64 BASIC 那味儿 |
+| `c64` | `READY.`, one command per line, that Commodore 64 BASIC feel |
 
-`RC.CONF` 里加一行 `style = moe`(或 `kao` / `plain` / `dos` / `c64`),开机就用那个样式(见 [docs/rc-conf.md](docs/rc-conf.md))。
-萌文案不是乱写的:字库里有半角片假名和 CJK;0.13 版又把希腊/标点/数学/箭头/几何/符号等范围补进字库,
-kaomoji 能用的素材多了一大把。
+Add a line `style = moe` (or `kao` / `plain` / `dos` / `c64`) to `RC.CONF` and that style is used from boot (see [rc-conf.md](rc-conf.md)).
+The cute strings aren't made up nonsense: the font includes half-width katakana and CJK; 0.13 also added Greek/punctuation/math/arrows/geometric/symbol ranges to the font,
+so kaomoji have a lot more material to work with.
 
-![颜文字提示符](docs/screenshot-style-kao.png)
+![Kaomoji prompt](screenshot-style-kao.png)
 
-![萌样式提示符](docs/screenshot-style-moe.png)
-
+![Moe-style prompt](screenshot-style-moe.png)

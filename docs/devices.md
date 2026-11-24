@@ -1,25 +1,31 @@
-# /DEV 设备抽象层
+[简体中文](zh-CN/devices.md)
 
-> 「一切皆文件」的最小学版:读时钟、写屏幕、丢垃圾,对程序来说都是
-> **打开一个名字、读/写字节**。KKernel 的 FAT16 已经把「名字 → 字节」这条路铺好了,
-> `/DEV` 只加一小段:文件名以 `DEV/` 开头时**不查磁盘,改查设备表**。
+# The /DEV Device Abstraction Layer
 
-## 1. 有哪些设备
+> The smallest edition of "everything is a file": reading the clock, writing to the screen,
+> throwing things away — to a program these are all just **opening a name and reading or writing
+> bytes**. KKernel's FAT16 has already paved the "name → bytes" road; `/DEV` adds only a short
+> stretch: when a filename starts with `DEV/`, **don't look at the disk, look at the device table**.
 
-| 名字 | 读 | 写 | 说明 |
+## 1. What devices exist
+
+| Name | Read | Write | Notes |
 |---|---|---|---|
-| `DEV/NULL` | 永远 0 字节 | 丢弃 | 经典 `/dev/null`:黑洞,写什么进去都没事 |
-| `DEV/ZERO` | 要多少给多少 `0x00` | 丢弃 | 典型用途:把缓冲清零 |
-| `DEV/RANDOM` | 伪随机字节 | 不支持 | xorshift32,种子偷 PIT 的 tick 数(每次开机不一样) |
-| `DEV/RTC` | `YYYY-MM-DD HH:MM:SS`(19 字节) | 不支持 | 实时读 CMOS 时钟,不缓存 |
-| `DEV/CON` | 不支持 | 当 UTF-8 文本打到屏幕上 | 不自动加换行,想换行自己写 `\n` 进去 |
-| `DEV/DEVICES` | 列出所有设备名(空格分隔) | 不支持 | 设备表自己报名字,加新设备不用改这里 |
+| `DEV/NULL` | Always 0 bytes | Discard | The classic `/dev/null`: a black hole, write whatever you like |
+| `DEV/ZERO` | As many `0x00` as you ask for | Discard | Typical use: zero out a buffer |
+| `DEV/RANDOM` | Pseudorandom bytes | Not supported | xorshift32, seeded from the PIT tick count (different on every boot) |
+| `DEV/RTC` | `YYYY-MM-DD HH:MM:SS` (19 bytes) | Not supported | Reads the CMOS clock live, no caching |
+| `DEV/CON` | Not supported | Printed to the screen as UTF-8 text | No automatic newline; write `\n` yourself if you want one |
+| `DEV/DEVICES` | Lists all device names (space-separated) | Not supported | The device table reports its own names; adding a device needs no change here |
 
-`/DEV` 目录里由 `tools/mkfat.py` 摆了**占位文件**(`ls DEV` 看得见),但它们的磁盘内容
-永远不会被读到 —— 读写都走内核设备层。占位文件的内容只是一句说明
-(`progs/DEV_NODE.txt`),方便别人直接看镜像时知道这些是什么。
+The `/DEV` directory contains **placeholder files** put there by `tools/mkfat.py` (you can see them
+with `ls DEV`), but their on-disk contents are never read — reads and writes both go through the
+kernel device layer. The placeholder content is just a one-line description
+(`progs/DEV_NODE.txt`), so anyone looking straight at the image can tell what these are.
 
-## 2. 在 shell 里试用
+## 2. Trying it in the shell
+
+Try it in the shell (Chinese output shown as-is):
 
 ```text
 > ls DEV
@@ -43,12 +49,14 @@ wrote DEV/NULL
 device is not readable
 ```
 
-设备名大小写不敏感,前导 `/` 可有可无:`DEV/RTC`、`dev/rtc`、`/DEV/RTC` 都行。
+Device names are case-insensitive, and a leading `/` is optional: `DEV/RTC`, `dev/rtc` and
+`/DEV/RTC` all work.
 
-## 3. 程序里怎么用
+## 3. Using it from a program
 
-`int 0x30` 的 **7 号(读文件)** 和 **8 号(写文件)** 与 shell 共用同一套设备层,
-所以程序**不用加任何新接口**就能读设备。C 程序里就是普通 `fopen/fread/fwrite`:
+Functions **7 (read file)** and **8 (write file)** of `int 0x30` share the same device layer as the
+shell, so programs get device access **without any new interface**. In C it's just ordinary
+`fopen/fread/fwrite`:
 
 ```c
 #include <stdio.h>
@@ -58,52 +66,62 @@ int main(void)
     char t[32];
     FILE *f = fopen("DEV/RTC", "rb");
     if (!f) { printf("no dev\n"); return 1; }
-    fread(t, 1, sizeof t - 1, f);      /* 19 字节时间串 */
+    fread(t, 1, sizeof t - 1, f);      /* 19-byte time string */
     fclose(f);
     printf("现在是 %s\n", t);
     return 0;
 }
 ```
 
-`progs/IOTEST.c` 最后一段就是设备自检(读 `DEV/RTC`、写 `DEV/NULL`);
-shell 里 `run iotest` 就能看到结果。
+The last part of `progs/IOTEST.c` is exactly this device self-test (reads `DEV/RTC`, writes
+`DEV/NULL`); `run iotest` in the shell shows the result.
 
-## 4. 实现(为什么这么写)
+## 4. Implementation (and why it looks like this)
 
 ```
 kernel/dev.asm
-  dev_table      设备表:每项 12 字节(名字指针 / 读函数 / 写函数,0 = 该方向不支持)
-  dev_lookup     esi = 名字 → eax = 设备表项(0 = 不是设备名)
-  dev_xxx_read   读:edi = 缓冲,ecx = 上限 → eax = 字节数(-1 = 失败)
-  dev_xxx_write  写:esi = 数据,ecx = 长度   → eax = 0 成功(-1 = 失败)
+  dev_table      device table: 12 bytes per entry (name pointer / read function / write function; 0 = that direction unsupported)
+  dev_lookup     esi = name → eax = table entry (0 = not a device name)
+  dev_xxx_read   read: edi = buffer, ecx = limit → eax = byte count (-1 = failure)
+  dev_xxx_write  write: esi = data, ecx = length → eax = 0 on success (-1 = failure)
 ```
 
-调用点只有两处:
+There are only two call sites:
 
-- `kernel/api.asm` 的 7/8 号功能:进 `fat_path` **之前**先 `dev_lookup`,
-  命中就直接调 handler,不碰当前目录(所以不会把 `fat_dir` 留在半路)。
-- `kernel/shell.asm` 的 `cat` / `write`:同样先查设备。`cat DEV/XXX` 的结果
-  打印前会补一个 `0` 结尾,防止把缓冲区里上一次的内容也打出来。
+- Functions 7/8 in `kernel/api.asm`: call `dev_lookup` **before** entering `fat_path`; on a hit,
+  call the handler directly and never touch the current directory (so `fat_dir` isn't left
+  halfway updated).
+- `cat` / `write` in `kernel/shell.asm`: same idea, check the device first. The result of
+  `cat DEV/XXX` gets a `0` terminator appended before printing, so bytes left in the buffer from
+  the previous use don't get printed too.
 
-每个 handler 自己 `pushad` 保护寄存器、只把结果留在 `eax` —— 这样内核里的
-两处调用点(cat/write 直接调、API 通过中断调)可以共用同一批函数。
+Each handler does its own `pushad` to protect registers and leaves only the result in `eax` — that
+way both kernel call sites (cat/write calling directly, the API calling through the interrupt) can
+share the same set of functions.
 
-## 5. 加一个新设备
+## 5. Adding a new device
 
-1. 写 handler(读和/或写),遵守上面的寄存器约定;
-2. 在 `kernel/dev.asm` 的 `dev_table` 里加一行,名字串放数据段;
-3. 在 `Makefile` 的 `MKFAT_FILES` 里给 `DEV/` 加一个占位条目:
-   `DEV/名字=progs/DEV_NODE.txt`;
-4. 想让它出现在文档里,就在上表加一行。
+1. Write the handler (read and/or write), following the register conventions above;
+2. Add a row to `dev_table` in `kernel/dev.asm`, with the name string in the data segment;
+3. Add a placeholder entry for `DEV/` to `MKFAT_FILES` in the `Makefile`:
+   `DEV/name=progs/DEV_NODE.txt`;
+4. If you want it documented, add a row to the table above.
 
-不需要改 `ls` / `cat` / `write` / API 的任何代码 —— 名字解析和设备表会自动认。
+No code in `ls` / `cat` / `write` / the API needs to change — name resolution and the device table
+pick it up automatically.
 
-## 6. 已知限制
+## 6. Known limitations
 
-- **只有 `/DEV` 一个命名空间**:`/dev` 是虚拟目录的"名字前缀",不是真的可 cd 的目录
-  (`cd DEV` 还是可以进 FAT 里那个目录,只是里面的文件读出来是魔法)。
-- **没有 open/close、没有 seek**:每次读都从头来;`DEV/RTC` 每次读都会重新读时钟。
-- **没有权限位**:所有程序都能读所有设备(反正现在内核也没有权限模型)。
-- **写方向没有返回写入字节数**:handler 只报成功/失败;`DEV/CON` 超过 255 字节会被截断。
-- **`cat DEV/RANDOM` 会打出二进制乱码**:它是字节设备,不是文本;要看效果请用程序读。
-- 设备占位文件在 `ls` 里会显示 86 字节(占位文本的长度),不代表设备本身的数据量。
+- **There is only one `/DEV` namespace**: `/dev` is a "name prefix" for a virtual directory, not a
+  real directory you can `cd` into (`cd DEV` still enters the directory that exists in FAT, it's
+  just that the files inside read out as magic).
+- **No open/close, no seek**: every read starts from the beginning; `DEV/RTC` re-reads the clock on
+  every read.
+- **No permission bits**: every program can read every device (the kernel has no permission model
+  yet anyway).
+- **The write direction returns no byte count**: the handler only reports success/failure;
+  `DEV/CON` truncates anything past 255 bytes.
+- **`cat DEV/RANDOM` prints binary garbage**: it's a byte device, not text; use a program to read it
+  if you want to see the effect.
+- Device placeholder files show up in `ls` as 86 bytes (the length of the placeholder text), which
+  says nothing about the device's actual data volume.

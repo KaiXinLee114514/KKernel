@@ -1,7 +1,10 @@
-# 用 C 写 KKernel 程序
+[简体中文](zh-CN/c-programs.md)
 
-**不用交叉编译器,普通 `gcc` 就行。** 程序编成平铺二进制,放进 FAT16 分区,
-shell 里 `run XXX` 跑起来 —— 和 `progs/*.asm` 那套完全一样,只是语言换了。
+# Writing KKernel Programs in C
+
+**No cross compiler needed — plain `gcc` will do.** Programs are compiled into flat binaries, put
+into the FAT16 partition, and started from the shell with `run XXX` — exactly the same as the
+`progs/*.asm` route, only in a different language.
 
 ```c
 #include <stdio.h>
@@ -16,29 +19,30 @@ int main(void)
 ```
 
 ```bash
-make                 # 自动编译 progs/*.c(需要 gcc 的 32 位支持)
-make cc-check        # 看一眼 C 工具链在不在
-make hd              # 起来之后: run CHELLO
+make                 # builds progs/*.c automatically (needs gcc's 32-bit support)
+make cc-check        # check whether the C toolchain is there
+make hd              # once booted: run CHELLO
 ```
 
-`make` 在**没有 32 位支持**的机器上会**跳过** C 程序并提示 `sudo apt install gcc-multilib`,
-汇编那部分照常构建 —— clone 下来的人不会被卡住。
+On machines **without 32-bit support**, `make` **skips** the C programs and prints
+`sudo apt install gcc-multilib`, while the assembly part builds as usual — nobody cloning this gets
+stuck.
 
 ---
 
-## 1. 这一套是怎么拼起来的
+## 1. How the pieces fit together
 
-| 文件 | 干什么 |
+| File | What it does |
 |---|---|
-| `include/kkernel.h` | 14 个 `int 0x30` 功能的 C 包装(static inline 内联汇编)+ 颜色/键值常量 |
-| `lib/crt0.asm` | 入口:`_start` → 清 BSS → `main()` → `ret` 回 shell;还有 `exit()` 用的跳板 |
-| `lib/minic.c` | 迷你 libc:string / ctype / malloc / printf / 一点点 stdio(约 600 行) |
-| `lib/minic.h` | 上面那些的声明(也是我们自己的 `<stdio.h>` 等的真正内容) |
-| `include/*.h` | 薄壳:让 `#include <stdio.h>` 这种老写法命中我们的实现 |
-| `lib/kkernel.ld` | 链接脚本:摆到 0x120000,输出平铺二进制,顺手给出 BSS 边界符号 |
-| `progs/*.c` | 你的 C 程序 |
+| `include/kkernel.h` | C wrappers for the 14 `int 0x30` functions (static inline assembly) + color/key constants |
+| `lib/crt0.asm` | Entry point: `_start` → clear BSS → `main()` → `ret` back to the shell; plus the trampoline used by `exit()` |
+| `lib/minic.c` | Mini libc: string / ctype / malloc / printf / a little stdio (~600 lines) |
+| `lib/minic.h` | Declarations for the above (and the real contents of our own `<stdio.h>` and friends) |
+| `include/*.h` | Thin shims: so that old-style `#include <stdio.h>` hits our implementation |
+| `lib/kkernel.ld` | Linker script: place at 0x120000, output a flat binary, and hand out the BSS boundary symbols |
+| `progs/*.c` | Your C programs |
 
-编译命令(Makefile 里已经写好了,这里只是让人看懂):
+The compile commands (already written in the Makefile; shown here so humans can follow along):
 
 ```bash
 gcc -m32 -std=gnu89 -ffreestanding -fno-pic -fno-stack-protector \
@@ -47,102 +51,119 @@ gcc -m32 -std=gnu89 -ffreestanding -fno-pic -fno-stack-protector \
 ld -m elf_i386 -T lib/kkernel.ld build/crt0.o build/Foo.o build/minic.o -o build/Foo.BIN
 ```
 
-每个参数都有理由:
+Every flag has a reason:
 
-* `-m32`:KKernel 是 32 位 x86,程序必须是 32 位代码;
-* `-ffreestanding -nostdlib`:裸机上没有 libc,别去链接 glibc(链了也起不来);
-* `-fno-pic`:`int 0x30` 要用 `ebx` 传参数,而位置无关代码拿 `ebx` 当 GOT 指针;
-* `-fno-stack-protector -fno-asynchronous-unwind-tables`:`__stack_chk_*` 和 `.eh_frame`
-  都是 libc/运行时才有的东西,带上就链接不过;
-* `-fno-builtin`:别把 `memcpy` 之类换成编译器内联版本(我们自己实现的更简单);
-* `-std=gnu89`:老 C 代码(STEVIE 那种)默认 gcc 14 编不过,gnu89 最省事。
+* `-m32`: KKernel is 32-bit x86, so programs must be 32-bit code;
+* `-ffreestanding -nostdlib`: there's no libc on bare metal, so don't link glibc (it wouldn't start
+  even if you did);
+* `-fno-pic`: `int 0x30` passes arguments in `ebx`, and position-independent code uses `ebx` as the
+  GOT pointer;
+* `-fno-stack-protector -fno-asynchronous-unwind-tables`: `__stack_chk_*` and `.eh_frame` are
+  libc/runtime things; bring them along and the link fails;
+* `-fno-builtin`: don't replace `memcpy` and friends with compiler-inlined versions (ours are
+  simpler);
+* `-std=gnu89`: old C code (the STEVIE kind) doesn't build with gcc 14 by default; gnu89 is the
+  least hassle.
 
-## 2. 程序的约定
+## 2. Program conventions
 
 ```
-0x120000            程序被 shell 读到这里(链接地址就是它)   ← 虚拟地址
-0x120000..0x17FFFF  程序镜像窗口(96 页,384 KiB;代码 + 只读数据 + 已初始化数据)
-0x180000..堆顶-1     堆(malloc 从这儿切;大小看机器内存/字库位置,默认约 2.1 MB,
-                    确切边界用 j_heap_end() 查;堆顶下两页是参数页和用户栈)
-(字库:运行时放在恒等映射顶部 ident-2 MiB 的槽里;默认 128 MiB 机器 = 0x7A00000 起)
+0x120000            program is read here by the shell (this is also the link address)   ← virtual address
+0x120000..0x17FFFF  image window (96 pages, 384 KiB; code + read-only data + initialized data)
+0x180000..heap top-1  heap (malloc carves from here; size depends on machine memory / where the font is, about 2.1 MB by default,
+                     exact boundary via j_heap_end(); the two pages below the heap top are the argument page and the user stack)
+(font: at runtime it lives in a slot at ident-2 MiB on top of the identity map; on a default 128 MiB machine that's 0x7A00000 upwards)
 ```
 
-* **这两块现在是"每程序私有页",而且按需才给**:内核建好页表,但镜像窗口 + 堆窗口
-  (默认 96 + 560 页)一页都不预先映射 —— 你的代码/数据第一次碰到哪一页,
-  缺页处理才从物理页池现拿一页、清零、填表(然后把那条指令重执行一遍,你感觉不到)。
-  程序退出后把这些页连页表一起还给页池。所以虚拟地址和你写代码时一样,
-  物理落在哪儿每次都不一样(想知道自己碰了多少页,跑一次 `run TOUCH`,或看 `run FOO`
-  最后那行 `demand paging: N page(s) faulted in (image x + heap y)`);
-* 超过 384 KiB 的镜像会被 `run` 拒绝(私有镜像窗口就这么大)。
+* **Both regions are now "per-program private pages", and handed out only on demand**: the kernel
+  builds the page tables, but not a single page of the image window or the heap window (96 + 560
+  pages by default) is mapped in advance — whichever page your code/data touches first, the page
+  fault handler grabs a page from the physical page pool, zeroes it, fills in the table (then
+  re-executes that instruction, so you never notice). On exit the pages go back to the pool along
+  with the page tables. So the virtual addresses are the same as when you wrote the code, but where
+  they land physically is different every run (to see how many pages you touched, run `run TOUCH`,
+  or look at the last line of `run FOO`: `demand paging: N page(s) faulted in (image x + heap y)`);
+* images larger than 384 KiB are rejected by `run` (that's all the private image window is).
 
-* **入口**:`lib/crt0.asm` 里的 `_start`(由链接脚本 `ENTRY(_start)` 指定)。
-  它清完 BSS 就调 `main()`,所以程序里写 `int main(void)` 就行,**不要**自己写 `_start`;
-* **返回**:`main` 返回(或 `exit()`)就回到 shell。没有进程、没有返回值语义,
-  退出码只有调试意义;
-* **参数**:`int main(int argc, char **argv)` **不行** —— 没有 argv。
-  用 `const char *arg = j_arg();` 取(`run FOO 参数` 里那串);
-* **BSS**:平铺二进制不存"全是 0 的段",所以 crt0 会清一遍;而现在按需补进来的页
-  本身就是干净的零页(镜像文件之外的部分连拷都不拷) —— 双保险,
-  "全局数组默认是 0"稳了。
+* **Entry point**: `_start` in `lib/crt0.asm` (selected by the linker script's `ENTRY(_start)`).
+  It clears BSS and then calls `main()`, so just write `int main(void)` — **do not** write your own
+  `_start`;
+* **Return**: when `main` returns (or `exit()` is called) you're back in the shell. There are no
+  processes and no return-value semantics; the exit code is only useful for debugging;
+* **Arguments**: `int main(int argc, char **argv)` **doesn't work** — there is no argv. Use
+  `const char *arg = j_arg();` (that's the string from `run FOO args`);
+* **BSS**: a flat binary doesn't store "all-zero sections", so crt0 clears it; and the pages faulted
+  in on demand are already clean zero pages (the part beyond the image file isn't even copied) —
+  belt and braces, so "global arrays are zero by default" holds.
 
-## 3. 迷你 libc 有什么、没有什么
+## 3. What the mini libc has and doesn't have
 
-**有**:`strlen/strcpy/strncpy/strcat/strcmp/strncmp/strchr/strrchr/strcspn/memcpy/memmove/memset`、
-`is*/to*`、`malloc/calloc/realloc/free`(首次适配 + 相邻合并)、
-`printf/fprintf/sprintf/snprintf`(`%d %i %u %x %X %o %c %s %p %%`,带宽度/精度/`-`/`0`/`+`/`#`)、
-`fopen/fclose/fgets/fgetc/fputc/fputs/puts/fflush`、`remove/rename/access`、`atoi/abs/exit/system/getenv`。
+**Has**: `strlen/strcpy/strncpy/strcat/strcmp/strncmp/strchr/strrchr/strcspn/memcpy/memmove/memset`,
+`is*/to*`, `malloc/calloc/realloc/free` (first fit + adjacent coalescing),
+`printf/fprintf/sprintf/snprintf` (`%d %i %u %x %X %o %c %s %p %%`, with width/precision/`-`/`0`/`+`/`#`),
+`fopen/fclose/fgets/fgetc/fputc/fputs/puts/fflush`, `remove/rename/access`, `atoi/abs/exit/system/getenv`.
 
-**没有**:浮点格式化(`%f`)、`scanf`、目录遍历、`time`、信号、线程、
-`qsort`、locale/宽字符。
+**Doesn't have**: floating-point formatting (`%f`), `scanf`, directory traversal, `time`, signals,
+threads, `qsort`, locale/wide characters.
 
-**和 POSIX 不一样的地方**(重要):
+**Where it differs from POSIX** (important):
 
-* 文件的模型是"**整读整写**":`fopen("r")` 会把整个文件读进内存(最多 64 KB),
-  `fopen("w")` 先在内存里攒着,`fclose` 时才一次写盘。没有 seek 回写、没有追加;
-* `remove()` 永远返回 -1:内核的接口里**没有删除文件**(见 [known-issues.md](known-issues.md));
-* `rename()` 是"读出来 + 写到新名字",旧文件还在;
-* `system()` 只打印一句"没有 shell escape" —— 这个系统里没有进程;
-* `getenv()` 永远返回 NULL(老代码得自己有默认值)。
+* The file model is "**read it all, write it all**": `fopen("r")` reads the whole file into memory
+  (64 KB max), `fopen("w")` accumulates in memory and writes to disk once at `fclose`. No seek and
+  rewrite, no append;
+* `remove()` always returns -1: the kernel interface has **no file deletion** (see
+  [known-issues.md](known-issues.md));
+* `rename()` is "read it out + write it under the new name"; the old file stays;
+* `system()` just prints "no shell escape" — there are no processes in this system;
+* `getenv()` always returns NULL (old code has to supply its own defaults).
 
-## 4. 例子:`progs/CHELLO.c`
+## 4. Example: `progs/CHELLO.c`
 
-它把能用的都试了一遍:printf 各种格式、malloc/free 看堆还剩多少、16 种颜色、
-取参数、用参数当文件名打开并统计行数/字节数。跑:
+It tries everything that works: the various printf formats, malloc/free to see how much heap is
+left, the 16 colors, getting the argument, using the argument as a filename and counting
+lines/bytes. Run:
 
 ```
 > run CHELLO
 > run CHELLO DOCS/README.TXT
 ```
 
-`ls` 里能看到它:`CHELLO.BIN` 8888 字节 —— 其中大约 6 KB 是迷你 libc 和 crt0,
-所以"每个 C 程序自己带一份 libc"也不算浪费(反正是从磁盘读的)。
+You'll see it in `ls`: `CHELLO.BIN`, 8888 bytes — roughly 6 KB of that is the mini libc and crt0,
+so "every C program carries its own copy of libc" isn't really wasteful (it's read from disk
+anyway).
 
-## 5. 现成的例子:`progs/` 里的 C 程序和 STEVIE
+## 5. Ready-made examples: the C programs in `progs/` and STEVIE
 
-* `progs/CHELLO.c`:printf / malloc / 参数 / 读文件,把能用的都试一遍;
-* `extensions/vi/`:**STEVIE 3.68 —— 公有领域的 vi 克隆(vim 的前身)**,整个移植过来了:
+* `progs/CHELLO.c`: printf / malloc / arguments / reading files — a workout for everything that's
+  available;
+* `extensions/vi/`: **STEVIE 3.68 — a public-domain vi clone (vim's ancestor)**, ported over
+  wholesale:
 
 ```bash
 make hd
-> run vi DOCS/NOTES.TXT      # 打开编辑器(:w 存盘、:q 退出、i 进插入模式、ESC 回普通模式)
+> run vi DOCS/NOTES.TXT      # open the editor (:w saves, :q quits, i enters insert mode, ESC back to normal)
 ```
 
-它的"机器相关层"本来叫 `nt.c`(Windows NT 版),现在换成我们自己写的
-`extensions/vi/kkernel.c`:屏幕走 `int 0x30` 的 9/13 号(定位 + 在指定位置画字),
-键盘走 10 号(方向键直接映到 STEVIE 的 `K_UARROW` 那套键值),文件走 7/8 号。
-编辑器核心(约 10 900 行)一行没改 —— 这正说明"平台层收得干净"的代码有多好移植。
+Its "machine-dependent layer" used to be called `nt.c` (the Windows NT version); now it's our own
+`extensions/vi/kkernel.c`: the screen goes through `int 0x30` functions 9/13 (position + draw text
+at a position), the keyboard through 10 (arrow keys map straight onto STEVIE's `K_UARROW` key
+codes), files through 7/8. The editor core (~10,900 lines) was not changed at all — which says
+quite a lot about how easy code with a clean platform layer is to port.
 
-平台层要提供的东西一共就这些:
+The platform layer only has to provide this much:
 
 ```
-windinit / windexit / windgoto(row,col) / wchangescreen   屏幕
-outchar / outstr / flushbuf                                画字符
-inchar                                                     收键
-fopenb / fixname                                           文件和文件名
-beep / delay / sleep / sig / dochdir / mysystem / doshell   杂项(多数是空实现)
+windinit / windexit / windgoto(row,col) / wchangescreen   screen
+outchar / outstr / flushbuf                                draw characters
+inchar                                                     get a key
+fopenb / fixname                                           files and filenames
+beep / delay / sleep / sig / dochdir / mysystem / doshell   misc (mostly empty stubs)
 ```
 
-**真人实测的坑**:`fixname` 在 NT 版里是 `fixname(char *s)` —— 一个参数、返回静态缓冲,
-而我第一版按"三个参数、写到调用方缓冲"写了。`stevie.h` 里是老式声明 `char *fixname();`,
-**参数个数不对编译器不吭声**,于是存盘时文件名变成空的:vi 报"存盘成功",磁盘上却多了
-一个名字全是空格的目录项。教训:移植老代码里的平台函数,先看原实现,别按自己以为的签名单干。
+**A pitfall I hit for real**: in the NT version `fixname` is `fixname(char *s)` — one argument,
+returns a static buffer — and my first version wrote it as "three arguments, writes into the
+caller's buffer". `stevie.h` has the old-style declaration `char *fixname();`, and **the compiler
+says nothing when the argument count is wrong**, so saving produced an empty filename: vi reported
+"save successful", while the disk got a directory entry whose name was all spaces. Lesson: when
+porting a platform function from old code, look at the original implementation first; don't
+freelance off the signature you assume.

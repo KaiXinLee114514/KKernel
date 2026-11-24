@@ -1,240 +1,265 @@
-# KKernel 的磁盘:ATA PIO、磁盘字库、FAT16 / FAT32
+[简体中文](zh-CN/filesystem.md)
 
-这一页讲清楚**磁盘上有什么、内核怎么读它、怎么往里写**。涉及三个文件:
+# KKernel's disk: ATA PIO, on-disk font, FAT16 / FAT32
 
-| 文件 | 干什么 |
+This page covers **what's on the disk, how the kernel reads it, and how it writes to it**. Three
+files are involved:
+
+| File | What it does |
 |---|---|
-| `kernel/ata.asm` | ATA(IDE)硬盘 PIO 驱动,读/写裸扇区 |
-| `kernel/fontdisk.asm` | 启动时把完整字库从磁盘搬进内存 |
-| `kernel/fat.asm` | FAT16:找文件、读文件、写文件、列目录 |
+| `kernel/ata.asm` | ATA (IDE) hard-disk PIO driver, reads/writes raw sectors |
+| `kernel/fontdisk.asm` | copies the full font from disk into memory at boot |
+| `kernel/fat.asm` | FAT16: find files, read files, write files, list directories |
 
-配套的 Python 工具是 `tools/mkimg.py`(拼镜像 + 放字库)和 `tools/mkfat.py`(造分区 + 放文件)。
+The companion Python tools are `tools/mkimg.py` (assemble the image + place the font) and
+`tools/mkfat.py` (create the partition + place files).
 
 ---
 
-## 1. 整张镜像长什么样
+## 1. What the whole image looks like
 
-`build/kkernel-hd.img` 是 16 MB,按 LBA(逻辑扇区号,1 扇区 = 512 字节)排:
-
-```
-LBA 0            引导扇区(512 字节,BIOS 读到 0x7C00)
-LBA 1 - 4        实模式 stub(搬到 0x500;问 VBE、进保护模式)
-LBA 5 起         32 位内核(512 扇区 = 256 KiB,搬到 0x10000)
-LBA 2047         字库描述块:magic 'JFD1' + 字库 LBA + 扇区数 + 字节数
-LBA 2048 起      字库本体(KKF0 格式,1 765 648 字节 = 3449 扇区)
-LBA 6144 起      FAT16 分区(8 MB;这里是唯一能被"文件"操作的地方)
-```
-
-为什么 FAT16 分区要从 **6144** 开始:字库到 5496 扇区才结束,后面留了点空。
-分区起点**写死**在两个地方,改的时候两边都得改:
-
-* `kernel/fat.asm` 里的 `FAT_PART_LBA equ 6144`(内核去这个 LBA 找"引导扇区")
-* `Makefile` 里 `mkfat.py $(HDIMG) 6144 8 ...`
-
-> 没有 MBR 分区表 —— `fat_mount` 不是"解析分区表",而是**直接去固定 LBA** 读那个 FAT 引导扇区。
-> 一个玩具系统这么干最省事,代价是分区不能搬家。
-
-软盘镜像(`build/kkernel.img`,1.44 MB)只有前三项,没有字库也没有文件系统 ——
-BIOS 的软盘读盘路径是另一条测试路线(`make test-fda`)。
-
-## 2. 为什么不用 BIOS 读盘了
-
-开机时用 `int 0x13` 读盘没问题(引导扇区就是那么干的),但那之后:
-
-* BIOS 只有"读第 N 个扇区"这一种操作,**它不知道什么是文件**;
-* `int 0x13` 是实模式的中断,进了保护模式还得来回切,麻烦;
-* 我们要用硬盘上的字库(1.8 MB),BIOS 一次读的那点量也不合适。
-
-所以进保护模式之后直接操作 **ATA 控制器端口**(0x1F0~0x1F7),这条路子叫 PIO
-(Programmed I/O:CPU 一个一个字地把数据搬进来,不用 DMA)。
-
-## 3. ATA PIO 驱动(`kernel/ata.asm`)
-
-一个扇区的读,寄存器顺序是固定的:
+`build/kkernel-hd.img` is 16 MB, laid out by LBA (logical sector number, 1 sector = 512 bytes):
 
 ```
-0x1F6 ← 0xE0 | (LBA >> 24 & 0x0F)   选主盘 + LBA 高 4 位
-0x1F2 ← 扇区数
-0x1F3 ← LBA & 0xFF                  低 24 位,三个端口分着放
+LBA 0            boot sector (512 bytes, read by the BIOS to 0x7C00)
+LBA 1 - 4        real-mode stub (moved to 0x500; ask VBE, enter protected mode)
+LBA 5 onward     32-bit kernel (512 sectors = 256 KiB, moved to 0x10000)
+LBA 2047         font descriptor block: magic 'JFD1' + font LBA + sector count + byte count
+LBA 2048 onward  the font itself (KKF0 format, 1,765,648 bytes = 3449 sectors)
+LBA 6144 onward  FAT16 partition (8 MB; the only place "files" can be operated on)
+```
+
+Why the FAT16 partition starts at **6144**: the font only ends at sector 5496, leaving a little slack
+after it. The partition start is **hardcoded** in two places, and both have to change together:
+
+* `FAT_PART_LBA equ 6144` in `kernel/fat.asm` (the kernel goes to this LBA to find the "boot sector")
+* `mkfat.py $(HDIMG) 6144 8 ...` in the `Makefile`
+
+> There is no MBR partition table — `fat_mount` isn't "parsing a partition table", it **goes straight
+> to a fixed LBA** and reads that FAT boot sector. For a toy system that's the least effort; the cost
+> is that the partition can't move.
+
+The floppy image (`build/kkernel.img`, 1.44 MB) only has the first three items — no font and no
+filesystem; BIOS floppy reads are a separate test route (`make test-fda`).
+
+## 2. Why we stopped using BIOS disk reads
+
+Reading disks with `int 0x13` at boot is fine (that's exactly what the boot sector does), but after
+that:
+
+* the BIOS only has one operation, "read sector N", and **it has no idea what a file is**;
+* `int 0x13` is a real-mode interrupt, and once in protected mode you'd have to switch back and forth,
+  which is a nuisance;
+* we want to use the 1.8 MB font on the hard disk, and the amount the BIOS reads at a time isn't a
+  good fit either.
+
+So once in protected mode we drive the **ATA controller ports** (0x1F0~0x1F7) directly — that approach
+is called PIO (Programmed I/O: the CPU moves the data in a word at a time, no DMA).
+
+## 3. The ATA PIO driver (`kernel/ata.asm`)
+
+Reading one sector uses a fixed register order:
+
+```
+0x1F6 ← 0xE0 | (LBA >> 24 & 0x0F)   select the master + top 4 bits of the LBA
+0x1F2 ← sector count
+0x1F3 ← LBA & 0xFF                  low 24 bits, spread over three ports
 0x1F4 ← (LBA >> 8) & 0xFF
 0x1F5 ← (LBA >> 16) & 0xFF
-0x1F7 ← 0x20(读)/ 0x30(写)          命令寄存器:发命令
-等 0x1F7:BSY(bit7) 变 0 且 DRQ(bit3) 变 1
-从 0x1F0 读 256 次(16 位)= 512 字节
+0x1F7 ← 0x20 (read) / 0x30 (write)  command register: issue the command
+wait on 0x1F7: BSY (bit7) goes 0 and DRQ (bit3) goes 1
+read 0x1F0 256 times (16 bits) = 512 bytes
 ```
 
-对外就两个函数(都在 `kernel/ata.asm`):
+Only two functions are exported (both in `kernel/ata.asm`):
 
 ```asm
-; eax = 起始 LBA,ecx = 扇区数,edi = 目标地址;返回 eax = 0 成功
+; eax = starting LBA, ecx = sector count, edi = destination; returns eax = 0 on success
 call ata_read_sectors
 
-; eax = 起始 LBA,ecx = 扇区数,esi = 源地址;返回 eax = 0 成功
+; eax = starting LBA, ecx = sector count, esi = source; returns eax = 0 on success
 call ata_write_sectors
 ```
 
-写盘还有两个额外动作,少一个都可能丢数据:
+Writing to disk takes two extra steps, and skipping either can lose data:
 
-1. **每写一个端口前等 ~400 ns**(`ata_delay400`,读四次状态口就算等了)—— 老硬盘吃不下这么快的写;
-2. 写完发 **0xE7 = FLUSH CACHE**,让驱动器把内部缓存真的落盘(不然 QEMU 一退,数据可能还在缓存里)。
+1. **wait ~400 ns before each port write** (`ata_delay400`, reading the status port four times counts
+   as the wait) — old drives can't take writes that fast;
+2. after writing, send **0xE7 = FLUSH CACHE** so the drive really commits its internal cache
+   (otherwise quitting QEMU can leave data sitting in the cache).
 
-### 坑 1:一次要 255 个扇区,结果只回来一个
+### Trap 1: asked for 255 sectors, only one came back
 
-读字库的时候最开始是"一口气发 255 个扇区的读命令",状态也显示成功,
-但读回来的内存里**只有第一个扇区是对的,后面全是 0**。
+When reading the font, the first version "issued a 255-sector read in one go"; the status said
+success, but **only the first sector in memory was correct — the rest were all zeros**.
 
-原因是 ATA 规范允许驱动器**只传一部分**(它想传多少传多少),而 PIO 模式下
-每传一个扇区就得等一次 DRQ。修法是分块 + 每块每扇区都等:
+The reason is that the ATA spec allows the drive to transfer **only part** of the request (as much as
+it feels like), and in PIO mode every sector transferred requires waiting for DRQ. The fix is
+chunking + waiting per sector within each chunk:
 
 ```asm
-ATA_MAX_CHUNK equ 16          ; 块大小:255 是硬件上限,16(=8 KB)实测最稳
+ATA_MAX_CHUNK equ 16          ; chunk size: 255 is the hardware limit, 16 (=8 KB) proved most reliable
 ```
 
-`ata_wait_drq` 在每搬 512 字节之前等 `DRQ=1`,这才把 3449 个扇区完整读进来。
+`ata_wait_drq` waits for `DRQ=1` before each 512-byte move, and that's what got all 3449 sectors in.
 
-### 坑 2:`mov al, 0xE0` 会把 LBA 弄丢
+### Trap 2: `mov al, 0xE0` loses the LBA
 
-`ata_setup_lba` 里的 LBA 存在 `eax` 里,而中间有一步要 `mov al, 0xE0`(选盘字节)——
-`al` 就是 `eax` 的低 8 位,LBA 的低字节当场被改成 0xE0。
+In `ata_setup_lba` the LBA lives in `eax`, and one step along the way does `mov al, 0xE0` (the
+drive-select byte) — `al` is the low 8 bits of `eax`, so the low byte of the LBA got overwritten with
+0xE0 on the spot.
 
-于是"读 LBA 0x1E0"变成了"读 LBA 0x00",字库全读成 0 → 屏幕上每个字都是 **missing glyph 方框**。
-修法:把所有参数列完之后再从内存里把 LBA 读回 `eax`。这类 bug 的教训是
-**看内存里的字节,别信"函数返回成功"**。
+So "read LBA 0x1E0" became "read LBA 0x00", the whole font read back as 0 → every character on screen
+was a **missing-glyph box**. The fix: list all the parameters first, then load the LBA back into `eax`
+from memory. The lesson from this class of bug is **look at the bytes in memory, don't trust "the
+function returned success"**.
 
-## 4. 磁盘字库(`kernel/fontdisk.asm`)
+## 4. On-disk font (`kernel/fontdisk.asm`)
 
-内核区只有 256 KiB(`KERNEL_SECTS = 512`),而完整字库是 **1.8 MB / 42 112 个字形**,
-不可能 `incbin` 进去。所以:
+The kernel area is only 256 KiB (`KERNEL_SECTS = 512`), while the full font is **1.8 MB / 42,112
+glyphs**, so `incbin` is out. Hence:
 
-* `font/font-kkf.bin`(416 字形,约 12 KB)**编进内核**,是保底方案;
-* `font/full-kkf.bin`(42 112 字形)**放在磁盘上**,启动时读进内存。
+* `font/font-kkf.bin` (416 glyphs, ~12 KB) is **compiled into the kernel** as the fallback;
+* `font/full-kkf.bin` (42,112 glyphs) **lives on the disk** and is read into memory at boot.
 
-启动流程(`font_load_from_disk`):
+The boot flow (`font_load_from_disk`):
 
 ```
-读 BOOTINFO+72 的启动盘号 → 不是 0x80 起(硬盘)就干脆不试,直接用内建子集
-读 LBA 2047 的描述块 → 头 4 字节不是 'JFD1' 就放弃
-按描述块里的 LBA/扇区数,把字库读进 0x200000
-校验 0x200000 处是不是 'KKF0' → 是就切过去(读字形数填 font_glyphs)
+read the boot drive number at BOOTINFO+72 → if it isn't 0x80 onwards (hard disk), don't even try; use the built-in subset
+read the descriptor block at LBA 2047 → if the first 4 bytes aren't 'JFD1', give up
+read the font to 0x200000 using the LBA/sector count in the descriptor block
+check for 'KKF0' at 0x200000 → if it's there, switch over (read the glyph count into font_glyphs)
 ```
 
-三点说明:
+Three notes:
 
-* **地址为什么是 0x200000**:分页恒等映射了 0~ident(至少 4 MiB),2 MB 在里面,
-  读进去就能当普通指针用(不用再建映射);
-* **为什么读失败也不慌**:任何一步不对就退回内建子集,系统照常启动 ——
-  字库是增强,不是必需品。软盘启动时走的就是这条路;
-* 屏幕上那行 `font: loaded from disk (ATA), 42112 glyphs` 就是证据
-  (`font: built-in subset, 416 glyphs` 说明它退回去了)。
+* **why the address is 0x200000**: paging identity-maps 0~ident (at least 4 MiB), 2 MB is inside that,
+  so once it's read in it can be used as an ordinary pointer (no new mapping needed);
+* **why a failed read isn't a problem**: any step going wrong falls back to the built-in subset and
+  the system still boots — the font is an enhancement, not a requirement. Booting from floppy takes
+  exactly this path;
+* the line `font: loaded from disk (ATA), 42112 glyphs` on screen is the evidence
+  (`font: built-in subset, 416 glyphs` means it fell back).
 
-## 5. FAT16(`kernel/fat.asm`)
+## 5. FAT16 (`kernel/fat.asm`)
 
-只做"够用"的那一小块:8.3 短名 + 子目录 + FAT16/FAT32 两种格式。
-**没有**长文件名(LFN)、**没有**文件时间戳。子目录的建立/删除/进出是有的(见下面 5.2)。
+Only the "just enough" slice: 8.3 short names + subdirectories + both FAT16/FAT32 formats. **No**
+long file names (LFN), **no** file timestamps. Creating/removing/entering/leaving subdirectories is
+there (see 5.2 below).
 
-引导扇区里用到的字段(偏移都是相对分区起点,`fat_mount` 逐个读出来):
+Fields used from the boot sector (offsets are relative to the partition start; `fat_mount` reads them
+one by one):
 
-| 偏移 | 含义 | 代码里的变量 |
+| Offset | Meaning | Variable in the code |
 |---|---|---|
-| 11 | 每扇区字节数(必须是 512,不然直接放弃) | `fat_bps` |
-| 13 | 每簇扇区数 | `fat_spc` |
-| 14 | 保留扇区数(FAT 表从这后面开始) | `fat_reserved` |
-| 16 | FAT 份数(通常 2) | `fat_nfats` |
-| 17 | 根目录项数(每项 32 字节) | `fat_root_ents` |
-| 22 | 每份 FAT 占几扇区(**0 = 这是 FAT32**,FAT32 用下面 36/44/48 的字段) | `fat_size` |
-| 36 | FAT32:每份 FAT 占几扇区(32 位) | `fat_size` |
-| 44 | FAT32:根目录首簇(根也是一条簇链) | `fat_root_cluster` |
-| 48 | FAT32:FSInfo 扇区号 | `fat_fsinfo` |
-| 510 | 0xAA55 签名(对不上就不是引导扇区) | — |
+| 11 | bytes per sector (must be 512, otherwise give up) | `fat_bps` |
+| 13 | sectors per cluster | `fat_spc` |
+| 14 | reserved sectors (the FAT starts after these) | `fat_reserved` |
+| 16 | number of FATs (usually 2) | `fat_nfats` |
+| 17 | root-directory entries (32 bytes each) | `fat_root_ents` |
+| 22 | sectors per FAT (**0 = this is FAT32**; FAT32 uses the fields at 36/44/48 below) | `fat_size` |
+| 36 | FAT32: sectors per FAT (32-bit) | `fat_size` |
+| 44 | FAT32: root-directory first cluster (the root is a cluster chain too) | `fat_root_cluster` |
+| 48 | FAT32: FSInfo sector number | `fat_fsinfo` |
+| 510 | 0xAA55 signature (not this and it isn't a boot sector) | — |
 
-算出来的三个位置:`fat_fat_lba`(FAT 表)、`fat_root_lba`(根目录)、`fat_data_lba`(数据区起点),
-加上 `fat_spc` 就能把"簇号"翻译成"扇区号":`LBA = fat_data_lba + (簇 - 2) * fat_spc`。
-(簇 0 和 1 是 FAT 表自己用的保留值,所以数据簇从 2 开始。)
+Three computed locations: `fat_fat_lba` (the FAT), `fat_root_lba` (root directory), `fat_data_lba`
+(start of the data area); with `fat_spc` you can translate "cluster number" into "sector number":
+`LBA = fat_data_lba + (cluster - 2) * fat_spc`.
+(Clusters 0 and 1 are reserved values used by the FAT itself, so data clusters start at 2.)
 
-**判 FAT16 还是 FAT32 就看偏移 22 那个 16 位字段是不是 0** —— 这是规范里唯一的硬性区别,
-不用猜、也不用读分区表。认出来之后差别在四个地方(代码里都收在一个 `fat_fat32` 标志后面):
+**Telling FAT16 from FAT32 is just checking whether the 16-bit field at offset 22 is 0** — that's the
+only hard difference in the spec, no guessing and no partition table needed. Once it's known, the
+differences are in four places (all tucked behind one `fat_fat32` flag in the code):
 
 | | FAT16 | FAT32 |
 |---|---|---|
-| FAT 表项 | 2 字节 | 4 字节(高 4 位是保留位,读出来要 `& 0x0FFFFFFF`) |
-| 根目录 | 固定区域(`root_ents` × 32 字节) | 普通簇链,起点 = 偏移 44 里的簇号 |
-| 链尾门槛 | ≥ 0xFFF8 | ≥ 0x0FFFFFF8(`fat_eoc` 变量) |
-| 目录项里的首簇 | 偏移 +26(16 位) | +26 低 16 位 + **偏移 +20 高 16 位** |
+| FAT entry | 2 bytes | 4 bytes (top 4 bits reserved; mask with `& 0x0FFFFFFF` after reading) |
+| Root directory | fixed area (`root_ents` × 32 bytes) | ordinary cluster chain, starting at the cluster number in offset 44 |
+| End-of-chain threshold | ≥ 0xFFF8 | ≥ 0x0FFFFFF8 (`fat_eoc` variable) |
+| First cluster in a directory entry | offset +26 (16 bits) | low 16 bits at +26 + **high 16 bits at offset +20** |
 
-所以"找空目录项"、"沿目录链找名字"、"给目录加一簇"这些逻辑两种格式**一份代码就够**,
-只有 `fat_next_cluster` / `fat_set_entry` / `fat_alloc_cluster` / 取簇号的地方分了岔。
+So "find a free directory entry", "walk the directory chain looking for a name" and "add a cluster to
+a directory" need **only one body of code** for both formats; only `fat_next_cluster` /
+`fat_set_entry` / `fat_alloc_cluster` and the places that fetch a cluster number fork.
 
-函数一览:
+Function list:
 
-| 函数 | 干什么 |
+| Function | What it does |
 |---|---|
-| `fat_mount` | 读引导扇区,算好上面那些位置;`fat_ok` = 1 表示挂上了 |
-| `fat_name83` | 把 `"hello.bin"` 变成目录项里的 11 字节 `HELLO   BIN` |
-| `fat_find` | 在根目录里线性找这个名字,找到就记下**目录项所在的扇区和偏移** |
-| `fat_next_cluster` | 查 FAT 表里的下一簇(带一扇区的 FAT 缓存 `fat_cache_lba`) |
-| `fat_read_file` | 顺着簇链把文件读进内存,返回字节数(找不到返回 -1) |
-| `fat_set_entry` | 改一个 FAT 项,**两份 FAT 都写** |
-| `fat_alloc_cluster` | 找一个空闲簇,标记成链尾 |
-| `fat_write_file` | 写文件:有就覆盖,没有就新建(占一个目录项) |
-| `fat_list` | 列当前目录(名字 + 字节数,目录显示 `<DIR>`),`ls` 用的 |
-| `fat_chdir` | 进子目录(检查 attr bit4、取首簇),`cd` 用的 |
-| `fat_path` | 把 `DOCS/NOTE.TXT` 按 `/`(或 `\`)切开,逐层 `fat_chdir`,返回最后一段的指针 |
-| `fat_free_slot` | 在当前目录里找空目录项;子目录满了会自动往簇链上接一个新簇(先清零) |
-| `fat_mkdir` | 建目录:占空位 → 分簇 → 清簇 → 写 `.` 和 `..` → 目录项写回父目录 |
-| `fat_rmdir` | 删目录:先扫一遍确认只有 `.`/`..`(非空就拒绝),再释放整条簇链、父目录项标 0xE5 |
-| `fat_dotdot` | 从当前目录第一簇的 `..` 项里读父目录簇号(`cd ..` 用的) |
-| `fat_zero_cluster` | 把一簇全写 0(新目录要干净的簇) |
-| `fat_ent_cluster` | 从目录项里取首簇(FAT16 取 +26,FAT32 再拼 +20 的高位) |
+| `fat_mount` | read the boot sector and compute the locations above; `fat_ok` = 1 means mounted |
+| `fat_name83` | turn `"hello.bin"` into the 11 bytes `HELLO   BIN` in a directory entry |
+| `fat_find` | linear search for that name in the root directory, and when found remember **the sector and offset of the directory entry** |
+| `fat_next_cluster` | look up the next cluster in the FAT (with a one-sector FAT cache `fat_cache_lba`) |
+| `fat_read_file` | read a file into memory along its cluster chain, returning the byte count (-1 if not found) |
+| `fat_set_entry` | change a FAT entry, **writing both FAT copies** |
+| `fat_alloc_cluster` | find a free cluster and mark it end-of-chain |
+| `fat_write_file` | write a file: overwrite if it exists, create if not (taking one directory entry) |
+| `fat_list` | list the current directory (name + byte count, `<DIR>` for directories), used by `ls` |
+| `fat_chdir` | enter a subdirectory (check attr bit4, take the first cluster), used by `cd` |
+| `fat_path` | split `DOCS/NOTE.TXT` on `/` (or `\`), `fat_chdir` layer by layer, return a pointer to the last segment |
+| `fat_free_slot` | find a free directory entry in the current directory; when a subdirectory is full, chain a new (zeroed) cluster onto it |
+| `fat_mkdir` | create a directory: take a slot → allocate a cluster → zero it → write `.` and `..` → write the entry back into the parent |
+| `fat_rmdir` | remove a directory: scan first to confirm it only has `.`/`..` (refuse if not empty), then free the whole cluster chain and mark the parent entry 0xE5 |
+| `fat_dotdot` | read the parent cluster number from the `..` entry in the current directory's first cluster (used by `cd ..`) |
+| `fat_zero_cluster` | write a whole cluster of zeros (a new directory wants a clean cluster) |
+| `fat_ent_cluster` | get the first cluster from a directory entry (FAT16 takes +26; FAT32 also combines the high bits at +20) |
 
-### 5.2 子目录与路径
+### 5.2 Subdirectories and paths
 
-* `fat_dir` 就是"当前目录":**0 = 根目录**,其它值 = 该目录的首簇号。所有查找/列目录/
-  找空位都要先问它一句"根还是簇链",这三处的写法都是同一个岔路。
-* `.` 和 `..` 是真的写在盘上的目录项(建目录时就写好),`ls` 会把它们藏起来;
-  `cd ..` 就是读 `..` 项里的簇号 —— 顶层目录的 `..` 按 FAT 的老规矩填 0,也就是"根"。
-* shell 里每条命令执行前后会保存/恢复 `fat_dir`(分发命令的地方各存一次),
-  所以 `cat DOCS/X.TXT` 这种命令只是"借"用一下目录游标,不会把你的 `cd` 弄丢;
-  `cd` 自己会把新目录写回那份保存值。
-* `int 0x30` 的文件接口(7 读 / 8 写)也走 `fat_path`,所以 `cat`、`run`、编辑器、
-  vi 存盘都认 `DOCS/NOTE.TXT` 这种路径,而且相对**当前目录**:先 `cd DOCS` 再
-  `run VI NOTE.TXT`,存的还是 `DOCS/NOTE.TXT`。
+* `fat_dir` is "the current directory": **0 = root**, any other value = that directory's first
+  cluster. Every lookup/list/free-slot search has to ask it "root or cluster chain" first, and that
+  fork is written the same way in all three places.
+* `.` and `..` are real directory entries written on disk (written when the directory is created),
+  and `ls` hides them; `cd ..` just reads the cluster number in the `..` entry — a top-level
+  directory's `..` is filled with 0 by the old FAT convention, i.e. "root".
+* The shell saves/restores `fat_dir` before and after each command (a save at each dispatch point),
+  so a command like `cat DOCS/X.TXT` only "borrows" the directory cursor and won't lose your `cd`;
+  `cd` itself writes the new directory back into that saved copy.
+* The `int 0x30` file interface (7 read / 8 write) goes through `fat_path` too, so `cat`, `run`, the
+  editor and vi's save all accept paths like `DOCS/NOTE.TXT`, relative to the **current directory**:
+  `cd DOCS` and then `run VI NOTE.TXT` still saves `DOCS/NOTE.TXT`.
 
-### 5.3 shell 层的撞名提示(R/D/O)
+### 5.3 Collision prompt at the shell layer (R/D/O)
 
-`write`、`cp`、`mv` 真正落地之前会先查目标在不在(用 `fat_path` + `fat_stat`,
-FAT 名字不区分大小写)。在的话先打印
+Before `write`, `cp` and `mv` actually commit, they check whether the target exists (with `fat_path`
++ `fat_stat`; FAT names are case-insensitive). If it does, they print
 
 ```
 Found file with same filename. Rename / Don't write / Overwrite? (R/D/O)
 ```
 
-按键:`R` 再读一行新名字(回显、退格,Enter 结束),拿新名字重新查,撞了继续问;
-`D` 或 Esc 放弃(打印 `not written.`);`O` 覆盖。`/DEV` 虚拟设备和管道里的写不弹
-提示(管道要保持数据流干净);cp/mv 的目标是目录时,查的是最终落地文件
-`DIR/basename`。
+Keys: `R` reads a new name line (echo, backspace, Enter to finish), re-checks with the new name, and
+asks again if it collides; `D` or Esc gives up (prints `not written.`); `O` overwrites. Writes to
+`/DEV` virtual devices and writes inside a pipe don't prompt (pipes need a clean data stream); when
+cp/mv's target is a directory, the check is on the final file `DIR/basename`.
 
-### 写文件的完整流程
+### The full write path
 
 ```
-1. fat_find 找同名文件 → 找到就沿簇链把它标成空闲(相当于删掉旧内容)
-2. 重新从第一个空闲簇开始,一个簇一个簇地写:写数据 → fat_set_entry 串上链
-3. 新建的情况下,在根目录里占一个空目录项,填首簇号和文件大小
-4. 发 FLUSH CACHE
+1. fat_find looks for a file of the same name → if found, mark it free along its cluster chain (equivalent to deleting the old contents)
+2. restart from the first free cluster and write cluster by cluster: write data → fat_set_entry links it into the chain
+3. when creating, take a free directory entry in the root directory and fill in the first cluster and file size
+4. send FLUSH CACHE
 ```
 
-第 2 步里的 `fat_set_entry` 会**把两份 FAT 都改掉** —— FAT16 故意存两份就是防这个,
-只改一份的话文件系统在别的系统上看着就是坏的。测试里专门有一项离线断言盯着这点。
+The `fat_set_entry` in step 2 **changes both FAT copies** — FAT16 deliberately keeps two as protection
+against exactly this; change only one and the filesystem looks corrupt to other systems. One offline
+assertion in the tests watches this specifically.
 
-### 限制(想扩展就从这里挑)
+### Limits (pick from here if you want to extend it)
 
-* 名字支持 8.3 + VFAT 长文件名(写入时按 LFN 校验和补长名目录项;8.3 别名取自然截断/`~N`);
-* 不写时间戳(目录项里那几字节留着 0);
-* 覆盖写文件时旧的簇链没释放(会漏簇;数据没错,"盘上多占几个簇");
-* FSInfo 只读进来放着,写盘时不更新它(其它系统只是少个"还有多少空闲"的提示);
-* 写文件不做"磁盘满"以外的错误恢复,也不检查簇是不是真的空闲(`fat_alloc_cluster` 只看
-  FAT 项是不是 0)。
+* names support 8.3 + VFAT long file names (when writing, long-name entries are added with LFN
+  checksums; the 8.3 alias is a natural truncation/`~N`);
+* no timestamps are written (those bytes in the directory entry stay 0);
+* overwriting a file doesn't free the old cluster chain (leaks clusters; data is fine, "the disk just
+  occupies a few extra clusters");
+* FSInfo is only read in and kept; it isn't updated when writing (other systems just miss a "how much
+  is free" hint);
+* writing does no error recovery beyond "disk full", and doesn't check whether a cluster is really
+  free (`fat_alloc_cluster` only looks at whether the FAT entry is 0).
 
-## 6. 往镜像里放文件:`tools/mkfat.py`
+## 6. Putting files into the image: `tools/mkfat.py`
 
 ```bash
 python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \
@@ -242,23 +267,27 @@ python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \
     BIN/HELLO.BIN=build/HELLO.BIN
 ```
 
-* 第 2 个参数是分区起始 LBA(必须和 `FAT_PART_LBA` 一致),第 3 个是分区大小(MB);
-* 后面全是 `镜像里的名字=宿主机上的文件`;
-* 每簇几个扇区是**自动挑**的:`mkfat.py` 会算一遍让簇数落在 FAT16 要求的
-  `[4085, 65525)` 里(8 MB 时是 2 扇区/簇,数据区起点 LBA 6241,8143 个簇);
-* 名字以 `/` 结尾 = 建目录;名字里带 `/` 的文件会自动把父目录建出来
-  (系统镜像就是这么分层的:根目录只放 `BIN/ LIB/ SYS/ DOCS/ SRC/ TEST/ DEV/ MNT/ INCLUDE/` 九个分类目录,
+* the 2nd argument is the partition's starting LBA (must match `FAT_PART_LBA`), the 3rd is the
+  partition size (MB);
+* everything after that is `name-in-image=file-on-host`;
+* sectors per cluster is **picked automatically**: `mkfat.py` computes it so the cluster count lands
+  in the `[4085, 65525)` range FAT16 requires (for 8 MB that's 2 sectors/cluster, data area starting
+  at LBA 6241, 8143 clusters);
+* a name ending in `/` = create a directory; a file name containing `/` creates its parent directories
+  automatically
+  (that's how the system image is layered: the root directory only holds `BIN/ LIB/ SYS/ DOCS/ SRC/ TEST/ DEV/ MNT/ INCLUDE/` nine category directories,
 
 ```bash
 python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \
     DOCS/README.TXT=progs/README.TXT DOCS/ DOCS/NOTE.TXT=progs/NOTES.TXT
 ```
 
-### FAT32 分区
+### FAT32 partitions
 
-加 `--fat32`:同一条命令行、同一个内核,只是分区按 FAT32 格式化(保留 32 扇区、
-4 字节 FAT 表项、根目录 = 簇 2 + FSInfo/备份引导扇区)。
-FAT32 规定**簇数至少 65525**,8 MB 的分区怎么调都凑不够,所以镜像得开大:
+Add `--fat32`: same command line, same kernel, just the partition formatted as FAT32 (32 reserved
+sectors, 4-byte FAT entries, root directory = cluster 2 + FSInfo/backup boot sector). FAT32 requires
+**at least 65525 clusters**, and an 8 MB partition can't reach that no matter how you tune it, so the
+image has to grow:
 
 ```bash
 python3 tools/mkimg.py build/boot.bin build/stub.bin build/kernel.bin build/kkernel-hd32.img \
@@ -267,40 +296,46 @@ python3 tools/mkfat.py build/kkernel-hd32.img 6144 88 --fat32 DOCS/README.TXT=pr
     DOCS/ DOCS/NOTE.TXT=progs/NOTES.TXT
 ```
 
-`make hd32` / `make test-hd32` 就是这两步。为什么会自动挑成 2 扇区/簇:
-`mkfat.py` 从 32 扇区/簇往下试,第一个"簇数 ≥ 65525"的就被选中。
+`make hd32` / `make test-hd32` are those two steps. Why it automatically picks 2 sectors/cluster:
+`mkfat.py` tries from 32 sectors/cluster downwards and the first one with "cluster count ≥ 65525"
+wins.
 
-`make hd` 会自动跑这一步(`Makefile` 里 `$(HDIMG)` 规则),所以平时只要:
+`make hd` runs this step automatically (the `$(HDIMG)` rule in the `Makefile`), so normally you just:
 
 ```bash
-make hd          # 构建 + 直接启动完整硬盘镜像
-# 或者
+make hd          # build + boot the full hard-disk image
+# or
 ./tools/run.sh --hd
 ```
 
-## 7. 怎么验证它是真的(不是"看起来对")
+## 7. How to verify it's real (not "it looks right")
 
-磁盘相关的测试都在 `tests/qemu_test.py` 的 `--fontdisk` 档案里(`make test-hd-font`),
-它用**两条互不相干的信道**:
+All the disk tests live in the `--fontdisk` profile of `tests/qemu_test.py` (`make test-hd-font`), and
+they use **two independent channels**:
 
-**信道一:屏幕像素。** QEMU 无头跑,`monitor` 抓 `screendump`,把期望的文字用
-`font/full-kkf.bin` 在 Python 里渲染成"有墨/无墨"网格,再去截图里找这个图案。
-这条证明"内核认为自己显示出来了"。
+**Channel one: screen pixels.** QEMU runs headless, `monitor` grabs a `screendump`, then the expected
+text is rendered with `font/full-kkf.bin` in Python into an "ink/no-ink" grid, and that pattern is
+looked for in the screenshot. This proves "the kernel thinks it displayed it".
 
-**信道二:离线解析镜像。** 测试跑完先把 QEMU 关掉(让它落盘),然后**不看内核**,
-用 `qemu_test.py` 里那个 70 行的 `Fat16` 类(纯 Python,自己算引导扇区字段、
-自己走簇链;它同样按"偏移 22 是不是 0"认 FAT32)把镜像当块设备读一遍,断言:
+**Channel two: offline image parsing.** After the test, QEMU is shut down first (so it flushes), and
+then **without looking at the kernel**, the 70-line `Fat16` class in `qemu_test.py` (pure Python:
+computes the boot-sector fields itself, walks the cluster chain itself; it also identifies FAT32 by
+"is offset 22 zero") reads the image as a block device and asserts:
 
-* `TEST.TXT` 真的出现在根目录里,内容真的是 `hello-from-fat16`(这是 shell 里
-  `write test.txt hello-from-fat16` 写进去的);
-* 子目录里的东西也对:`DOCS/NOTE.TXT` 和 `progs/NOTES.TXT` 字节一致、
-  `DOCS/SUBFILE.TXT` 是 shell 里 `cd DOCS` 之后 `write` 出来的、`TESTDIR/INNER.TXT`
-  是在二级目录里写的、`rmdir` 删掉的空目录真的从根目录消失了;
-* 两份 FAT 里那个簇项都是"链尾",也就是**两份 FAT 都被更新了**;
-* 镜像里原来的 `DOCS/README.TXT` / `BIN/HELLO.BIN` / `BIN/COUNT.BIN` 字节和仓库里的源文件**一模一样**;
-* LBA 2047 的字库描述块 + LBA 2048 起的字库和 `font/full-kkf.bin` 字节一致。
+* `TEST.TXT` really is in the root directory, and its content really is `hello-from-fat16` (written
+  from the shell with `write test.txt hello-from-fat16`);
+* stuff in subdirectories is right too: `DOCS/NOTE.TXT` and `progs/NOTES.TXT` are byte-identical,
+  `DOCS/SUBFILE.TXT` was written by `write` after `cd DOCS` in the shell, `TESTDIR/INNER.TXT` was
+  written in a second-level directory, and the empty directory removed with `rmdir` really is gone
+  from the root;
+* the cluster entry in **both** FATs is end-of-chain, i.e. **both FATs were updated**;
+* the image's original `DOCS/README.TXT` / `BIN/HELLO.BIN` / `BIN/COUNT.BIN` are **byte-for-byte
+  identical** to the source files in the repo;
+* the font descriptor block at LBA 2047 and the font from LBA 2048 are byte-identical to
+  `font/full-kkf.bin`.
 
-这条证明"字节真的落在磁盘上了" —— 内核自己打印的 `wrote test.txt` 不算证据。
+This proves "the bytes really landed on the disk" — the kernel's own `wrote test.txt` is not evidence.
 
-`make test-hd32` 是同一套断言跑在 FAT32 镜像上(外加一项"开机信息里认出的是 FAT32"),
-同一个内核、同一份解析器,所以"FAT16 能跑但 FAT32 只是摆设"这种情况跑不出来。
+`make test-hd32` runs the same assertions on a FAT32 image (plus one "boot reports FAT32"), with the
+same kernel and the same parser, so the situation "FAT16 works but FAT32 is just decoration" can't
+slip through.

@@ -1,63 +1,66 @@
-# 参与开发（怎么改）
+[简体中文](zh-CN/hacking.md)
 
-> 原为 README §8。
+# Hacking (how to make changes)
 
+> Originally README §8.
 
+After a change, run `make`, then `./tools/run.sh --hd` to see the result.
 
-改完 `make` 一下,`./tools/run.sh --hd` 就能看到效果。
-
-## 8.1 加一个自己的程序(最推荐)
+## 8.1 Add a program of your own (most recommended)
 
 ```bash
-cp progs/HELLO.asm progs/MYPROG.asm     # 改吧
-make                                    # Makefile 会自动编 progs/*.asm
+cp progs/HELLO.asm progs/MYPROG.asm     # hack away
+make                                    # the Makefile builds progs/*.asm automatically
 python3 tools/mkfat.py build/kkernel-hd.img 6144 8 MYPROG.BIN=build/MYPROG.BIN
-make hd                                 # 或者在 Makefile 的 PROGS 里加一行,让 make hd 自动带上
+make hd                                 # or add a line to PROGS in the Makefile so make hd includes it
 > run MYPROG
 ```
 
-接口、约定、例子都在 **[docs/programs.md](docs/programs.md)**。
+Interfaces, conventions and examples are all in **[docs/programs.md](programs.md)**.
 
-## 8.2 写个全屏程序(计算器/编辑器就是这么来的)
+## 8.2 Write a full-screen program (this is how the calculator/editor came about)
 
-想要"自己清屏、自己排版"的程序,用第 6/9/10/11/12/13 号功能:
-清屏、定位、读键事件(方向键)、问屏幕尺寸、取参数、在指定位置画字。
-`progs/CALC.asm`(300 行)和 `progs/EDIT.asm`(400 行)就是照这个套路写的,
-三条踩过的经验写在 [docs/programs.md 第 6 节](docs/programs.md)。
+For a program that "clears the screen and lays itself out", use functions 6/9/10/11/12/13:
+clear the screen, position the cursor, read key events (arrow keys), ask for the screen size, fetch
+arguments, draw text at a given position. `progs/CALC.asm` (300 lines) and `progs/EDIT.asm`
+(400 lines) were written exactly this way, and the three lessons learned are in section 6 of
+[docs/programs.md](programs.md).
 
-## 8.3 改开机那句话
+## 8.3 Change the boot message
 
-`kernel/kmain.asm` 最下面的数据区,`msg_title` 就是第一行:
+In the data area at the bottom of `kernel/kmain.asm`, `msg_title` is the first line:
 
 ```asm
-msg_title   db 'KKernel - stage 5', 10, 0     ; 10 = 换行,0 = 字符串结束
+msg_title   db 'KKernel - stage 5', 10, 0     ; 10 = newline, 0 = end of string
 ```
 
-中文也直接写(字符串是 UTF-8,图形模式下能显示;文本模式会成乱码,见 6.8)。
+Chinese works there too (the string is UTF-8 and displays in graphics mode; in text mode it turns
+into mojibake, see 6.8).
 
-## 8.4 加一条 shell 命令
+## 8.4 Add a shell command
 
-三处,都在 `kernel/shell.asm`:
+Three places, all in `kernel/shell.asm`:
 
 ```asm
-; 1) 写处理函数(想打印就用 term_print,想读参数用 [cmd_arg])
+; 1) write the handler (use term_print to print, [cmd_arg] to read arguments)
 cmd_hi:
     mov esi, msg_hi
     call term_print
     ret
 
-msg_hi db 'hi there', 10, 0                 ; 2) 加字符串
+msg_hi db 'hi there', 10, 0                 ; 2) add the string
 
-; 3) 在命令表里登记(名字 + 处理函数)
+; 3) register it in the command table (name + handler)
 n_hi db 'hi', 0
 cmd_table:
     dd n_hi, cmd_hi
     ...
 ```
 
-命令名匹配是**整词**比较(`str_eq`),所以 `page` 不会被 `pa` 之类误命中。
+Command-name matching is a **whole-word** comparison (`str_eq`), so `page` won't be caught by `pa` or
+the like.
 
-## 8.5 往镜像里放个文件
+## 8.5 Put a file into the image
 
 ```bash
 python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \
@@ -66,78 +69,86 @@ make hd
 > cat DOCS/NOTES.TXT
 ```
 
-参数含义、为什么是 6144、每簇几个扇区怎么选的,见
-[docs/filesystem.md 第 6 节](docs/filesystem.md)。
+For what the arguments mean, why 6144, and how the sectors per cluster are chosen, see section 6 of
+[docs/filesystem.md](filesystem.md).
 
-## 8.6 改分页怎么映射
+## 8.6 Change how paging maps things
 
-`kernel/paging.asm` 顶部那两张页表是**开机固定**的;恒等映射 0~ident(最多 256 MiB),
-4 MiB 以上的页表页运行时从页池拿:
+The two page tables at the top of `kernel/paging.asm` are **fixed at boot**; identity mapping covers
+0~ident (up to 256 MiB), and page-table pages above 4 MiB are taken from the page pool at run time:
 
 ```asm
-PD_ADDR     equ 0x1000     ; 页目录
-PT_LOW      equ 0x2000     ; 恒等 0-4 MiB
-PT_LFB      equ 0x4000     ; VBE 帧缓冲窗口
-; 4 MiB 以上的恒等页表:没有固定地址,运行时 pmem_alloc 一页一页拿
+PD_ADDR     equ 0x1000     ; page directory
+PT_LOW      equ 0x2000     ; identity 0-4 MiB
+PT_LFB      equ 0x4000     ; VBE framebuffer window
+; identity page tables above 4 MiB: no fixed address, pmem_alloc grabs a page at a time at run time
 ```
 
-想玩"虚拟地址 ≠ 物理地址"不用改代码,shell 里现成有:
+To play with "virtual address ≠ physical address" you don't have to change any code; the shell has it
+ready-made:
 
 ```
-> debug pmap 0x8000000     ← 从页池拿一页(4 MiB 以上),现建页表映到 128 MiB 那个虚拟地址
-> debug page 0x8000000     ← 看 PDE/PTE:虚拟 0x08000000、物理 0x00400000
-> debug pumap 0x8000000    ← 解映射并把页还回去
-> debug ptest        ← 一个命令跑完整个流程(分配→建表→读写→归还),还会检查页池有没有泄漏
+> debug pmap 0x8000000     ← take a page from the pool (above 4 MiB) and build a page table mapping it at virtual 128 MiB
+> debug page 0x8000000     ← look at the PDE/PTE: virtual 0x08000000, physical 0x00400000
+> debug pumap 0x8000000    ← unmap and give the page back
+> debug ptest        ← one command runs the whole cycle (alloc → build tables → read/write → return) and also checks the pool for leaks
 ```
 
-要加一个"固定的自定义映射",在 `paging_init` 末尾照 LFB 那段写就行;
-`paging_map(va, pa, flags)` 和 `paging_unmap(va)` 是内核里的动态接口
-(`kernel/paging.asm`,页表不够会自己找 `pmem_alloc` 要页)。想让它"映了但不许写",
-把 flags 里的 `PAGE_RW` 去掉,写它就会吃 13 号通用保护异常。
+To add a "fixed custom mapping", write it at the end of `paging_init` following the LFB block;
+`paging_map(va, pa, flags)` and `paging_unmap(va)` are the dynamic interfaces in the kernel
+(`kernel/paging.asm`; if the page tables run short it asks `pmem_alloc` for pages itself). To make a
+mapping "mapped but not writable", drop `PAGE_RW` from the flags and writing to it takes general
+protection exception 13.
 
-想改"程序能用多大内存"看 `paging.asm` 顶部的 `SPACE_IMG_PAGES` / `SPACE_HEAP_PAGES`
-—— 镜像窗口是常量 96 页,堆窗口页数是运行时变量 `space_heap_pages`(参数页/栈顶
-`space_args_va`/`space_stack_va`/`space_user_stack_top` 也是运行时算的),建空间时一页都不给,
-是程序碰到才补。想知道它是怎么补的,从 `page_fault_try_handle` 看起;
-想关掉按需分页回到"一次给满",在 `space_create` 里把清页表那几行换成
-`paging_map` 逐页映上去就行(老版本就是这么写的,git 历史里能翻到)。
-`cmd_run` 里那几步一眼能认出来:建空间 → 写镜像大小 → 切 CR3 跑 → `space_destroy` 归还。
+To change "how much memory a program can use", look at `SPACE_IMG_PAGES` / `SPACE_HEAP_PAGES` at the
+top of `paging.asm` — the image window is a constant 96 pages, the heap-window page count is the
+runtime variable `space_heap_pages` (the argument page / stack top `space_args_va` / `space_stack_va`
+/ `space_user_stack_top` are computed at run time too), and creating a space hands out no pages at
+all: pages are faulted in when the program touches them. To see how that works, start from
+`page_fault_try_handle`; to turn demand paging off and go back to "give it all up front", replace the
+page-table-clearing lines in `space_create` with `paging_map` calls mapping page by page (that's how
+the old version did it; it's in the git history). The steps in `cmd_run` are easy to spot: create the
+space → write the image size → switch CR3 and run → `space_destroy` to give it back.
 
-## 8.7 让 panic 屏显示更多
+## 8.7 Make the panic screen show more
 
-`kernel/idt.asm` 里 `isr_common` 就是那个"红屏 + 停机"。异常帧里的东西都在栈上:
+`isr_common` in `kernel/idt.asm` is that "red screen + halt". Everything in the exception frame is on
+the stack:
 
 ```
-[ebp+32]=向量号  [ebp+36]=错误码  [ebp+40]=EIP  [ebp+44]=CS  [ebp+48]=EFLAGS
+[ebp+32]=vector  [ebp+36]=error code  [ebp+40]=EIP  [ebp+44]=CS  [ebp+48]=EFLAGS
 ```
 
-想再打 `CR3`、`DS`、或者页表项,照着 `mov eax, cr2 / call term_print_hex` 那样加一行就行。
+To print `CR3`, `DS` or page-table entries as well, add a line following
+`mov eax, cr2 / call term_print_hex`.
 
-## 8.8 用 C 写程序
+## 8.8 Write programs in C
 
-`make cc-check` 看看工具链在不在,然后往 `progs/` 里丢一个 `.c`,把名字加进
-`Makefile` 的 `C_PROGS`,再 `make hd`。接口、内存布局、迷你 libc 有什么没有什么,
-都在 [docs/c-programs.md](docs/c-programs.md);`progs/CHELLO.c` 是现成例子。
+Run `make cc-check` to see whether the toolchain is there, then drop a `.c` into `progs/`, add the
+name to `C_PROGS` in the `Makefile`, and `make hd`. Interfaces, memory layout, and what mini-libc
+does and doesn't have are all in [docs/c-programs.md](c-programs.md); `progs/CHELLO.c` is a
+ready-made example.
 
-## 8.9 想看汇编到底编成了什么
+## 8.9 See what the assembly actually assembled into
 
 ```bash
-make lst        # 生成 build/boot.lst 和 build/kernel.lst(带机器码的反汇编)
-qemu ... -s -S  # 配合 gdb:target remote :1234(或 ./tools/run.sh --gdb)
+make lst        # produces build/boot.lst and build/kernel.lst (disassembly with machine code)
+qemu ... -s -S  # with gdb: target remote :1234 (or ./tools/run.sh --gdb)
 ```
 
-## 8.10 推送到 GitHub(国内网络时通时不通)
+## 8.10 Pushing to GitHub (the network in China comes and goes)
 
-手动 `git push` 碰上 GitHub 抽风就得干等。用现成的脚本:
+When a manual `git push` runs into one of GitHub's bad days, you just have to sit and wait. Use the
+ready-made script:
 
 ```bash
-tools/onekey_push.sh --dry-run                       # 先看看要推什么
-GH_TOKEN=ghp_xxx tools/onekey_push.sh                # 带上 PAT 推(失败自动重试)
-tools/onekey_push.sh                                 # 配过 credential.helper / SSH 时直接推
+tools/onekey_push.sh --dry-run                       # see what would be pushed first
+GH_TOKEN=ghp_xxx tools/onekey_push.sh                # push with a PAT (retries automatically on failure)
+tools/onekey_push.sh                                 # push directly when credential.helper / SSH is set up
 tools/onekey_push.sh --branch dev --retry 8 --sleep 15
 ```
 
-token 只从环境变量 `GH_TOKEN` 读,**不写进 config、不落盘**。想长期免输入可以
-`git config --global credential.helper store`(明文存 `~/.git-credentials`),
-或者干脆每次拷进环境变量。
-
+The token is read only from the `GH_TOKEN` environment variable; it is **never written to config and
+never touches disk**. For long-term password-free pushes you can
+`git config --global credential.helper store` (stores `~/.git-credentials` in plain text), or just
+copy the token into the environment variable each time.

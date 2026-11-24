@@ -1,45 +1,38 @@
-# PCI:怎么知道机器上插了什么
+[简体中文](zh-CN/pci.md)
 
-USB 键盘、网卡这些东西在 x86 上都不是"固定的端口",而是挂在 **PCI 总线**上的。
-想写 USB 驱动,第一件事就是先把总线枚举出来:找到 USB 控制器、读它的寄存器窗口。
-KKernel 的 `kernel/pci.asm` 就干这一件事,开机扫一遍,shell 里用 `pci` 看。
+# PCI: Finding Out What's Plugged Into the Machine
 
-## 机制 #1:两个端口搞定配置空间
+Things like USB keyboards and network cards aren't at "fixed ports" on x86 — they hang off the **PCI bus**. The first thing you do when writing a USB driver is enumerate that bus: find the USB controller and read its register window. KKernel's `kernel/pci.asm` does exactly that one job; it scans once at boot, and the shell's `pci` command shows you the result.
 
-PCI 设备内部有一块 256 字节的"配置空间"(前 64 字节是标准头)。访问它只要两个 I/O 端口:
+## Mechanism #1: Two Ports Cover the Configuration Space
 
-| 端口 | 干什么 |
+A PCI device has a 256-byte "configuration space" inside it (the first 64 bytes are the standard header). Two I/O ports are all you need to get at it:
+
+| Port | What it does |
 |---|---|
-| `0xCF8` | 写 32 位"地址":bit31 = 1(开),bit16~23 = 总线号,bit11~15 = 设备号,bit8~10 = 功能号,bit0~7 = 寄存器偏移(4 字节对齐) |
-| `0xCFC` | 读写 32 位数据 |
+| `0xCF8` | write a 32-bit "address": bit31 = 1 (enable), bits16~23 = bus number, bits11~15 = device number, bits8~10 = function number, bits0~7 = register offset (4-byte aligned) |
+| `0xCFC` | read/write 32-bit data |
 
-所以读一个寄存器就三步:拼地址 → `out 0xCF8` → `in 0xCFC`。
-**最容易踩的坑是忘了 bit31**:忘了它 CPU 根本不发起配置周期,读回来全是 0,
-而且不报错([踩坑笔记](pitfalls.md) 的 6.26)。
+So reading one register is three steps: build the address → `out 0xCF8` → `in 0xCFC`. **The trap most people fall into is forgetting bit31**: without it the CPU never starts a configuration cycle, every read comes back 0, and nothing reports an error ([pitfalls](pitfalls.md) 6.26).
 
-## 扫总线:别忘了"兄弟功能"
+## Scanning the Bus: Don't Forget the "Sibling Functions"
 
-枚举顺序:总线 0 → 设备 0~31 → 每个设备的 功能 0~7。
+Enumeration order: bus 0 → devices 0~31 → functions 0~7 of each device.
 
-- 先读 offset 0 的 32 位:**厂商号 0xFFFF = 这里没设备**(空槽位返回的是 0xFFFF,不是 0)。
-- 有设备就读 offset 0x0C 的 header type;**bit7 = 1 说明是"多功能设备"**,
-  这时候 func 1~7 都要扫 —— 机器上的 IDE(00:01.1)、USB(00:01.2)就是 ISA 桥(00:01.0)
-  的功能,只扫 func 0 会一个都看不见([踩坑笔记](pitfalls.md) 的 6.27)。
+- Read the 32 bits at offset 0 first: **vendor ID 0xFFFF = no device here** (an empty slot returns 0xFFFF, not 0).
+- If there is a device, read the header type at offset 0x0C; **bit7 = 1 means it's a "multi-function device"**, and then functions 1~7 all have to be scanned — the machine's IDE (00:01.1) and USB (00:01.2) are functions of the ISA bridge (00:01.0), so scanning only function 0 would show you none of them ([pitfalls](pitfalls.md) 6.27).
 
-设备名里那串 `8086:7010` 就是"厂商号:设备号"(8086 = Intel)。类别号(offset 0x0B/0x0A,
-比如 `01.01` = IDE、`0C.03` = USB UHCI、`03.00` = 显卡)用来认它是什么东西。
+The `8086:7010` in a device name is "vendor ID:device ID" (8086 = Intel). The class code (offset 0x0B/0x0A — e.g. `01.01` = IDE, `0C.03` = USB UHCI, `03.00` = display) tells you what kind of thing it actually is.
 
-## BAR:设备的寄存器窗口
+## BARs: A Device's Register Windows
 
-设备头里 offset 0x10 起有 6 个 **BAR(Base Address Register)**,每个 4 字节:
+From offset 0x10 in the device header there are 6 **BARs (Base Address Registers)**, 4 bytes each:
 
-- 读它的**低位**就知道是内存窗口还是 I/O 窗口:`bit0 = 1` = I/O 端口,`= 0` = 内存地址。
-- 想要**大小**:把这个 BAR 写全 1、再读回来,不受影响的那些位就是"设备要用的位",
-  反推即可(内存 BAR 还要清掉低 4 位的标志位)。量完把原值写回去。
-  ⚠️ 我们**只这么量内存 BAR**:实测拿 I/O BAR 这么干一次,整台 QEMU 的配置空间
-  都会变得读不动([踩坑笔记](pitfalls.md) 的 6.32),而 I/O BAR 的基址已经够用了。
+- The **low bit** tells you whether it's a memory window or an I/O window: `bit0 = 1` = I/O port, `= 0` = memory address.
+- To get the **size**: write all 1s to the BAR and read it back; the bits that didn't change are the ones "the device needs" — invert from there (for a memory BAR, also mask off the low 4 flag bits). Write the original value back when you're done.
+  ⚠️ We **only do this to memory BARs**: in testing, doing it once to an I/O BAR made the whole of QEMU's configuration space unreadable ([pitfalls](pitfalls.md) 6.32), and the base address an I/O BAR reports is good enough anyway.
 
-## 命令怎么用
+## Using the Command
 
 ```
 > pci
@@ -63,27 +56,25 @@ pci: 7 device(s) found on bus 0
  BAR5    --
 ```
 
-地址写法是 `总线:设备.功能`,认不出来(比如写了不存在的设备)会直接告诉你。
+The address syntax is `bus:device.function`; if it can't make sense of it (you name a device that doesn't exist, say) it tells you straight away.
 
-![pci 命令截图](screenshot-pci.png)
+![pci command screenshot](screenshot-pci.png)
 
-## 以后要往哪走
+## Where to Go From Here
 
-| 步 | 干什么 | 会踩什么 |
+| Step | What to do | What you'll trip over |
 |---|---|---|
-| ① PCI 枚举 | ✅ 已经能列出设备、读 BAR | bit31、多功能设备、0xFFFF([踩坑笔记](pitfalls.md) 的 6.26~6.29) |
-| ② UHCI 初始化 | 打开控制器:复位、把帧列表(1024 项)和异步队列头挂上去 | 那是**物理地址**,得放在恒等映射区(0~ident)里 |
-| ③ EP0 控制传输 | 8 字节的 SETUP 包 + 数据 + 握手,这是第一次真的"发 DMA" | 缓冲区必须**物理连续**;USB 是**小端**,描述符要按位拆 |
-| ④ HID 键盘 | 中断传输 + 轮询:键码在"报告"里,不是 PS/2 扫描码 | 报告长度不同、修饰键是 bitmask,得单独做一张翻译表 |
-| ⑤ EHCI / 大容量存储 | 高速设备 + SCSI 子集(读块要走 CBW/CSW) | 是"每一帧一大串描述符",和 UHCI 的差别很大 |
+| ① PCI enumeration | ✅ can already list devices and read BARs | bit31, multi-function devices, 0xFFFF ([pitfalls](pitfalls.md) 6.26~6.29) |
+| ② UHCI init | power up the controller: reset it, then hang the frame list (1024 entries) and the async queue head off it | those are **physical addresses**, so they have to live in the identity-mapped region (0~ident) |
+| ③ EP0 control transfers | an 8-byte SETUP packet + data + handshake; this is the first time you really "send DMA" | buffers must be **physically contiguous**; USB is **little-endian**, so descriptors have to be pulled apart bit by bit |
+| ④ HID keyboard | interrupt transfers + polling: the key code is in the "report", not a PS/2 scancode | report lengths differ and modifier keys are a bitmask, so you need a translation table of your own |
+| ⑤ EHCI / mass storage | high-speed devices + the SCSI subset (reading blocks goes through CBW/CSW) | it's "a whole string of descriptors per frame", very different from UHCI |
 
-好消息是 x86 PC 上**不需要管缓存一致性**:CPU 和 PCI 共用同一块物理内存,
-DMA 缓冲区只要在恒等映射区(0~ident)之内就直接能读能写。
+The good news is that on an x86 PC **you don't have to worry about cache coherency**: the CPU and PCI share the same physical memory, so a DMA buffer is directly readable and writable as long as it sits inside the identity-mapped region (0~ident).
 
-## 现在的限制
+## Current Limitations
 
-- 只扫 **bus 0**:桥后面(比如 PCIe 后面)的总线看不到
-- 中断号只读得出来,**IDT 里还没有对应的门**,所以 USB 现在只能轮询
-- I/O BAR 不给大小(原因见 [踩坑笔记](pitfalls.md) 的 6.32);个别内存 BAR 会偏大(VGA 的 BAR2 我们量出 64 KiB,
-  QEMU 的 `info pci` 说 4 KiB)
-- 配置空间只读不改:枚举时只会打开 I/O / MMIO / Bus Master 三个开关
+- Only **bus 0** is scanned: buses behind bridges (behind PCIe, say) are invisible
+- Interrupt numbers can be read out, but **there is no corresponding gate in the IDT yet**, which is why USB can only poll for now
+- I/O BARs don't report a size (reason in [pitfalls](pitfalls.md) 6.32); a few memory BARs come out too large (we measure VGA's BAR2 as 64 KiB, QEMU's `info pci` says 4 KiB)
+- Configuration space is read-only: enumeration only ever flips three switches — I/O, MMIO and Bus Master

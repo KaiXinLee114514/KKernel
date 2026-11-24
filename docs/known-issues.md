@@ -1,302 +1,179 @@
-# 已知问题(和它们的现状)
-
-这份文件只记**确认存在、还没修**的问题 —— 免得下次(或者别人)又踩一遍,
-也免得我们把它当成"应该没事"给忘了。
-
-## 1. 帧缓冲终端:滚屏之后花屏(已修,2026-10)
+[简体中文](zh-CN/known-issues.md)
 
-**现在长输出滚屏是干净的**:`cat DOCS/README.TXT`(2 KB 多中文)连滚好几屏之后,
-屏幕照样一行一行对齐、读屏工具照样认得出来(hd 套件里有专门的断言
-「长中文滚屏之后屏幕还能读」)。这段留在这里当记录。
+# Known Issues (and Where They Stand)
 
-当时的症状:`cat DOCS/README.TXT` 之后屏幕就花了 —— 旧内容和 `?` 混在一起,按字符格读屏读不出来。
-查下来是**两个**问题:
+This file records only **confirmed problems that are still unfixed** — so the next person (or we ourselves) doesn't step on them again, and so we don't forget them as "probably fine".
 
-1. **格子对齐**:600 像素 ÷ 16 = 37.5,原来 `fb_newline` 把底边夹到 `600-16 = 584`,
-   而 `584 % 16 = 8` —— 一旦滚屏,新写的每一行都比滚上去的旧行低 8 像素,
-   于是"两代文字叠在一起"(QEMU 里是上下半行重影,VirtualBox 里相位越滚越乱、整屏花掉)。
-   现在先把屏幕高度按 16 向下对齐(`fb_height & ~15` → 592),再减一行 ⇒ 光标永远落在格子线上,
-   最下面那 8 像素不用。
-2. **它看起来像"渲染坏了",其实还有一半是测错了**:往 VBE 帧缓冲写字在 QEMU 里是 **MMIO**,
-   一个像素一次内存操作,画满一屏 2 KB 中文要好几秒。测试台原来"敲完命令 sleep 0.9 秒"就抓屏断言,
-   抓到的经常是**画到一半**的屏幕 —— 于是表现为"17 条断言挂掉"。
-   现在抓屏前会等屏幕静下来(连续两次抓屏一样)、断言用轮询,见 [踩坑笔记](pitfalls.md) 的 6.34。
-
-**顺手的收益**:修好对齐 + 等画完之后,同一批断言全绿,不用再"分几次看大文件"了。
-
-
-## 2. 蜂鸣器:VBox 里听不见,时值也是估的,音量还没法调(已知,这次不修)
+## 1. Framebuffer terminal: garbled screen after scrolling (fixed, 2026-10)
 
-**现状**
-
-1. **VirtualBox 不仿真 PC 扬声器。** `run PLAY MYSONG.TXT` 在 VBox 里跑得完全正常
-   (谱子照样解析、屏幕照样滚),就是**没有声音** —— VBox 从来没做 PIT 通道 2 + `0x61`
-   那套 PC 喇叭仿真(它只认 AC'97/HDA 声卡)。QEMU 有,但 **7.0 以后默认不接音频后端**,
-   得显式写 `-machine pcspk-audiodev=snd0 -audiodev pa,id=snd0` 才响
-   (完整命令在 [quickstart.md 第 8 节](quickstart.md))。测试里的 QEMU 是
-   `-display none` 且不带音频后端,所以**自动化测试断言不了声音**
-   (原来那条"`--list` 解析出音名"的断言随示例谱一起撤了)。
-2. **时值是估算的。** 这次没加 IRQ0/时钟:`beep` 的"毫秒"是数指令圈数忙等出来的
-   (`kernel/speaker.asm` 的 `SPKR_LOOPS_PER_MS`)。本机 QEMU(TCG)实测,标称 300 ms
-   实际等了 289~318 ms(±5%,宿主负载一变就抖),换台机器/开 KVM/跑真机会差好几倍。
-   音高**不受影响**:那是 PIT 硬件按 1193182 Hz 分频算出来的,宿主是谁都一样。
-3. **PC 蜂鸣器是方波,而且没有音量控制。** 硬件只有"响 / 不响"(`0x61` 那两位),
-   全音量下很刺耳,所以镜像里**默认不内置曲谱**(播放器还在,谱自己写)。想小声点只能在
-   宿主侧动手:调低系统音量,或者在宿主混音器(`wpctl` / `pavucontrol`)里把 QEMU 那条流
-   单独调小(`-audiodev pa,id=snd0,out.stream-name=KKernel` 起个认得出的名字)。
-   ★ **QEMU 侧没有音量参数**:`-audiodev pa,id=snd0,out.volume=0.2` 这种写法是错的,
-   QEMU 直接拒绝启动(`Parameter 'out.volume' is unexpected`,本机 10.0.11 实测;上游
-   QAPI 的 `AudiodevPerDirectionOptions` 只有 frequency / channels / voices / format /
-   buffer-length / mixing-engine)。完全不想出声就换后端:`-audiodev wav,id=snd0,path=/tmp/kk.wav`
-   (只录不响)或 `-audiodev none,id=snd0`。
-
-**要真做准(下一步)**
-
-在 `speaker_beep` 里读 **PIT 通道 0** 的计数器当时基(锁存:`out 0x43,0x00`;
-再连读两次 `0x40`),不需要中断,精度能到微秒级。代价是要假设通道 0 在跑
-(BIOS 起来之后确实是),再多几十行状态机 —— 按"玩具 OS,听着对就行"这次没做。
-
-**听着不对怎么办**
+**Long output now scrolls cleanly**: after `cat DOCS/README.TXT` (2 KB+ of Chinese) scrolls several screens, the screen is still aligned line by line and the screen reader still recognises it (the hd suite has a dedicated assertion, "the screen is still readable after long Chinese scrolling"). This section stays as a record.
 
-只改 `SPKR_LOOPS_PER_MS` 一个数:整体明显偏慢就调小,偏快就调大。音高(频率)不用动。
+The symptom at the time: after `cat DOCS/README.TXT` the screen was garbled — old content mixed with `?`, unreadable character cell by character cell. It turned out to be **two** problems:
 
-## 3. `rm` / `rmdir` 已经能用,还缺长文件名和一个"程序里的删除"
+1. **Cell alignment**: 600 pixels ÷ 16 = 37.5; `fb_newline` used to clamp the bottom to `600-16 = 584`, and `584 % 16 = 8` — once scrolling started, every new line sat 8 pixels lower than the line it replaced, so "two generations of text overlapped" (in QEMU, half-line ghosting; in VirtualBox the phase drifted with every scroll until the whole screen was garbage). Now the screen height is first rounded down to a multiple of 16 (`fb_height & ~15` → 592), then one line is subtracted ⇒ the cursor always lands on a cell boundary, and the bottom 8 pixels go unused.
+2. **It looked like "broken rendering", but half of it was a bad test**: writing to the VBE framebuffer is **MMIO** in QEMU — one memory operation per pixel; painting a full screen of 2 KB of Chinese takes several seconds. The harness used to "sleep 0.9 s after typing the command" and then grab the screen; what it captured was often **half-drawn** — which showed up as "17 assertions failed". Now it waits for the screen to go quiet (two consecutive grabs identical) before capturing, and assertions poll; see [pitfalls](pitfalls.md) 6.34.
 
-删除这块 2026-10 补上了:`rm <file>` 删文件、`rmdir <dir>` 删空目录(不空会拒绝)。
-两条规矩值得记着:
+**A bonus**: after fixing the alignment + waiting for the paint to finish, the same assertions all went green, and there's no need to "look at large files in several chunks" any more.
 
-- 目录项不是"清成 0",而是首字节写 **`0xE5`** —— `0x00` 的语义是"这一项之后
-  全是空的",写 0 会把同目录后面所有兄弟文件一起藏掉。
-- 目录得单独走 `rmdir`,而且必须先确认它是空的:直接删目录项会把里面那条簇链
-  上的文件全变成孤儿(页池那边的教训同理)。
 
-还没做的:**长文件名(VFAT)** 是另一码事;`mini-libc` 里也还没有 `remove()`
-(程序接口里没有删除,所以编辑器存盘仍然只能覆盖同名文件)。
+## 2. Buzzer: inaudible in VBox, durations are estimates, no volume control (known, not fixing this time)
 
-## 4. 程序里的 `exit()` 靠 setjmp 跳板回 shell
+**Current state**
 
-`lib/crt0.asm` 里存了一个跳板,`exit()` 用 `longjmp` 跳回去再 `ret`。
-这样一来说明不了"unwind"、二来程序自己注册的清理代码不会跑。
-真要做对,得先有"进程"这个概念(现在的程序就是内核里 call 出来的一段代码)。
+1. **VirtualBox doesn't emulate the PC speaker.** `run PLAY MYSONG.TXT` runs perfectly in VBox (the score is parsed, the screen scrolls), it just makes **no sound** — VBox has never implemented the PIT channel 2 + `0x61` PC-speaker emulation (it only knows AC'97/HDA sound cards). QEMU has it, but **since 7.0 it doesn't attach an audio backend by default**; you have to pass `-machine pcspk-audiodev=snd0 -audiodev pa,id=snd0` explicitly for it to beep (the full command is in [quickstart.md §8](quickstart.md)). The test QEMU runs with `-display none` and no audio backend, so **automated tests can't assert sound** (the old "`--list` parses note names" assertion was withdrawn along with the sample scores).
+2. **Durations are estimates.** No IRQ0/timer was added this time: `beep`'s "milliseconds" are a busy-wait on an instruction loop (`SPKR_LOOPS_PER_MS` in `kernel/speaker.asm`). On local QEMU (TCG) a nominal 300 ms actually waited 289~318 ms (±5%, jittering with host load); another machine / KVM / real hardware can differ by several times. Pitch is **unaffected**: that's computed by the PIT hardware dividing 1193182 Hz, the same on any host.
+3. **The PC buzzer is a square wave and has no volume control.** The hardware only has "on / off" (the two bits at `0x61`), and at full volume it's harsh, so the image **ships no built-in scores** (the player is there; write your own). To make it quieter you can only act on the host side: turn the system volume down, or in the host mixer (`wpctl` / `pavucontrol`) turn the QEMU stream down separately (start it with a recognisable name via `-audiodev pa,id=snd0,out.stream-name=KKernel`). ★ **There is no volume parameter on the QEMU side**: `-audiodev pa,id=snd0,out.volume=0.2` is wrong and QEMU refuses to start (`Parameter 'out.volume' is unexpected`, measured locally on 10.0.11; upstream QAPI's `AudiodevPerDirectionOptions` only has frequency / channels / voices / format / buffer-length / mixing-engine). If you want no sound at all, switch backends: `-audiodev wav,id=snd0,path=/tmp/kk.wav` (record only, no playback) or `-audiodev none,id=snd0`.
 
-## 5. 按需分页"按访问给",还有几件没做(不是 bug,是没写)
+**To do it accurately (next step)**
 
-现在跑程序时是**按需分页**:内核只建空页表,程序碰到哪页才补哪页(见 README 第 5 节)。
-下面这些是有意留着的口味问题,不是坏掉了:
+Read **PIT channel 0**'s counter in `speaker_beep` as the time base (latch: `out 0x43,0x00`; then read `0x40` twice), no interrupts needed, microsecond precision. The cost is assuming channel 0 is running (it is after the BIOS boots) and a few dozen more lines of state machine — skipped this time on "toy OS, sounds right is good enough".
 
-* **没有页置换 / swap / 写时复制**:页一旦补进来,就留到程序退出才归还;
-* **按"访问"给,不是按"要用"给**:程序只是读一下镜像窗口空隙里的地址,也会拿到一页
-  零页(补页逻辑只看 CR2 落在哪个窗口,不看这页有没有意义);
-* **不给程序自己长栈**:栈还是 shell 的栈 = 内核那套页表里的 0x90000,程序的栈
-  溢出了没人拦(和以前一样);
-* **窗口是死的**:镜像窗口 96 页(384 KiB)、堆窗口页数运行时定(`space_heap_pages`,
-  默认约 560 页 = 2.2 MB);程序镜像上限 384 KiB,`malloc` 只在这段堆里切 ——
-  想要更大堆得改内存布局(见 README 的"可变的三样");
-* **RPL/权限位没管**:补出来的页都是"用户可读写"(flags = 3),但内核窗口照旧
-  恒等映射在程序地址空间里,所以程序还是能改内核内存 —— 挡这个要 ring 3。
+**If it sounds wrong**
 
-## 6. 补页时的"野地址"还是会红屏(这是设计)
+Change only `SPKR_LOOPS_PER_MS`: if it's clearly too slow overall, lower it; too fast, raise it. Pitch (frequency) needs no adjustment.
 
-CR2 不在镜像窗口/堆窗口里(比如程序把指针玩飞了、栈溢出到别的段),
-`page_fault_try_handle` 直接返回"我不管",照旧走 `isr_common` 的红屏 panic
-(异常名 / 错误码 / EIP / CS / EFLAGS / CR2 全套)。
-所以看到 `EXCEPTION 0E` 不一定是按需分页坏了 —— 先看 **CR2**:落在窗口里说明是补页
-逻辑的问题,落在窗口外是程序自己踩空了。
+## 3. `rm` / `rmdir` work now; long file names and an in-program delete are still missing
 
+Deletion landed in 2026-10: `rm <file>` deletes a file, `rmdir <dir>` deletes an empty directory (refuses if not empty). Two rules worth remembering:
 
-## 7. 定时器只做到"数秒"这一步(不是 bug,是还没写)
+- A directory entry isn't "cleared to 0" but has its first byte set to **`0xE5`** — `0x00` means "everything after this entry is empty", and writing 0 would hide every sibling file later in the same directory.
+- Directories must go through `rmdir` separately, and must be confirmed empty first: deleting a directory entry outright orphans every file on its cluster chain (same lesson as the page pool).
 
-`kernel/pit.asm` 让 8254 通道 0 以 100 Hz 发 IRQ0,内核在中断里只 `inc` 一个 tick 计数;
-`uptime` / `sleep` 都建在它上面。已经够用的部分:秒级计时、`hlt` 睡觉不烧 CPU
-(空闲时去看 `qemu-system-i386` 进程,CPU 占用接近 0 —— `kbd_getchar` 和 `pit_wait_ticks`
-都是 `hlt` 等中断,不是空转)。还没做的:
+Still missing: **long file names (VFAT)** are a separate matter; `mini-libc` still has no `remove()` (there's no delete in the program API, so the editor's save can still only overwrite a same-named file).
 
-- **粒度 10 ms**:`uptime` 只能报整秒,`sleep` 只认整秒。想更细就改 `PIT_DIV`
-  (11932 ≈ 100 Hz),代价是中断更频繁。
-- **32 位 tick 会回绕**:100 Hz 下 497 天一圈。`pit_wait_ticks` 用"差值判负"比较,
-  回绕时不会卡死;但 `uptime` 的秒数会从 0 重来(玩具系统,先这样)。
-- **还不能抢占**:`pit_irq` 只加计数 + 发 EOI,不切栈 —— 一个死循环照样能把系统占死
-  (`run` 跑飞了还是只能重启)。下一步就是**抢占式内核线程**,难点是内核**不可重入**:
-  全局变量共享、`hlt` 等键、`space_live` 这种状态机都在同一个栈上,得先划清
-  "哪些地方可以被抢",再在 `pit_irq` 里保存/切换上下文(注释已经留在那儿了)。
-- **没有嵌套中断**:中断门会自动清 IF,`pit_irq` 执行时不会被键盘插队(反之亦然)。
-  现在两个处理程序都极短,够用;处理变长了就得考虑"上半部快、下半部慢"那套。
+## 4. `exit()` in programs jumps back to the shell via a setjmp trampoline
 
+`lib/crt0.asm` stores a trampoline; `exit()` uses `longjmp` to jump back and then `ret`. That means, one, there's no "unwind", and two, cleanup code registered by the program never runs. Doing it properly requires the concept of a "process" first (today's program is just a chunk of code called from the kernel).
 
-## 8. 实时时钟(RTC)只管"读",而且不知道时区(不是 bug,是没写)
+## 5. Demand paging "gives pages on access", and a few things aren't done (not bugs — unwritten)
 
-`kernel/rtc.asm` 从 CMOS 的 `0x70`/`0x71` 读日期和时间(shell 的 `date` 建在它上面)。
-已经做对的部分:等 UIP(更新中标志)清零再读、**读两遍比对**(两次之间正好翻秒就重试,
-最多 3 遍)、BCD → 二进制、12 小时制的 PM 位换算成 24 小时、世纪寄存器 `0x32` 读不到就按 20xx 猜,
-最后还会做范围检查(秒 ≤ 59、月 ≤ 12 这种)。下面这些是**故意没做**的:
+Programs now run with **demand paging**: the kernel only builds empty page tables, and a page is filled in when the program touches it (see README §5). The following are deliberate taste calls, not breakage:
 
-- **只能读,不能写**:没有 `settime`。往 RTC 写要先关 NMI 位(`0x70` 的 bit7)、
-  还得避开时钟自己更新那一下,玩具系统先不做。
-- **不知道时区**:`date` 打出来的就是 CMOS 里存的数字。PC 的 RTC 一般存**本地时间**
-  (和 Windows 双系统共用时基本如此),QEMU 默认存 **UTC** —— 所以 `make run` / `make hd`
-  这些窗口目标都加了 `-rtc base=localtime`,让 guest 跟你的表一致;测试台故意不加
-  (它要拿宿主 UTC 当基准断言)。
-- **世纪靠猜**:寄存器 `0x32` 有些机器不实现,读不到就按 20xx。
-- **精度**:正常情况下误差远小于 1 秒;要是三遍都读不稳,开机行会多打一句
-  `-- read was unstable, values may be off by a second`;时间明显不对(比如时钟没设过)
-  会打 `-- values look wrong (clock not set?)`。
-- **没有夏令时 / 闰秒**:一秒不多,一秒不少。
-- **测试里认不出中文星期**:抓屏 OCR 是拿字库点阵比像素的,`星期三` 会变 `??????` ——
-  套件只断言 ASCII 部分,星期几得人眼看截图(见 [踩坑笔记](pitfalls.md) 的 6.12)。
-
-
-## 在 VirtualBox 里跑出来的三个坑(2026-10,已修两个)
-
-同一套内核、同一个镜像,QEMU 里一切正常,VirtualBox 里花屏 + 崩。逐个查清了:
-
-### 1. 换行把光标夹到了"半个格子"上(已修)
-
-`fb_newline` 原来把光标夹到 `fb_height - 16`。800×600 时那是 **584**,而 584 % 16 = 8 ——
-不在字符格子的线上。于是一旦开始滚屏,新写的每一行都比滚上去的旧行低 8 像素,
-屏幕上就是"两代字叠在一起"的重影(截图一眼就能看到右边一条"幽灵输出")。
-
-修法(已提交):先把屏幕高度按 16 对齐(`and ebx, ~15`),再减一行 —— 光标永远落在格子线上。
-
-### 2. 多扇区 PIO 读在 VirtualBox 里不可靠(已用"每次一扇区"绕开)
-
-现象:VBox 里字库从磁盘加载失败(只剩内建 416 个 ASCII 字形 → 中文全变成缺字方块);
-`cat` 一个中文文件会把**整个内核区写成同一个值**,然后三连异常,VM 直接 Guru Meditation。
-
-原因:`ata_read_sectors` 一次命令读多个扇区,靠"每个扇区等一次 DRQ"。在 VBox 下某个扇区上
-等不到 DRQ → 超时返回失败,**但驱动器还挂着没传完的数据**;下一次读命令就把残留数据当成
-新数据收下 → 目录项/簇链全花 → 拿着野簇号/野长度去读盘 → 把内存写穿。
-
-现状:`ATA_MAX_CHUNK = 1`(每次一个扇区),读写都稳,代价是字库加载慢几秒。
-真正的修法:失败时先排空数据口(`in` 到 DRQ 清零)再重试,或者失败后改用更小的分块重试。
-
-### 3. 缺字(中文)渲染路径还有第二个崩溃点(未修)
-
-把读盘限制成单扇区后,`cat DOCS/NOTES.TXT` 能打出第一行(ASCII),但接着还是崩:
-寄存器被写成野值、栈从 0x90000 一路撑到 0x131BC(把内核映像前 32 KiB 写坏)。
-怀疑点在 `fb_putcp` 的"缺字"分支:它画完方块只做 `add [fb_cur_x], 8`,
-**没有像正常字那样检查右边越界** —— 需要接着查。
-
-## 排障工具(这次加的,留着)
-
-* 开机多打一行 `fb: phys=... w=... h=... pitch=... bpp=...  modeinfo: bytesPerScanLine=... linBytesPerScanLine=... vbe=...`
-  —— 一眼看出虚拟机给的帧缓冲几何对不对(QEMU 0xFD000000 / VBox 0xE0000000,其它一致);
-* `ata_read_sectors` 里的**调用记录环**(64 条:LBA/扇区数/目标/调用者),崩溃后
-  `VBoxManage debugvm <vm> dumpvmcore` 转储内存就能读出来是谁读写盘把内存写穿的;
-* 同一个函数里的**安全闸**:扇区数离谱、或者"目标+长度"越出恒等映射区(现在 0~ident),
-  一律拒绝,宁可变"读失败"也不让内核被自己埋掉。
-
-
-## 软盘启动:曾经在引导扇区就停机(已修,2026-10-06)
-
-**现在 `make test-fda` 是绿的**,这段留在这里当"坑的记录"。当时的症状:软盘镜像开机后
-屏幕全黑(720×400 文本模式,清屏后什么都没打),QEMU monitor 看 CPU 是
-`EIP=0x7D78`(引导扇区里的 `halt16`)、`HLT=1`、实模式 ⇒ 读盘失败重试 3 次后停机,
-内核根本没被加载。根因是**两个**叠在一起:
-
-1. **软盘不该走 EDD**:BIOS 对软盘也常报"支持 LBA 扩展读",但软盘的 EDD 读**跨磁道会失败**
-   (1.44 MB 每磁道 18 扇区,一次读 8 扇区很容易跨)。⇒ `boot_drive < 0x80` 一律走 CHS,
-   而 CHS 分支会把一次读的量夹在磁道边界上(`boot/boot.asm` 的 `read_chunk`)。
-2. **ISA DMA 不能跨 64 KiB 物理边界**(软盘走 DMA,硬盘的 EDD 不走 ⇒ 硬盘上一直看不出来):
-   目的地址 `0x1F200` 再读 4 KiB 就跨过 `0x20000`,BIOS 直接报错。⇒ 每次读之前把扇区数
-   夹到"当前 64 KiB 页里还剩多少";另外**不能按固定次数循环** —— BIOS 实际读几个扇区由它决定,
-   得看 `dap_lba` 有没有走到 `KERNEL_LBA + KERNEL_SECTS`。
-
-怎么确认修好了:① `make test-fda` 连跑 7 次全绿(19 条断言);② 用 QMP `pmemsave` 把客户机
-`0x10000` 起的 128 KiB 内核区 dump 出来跟镜像逐字节比 —— 只有 1485 个字节不同、分成 610 段,
-**最长的一段才 14 字节**,没有一整扇区的差 ⇒ 全是内核运行时自己改的数据(`.bss`、shell 缓冲区),
-256 个扇区一个不少地读对了。③ 引导扇区读失败时会把失败 LBA 留在 `0x7B00`,方便下回排查。
-
-顺带修掉的**测试台**问题(同一个坑的另一面):
-- 抓屏默认路径原来是固定的 `build/_shot.ppm`,两轮测试(或我和套件)同时开着时会**读到别人家的屏幕**
-  —— 硬盘那轮的「读盘方式」断言就偶发读到软盘屏幕上的 `boot disk: CHS fallback`。
-  现在默认路径带进程号(`/tmp/kkernel-shot-<pid>.ppm`)。
-- 开机那几十行是内核一行行往 VBE 帧缓冲上画的(MMIO 慢),抓屏只等 2 秒的话,机器一忙就
-  可能拍到**画到一半**的屏幕 ⇒ 偶发假失败。现在先等最后一行(`type "help" for commands.`)
-  出现再逐条断言;真失败会把屏幕 OCR 出来并存 `build/screen-fail.png`。
-
-
-## 9. 调度器(内核线程 + 抢占式轮转)的边界
-
-`kill` 分两种:**普通内核线程**直接杀,`sched_kill` 先把整块 TCB 抄进 `kill_space`,
-`cmd_kill` 再照着快照把它的页目录 / 私有页表 / 镜像暂存区一起还给页池;**shell 线程**
-(0..3)不能杀线程本身(键盘挂在它们身上),但它正在跑的程序可以杀 —— 另一条 shell 给
-它打一个 `KILLREQ`,它下一次被定时器从 ring 3 打断时在**自己的内核栈上**收摊
-(`irq0_stub` 直接跳 `run_resume_kernel`),页照样还回池子。
-
-
-
-`kernel/sched.asm` 是玩具级轮转调度,故意做得很小。下面这些"没有"是设计选择,不是漏做:
-
-- **没有优先级、没有阻塞/唤醒**:6 个槽、每个 20 ms 时间片,纯轮转。线程要"等一会"
-  只能忙等或 `hlt`(像 `sleep` 那样),没有睡眠队列、没有 `yield` 语义
-- **没有"一个线程一套地址空间"**:所有线程共用内核那张页目录。CR3 是随线程一起
-  保存/恢复的,所以抢占正好发生在"跑程序"(切了 CR3)期间也不会串,但线程之间
-  还是共享同一片地址空间
-- **还是内核态**:没有 ring 3 / TSS / 系统调用门,线程和内核平起平坐,谁都能改内核内存
-- **打印会互相插行**:终端的光标位置/颜色是全局状态,两个线程一起打就会插在一起;
-  你正敲命令时线程往屏幕上打,连提示符和命令回显都会跟着花(命令本身照常执行 ——
-  被插花的是显示,不是输入缓冲区)。想打干净得先有"关中断的临界区"或给终端加锁
-- **没有锁原语**:没有自旋锁 / 信号量。现在靠"线程之间不共享可变状态"来避开
-- **栈固定 2 页(8 KiB)**,而且没有保护:内核栈溢出会直接踩到隔壁物理页(恒等映射,没人拦)
-- **`kill` 立即生效**:不回收资源(线程本来也没有资源),但不巧杀到正在打印的线程时,
-  屏幕上会留半行
-- **地址空间已经按线程拆开了**:`space_pd` / `space_pt` / `space_live` / 镜像大小 / 缺页计数
-  全在各自线程的 TCB 里,`space_cur` 跟着 `sched_pick` 换;`TSS.esp0` 也按线程设,两条 shell
-  同时跑 ring 3 程序互不踩栈。还剩两个共享点:①装载锁 —— "读文件 + 展开 + 建空间 + 拷参数"
-  这一段一次只让一条线程走(暂存区 `PROG_ADDR` / `PROG_ARG_STR` 还是全局的),程序跑起来之后
-  才真正并行;②键盘和屏幕 —— 前台 shell 的程序会抢按键,后台程序看不见键盘(下一阶段做
-  per-shell 控制台)
-- **`kill` 掉"正在跑程序的线程"**:线程的栈由 `sched_kill` 还,地址空间在清槽前抄进
-  `kill_space`,由 `cmd_kill` 用 `space_destroy_at` 收掉,不再漏页。窗口只剩"快照抄完、
-  还没拆"那一小段(单 CPU、关中断做不了整段),真并发 kill 同一个槽的概率可以忽略
-- **卡死的 shell 靠别的 shell 救**:演示程序 `run HANG` 会把线程 0 占住;`Ctrl+←/→` 换到
-  别的 shell,敲 `kill 0` 就能把它的程序停掉(`shell 1` 自己的键盘这时是死的,命令得从
-  另一条 shell 下)。`kill` 对"正在跑程序"的 shell 只杀程序、不杀线程。程序如果卡在
-  内核里的阻塞调用(比如等键盘)而不是 ring 3 空转,`KILLREQ` 要等它回到 ring 3 才生效
-
-## 10. ring 3(用户态程序)的边界
-
-程序现在真的跑在 CPL=3 了(`kernel/tss.asm` 重建 GDT + TSS,程序页表项带 U/S 位),
-但这是"够用来讲明白保护是什么"的程度,不是完整的用户态进程:
-
-- **只有一条系统调用门**:`int $0x30`,15 个功能 + 15 号"退出"。没有 `sysenter`/`syscall`,
-  没有传指针进内核的通用约定 —— 凡是内核要交给程序看的字符串,都得先拷进程序自己的页
-  (参数页在堆顶-0x2000,就是这么来的;忘了拷 = 程序一读就崩,见 [踩坑笔记](pitfalls.md) 的 6.20)
-- **用户栈只有一页(4092 字节)**:栈顶 = 堆顶-4,再往下就出了窗口 → 页错误被杀。
-  没有"程序自己长栈"、没有 guard page 的友好提示(就是普通页错误)
-- **弹床页占死一个固定地址**:程序结尾的 `ret` 回到 `0x17F000` 那条"退出"系统调用;
-  程序**不能自己用** `0x17F000` 当数据缓冲(EDIT 的文件名缓冲原来就在这儿,布局改完
-  一存盘就崩 —— 退出时 `ret` 跳进被文件名覆盖的页面,后来挪到 `0x17E000`)
-- **没有 `fork`/`exec`/`wait`、没有信号**:每条 shell 各跑一个程序,退出就是退出
-- **不能执行特权指令**:`hlt` / `cli` / `sti` / `in` / `out` / `lgdt` … 执行到就 #GP,
-  被当成"程序崩了"处理(演示程序 HANG 原来用 `hlt` 睡觉,进 ring 3 当天就踩到了)
-- **内核里还有几处"全系统一份"的东西**:装载暂存区(PROG_ADDR/参数块)靠一把装载锁串行化,
-  键盘和屏幕也只有一套(§9);页目录/私有页表/暂存区本身已经每线程一份,`kill` 会回收
-- **没有页置换 / swap / 写时复制**:窗口里的空洞"按访问给页",碰过的页一直占着直到收摊
-- **内核线程仍是 ring 0**:`spawn` 出来的演示线程和 shell 线程都是内核态,只有 `run` 进来的
-  程序是 ring 3。要"每个线程一套地址空间 + 都在用户态",得把上面几条一起做
-- **shell 线程本身杀不掉**:`kill 0`~`kill 3` 不拆线程(键盘挂在它们身上,杀了没人收键),
-  只会给那条线程上的程序发"收摊"请求:ring 3 死循环下一次时钟中断就被收掉;程序要是卡在
-  内核态(某个 API 里),得等它回到 ring 3 才生效。也没有"重启某条 shell"这件事
-
-## 11. PCI 枚举的边界(2026-10 加的)
-
-`pci` 命令能把 bus 0 上的设备列全,但它是"查看器",不是完整的总线驱动:
-
-- **只扫 bus 0**:桥后面的总线(PCIe 根后面的、CardBus 之类)看不到;真机上多级总线要递归扫。
-- **中断号只读出来,没接线**:`irq 11` 只是配置空间里的一个数字,IDT 里没有对应的门,
-  所以 USB 现在只能轮询。想用中断得先理清 PIRQ 路由(而且 UHCI 默认在 8259 的 IRQ10/11 上)。
-- **I/O BAR 不给大小**:只给基址(写全 1 量大小会把 QEMU 的配置空间整个搞挂,见 [踩坑笔记](pitfalls.md) 的 6.32)。
-- **内存 BAR 大小偶尔偏大**:VGA 的 BAR2 我们量出 64 KiB,QEMU 的 `info pci` 说 4 KiB ——
-  真要用那一块时以设备手册为准。
-- **配置空间只打开三个开关**:枚举时给每台设备开 I/O / MMIO / Bus Master,其它位一律不动,也不写 BAR。
-- **没有热插拔**:只在开机扫一次,后来插上的设备不会发现(那要走 ACPI/PCIe 那套机制)。
-
-## 拼音输入法
-
-- **只挑单字**:没有词组、没有联想,一个音节一个字。
-- **候选要翻页**:一页只放 9 个,`ime_page` 记当前页;候选多于一页时提示里会写「`1/4`」这样的页码,按 **`,` 上一页 / `.` 下一页**翻(两端到头就不动),页内始终按 `1`-`9` 编号(和 `1-9 pick` 的键位一一对应);选完 / 取消 / 换新拼音都会回到第 1 页。没用方向键是因为方向键是 ESC 前缀,在 shell 里会丢/串成别的键。
-- **词表是"高频单字"**:用 wordfreq 的中文词频取前 6000 个单字,不是语文课本的"常用字表";生僻字查不到是正常的(400 个音节覆盖 6000 个字,平均 15 个/音,最多的是 `ji` 92 个、11 页)。
-- **Shift 是切换键**:其它平台常见 Ctrl+Space;这里为了好按选了 Shift,但代价是**单独按 Shift 会切模式**(组合键照常工作,pressed-with-other-key 不算)。
-- **候选条占用屏幕最底两行**:候选条是『悬浮』画在屏幕最底两行上的(候选一行、拼音回显一行;先存下这两行的像素、画完再还原),正在编辑的那一行落在里面时会整体往上挪一行;但如果页池紧张申请不到 104 KiB 还原缓冲,就会退回旧画法(换行打印候选、选完重画命令行)。
-- **翻页 / 取消都是就地重画**:候选条浮在最底两行,翻页和取消会擦掉重画,不留在屏幕上。
+* **No page replacement / swap / copy-on-write**: once a page is filled in it stays until the program exits;
+* **Given on "access", not on "use"**: a program that merely reads an address inside a hole in the image window still gets a zero page (the fault handler only looks at which window CR2 falls in, not whether the page means anything);
+* **No self-growing stack for programs**: the stack is still the shell's stack = 0x90000 in the kernel's page tables; nothing catches a program's stack overflow (same as before);
+* **The windows are fixed**: the image window is 96 pages (384 KiB), heap window pages are decided at runtime (`space_heap_pages`, default ~560 pages = 2.2 MB); program images are capped at 384 KiB and `malloc` only slices within that heap — a bigger heap means changing the memory layout (see "the three variable things" in the README);
+* **RPL/permission bits are ignored**: faulted-in pages are all "user read/write" (flags = 3), but the kernel window is still identity-mapped into the program's address space, so programs can still modify kernel memory — blocking that needs ring 3.
+
+## 6. A "wild address" during fault-in still red-screens (by design)
+
+If CR2 isn't in the image window/heap window (the program sent a pointer flying, or the stack overflowed into another segment), `page_fault_try_handle` returns "not my problem" and the usual `isr_common` red-screen panic follows (exception name / error code / EIP / CS / EFLAGS / CR2, the full set). So seeing `EXCEPTION 0E` doesn't necessarily mean demand paging broke — look at **CR2** first: inside a window means the fault-in logic is at fault; outside means the program itself stepped into thin air.
+
+
+## 7. The timer only goes as far as "counting seconds" (not a bug — unwritten)
+
+`kernel/pit.asm` makes 8254 channel 0 fire IRQ0 at 100 Hz; the interrupt handler only `inc`s a tick counter, and `uptime` / `sleep` are built on it. What already works: second-level timing, and `hlt` sleeping without burning CPU (check the `qemu-system-i386` process while idle — CPU usage is near 0; both `kbd_getchar` and `pit_wait_ticks` `hlt` for interrupts rather than spinning). Not done yet:
+
+- **10 ms granularity**: `uptime` only reports whole seconds, `sleep` only accepts whole seconds. For finer, change `PIT_DIV` (11932 ≈ 100 Hz); the cost is more frequent interrupts.
+- **The 32-bit tick wraps**: at 100 Hz that's 497 days per cycle. `pit_wait_ticks` compares using a "difference goes negative" test, so it won't hang at wrap; but `uptime`'s seconds restart from 0 (toy system, fine for now).
+- **No preemption yet**: `pit_irq` only bumps the counter + sends EOI, it doesn't switch stacks — an infinite loop can still monopolise the system (`run` going wild still means a reboot). The next step is **preemptive kernel threads**, and the hard part is that the kernel is **not reentrant**: globals are shared, `hlt`-waiting-for-a-key and state machines like `space_live` all live on the same stack, so you first have to draw the line around "what may be preempted" and then save/switch context in `pit_irq` (the comments are already there).
+- **No nested interrupts**: interrupt gates clear IF automatically, so `pit_irq` won't be interrupted by the keyboard (or vice versa). Both handlers are tiny today, which is fine; longer handlers would need the "fast top half, slow bottom half" arrangement.
+
+
+## 8. The real-time clock (RTC) is read-only, and has no timezone (not a bug — unwritten)
+
+`kernel/rtc.asm` reads the date and time from CMOS `0x70`/`0x71` (the shell's `date` is built on it). What's already right: wait for UIP (update-in-progress) to clear before reading, **read twice and compare** (retry if a second ticked over between the two reads, at most 3 tries), BCD → binary, 12-hour PM bit to 24-hour, guess 20xx if the century register `0x32` can't be read, and finally range checks (seconds ≤ 59, month ≤ 12, and so on). The following are **deliberately not done**:
+
+- **Read-only, no writes**: there's no `settime`. Writing to the RTC means masking the NMI bit (bit7 of `0x70`) first and dodging the clock's own update; a toy system skips it.
+- **No timezone**: `date` prints the number stored in CMOS. A PC's RTC usually holds **local time** (that's basically how it works when dual-booting with Windows), while QEMU defaults to **UTC** — so the window targets `make run` / `make hd` all add `-rtc base=localtime` to make the guest agree with your watch; the test harness deliberately doesn't (it needs host UTC as the reference for assertions).
+- **Century is a guess**: some machines don't implement register `0x32`; if it can't be read, assume 20xx.
+- **Precision**: normally the error is far below 1 second; if all three reads are unstable, the boot line adds `-- read was unstable, values may be off by a second`; if the time is clearly wrong (the clock was never set, say) it prints `-- values look wrong (clock not set?)`.
+- **No DST / leap seconds**: not a second more, not a second less.
+- **The tests can't recognise Chinese weekdays**: screen OCR compares pixels against font bitmaps, so `星期三` becomes `??????` — the suite only asserts the ASCII part; the weekday has to be checked by eye in a screenshot (see [pitfalls](pitfalls.md) 6.12).
+
+
+## Three Traps Found Running Under VirtualBox (2026-10, two fixed)
+
+Same kernel, same image: everything fine in QEMU, garbled screen + crashes in VirtualBox. We tracked each one down:
+
+### 1. Newline clamped the cursor to "half a cell" (fixed)
+
+`fb_newline` used to clamp the cursor to `fb_height - 16`. At 800×600 that's **584**, and 584 % 16 = 8 — not on a character cell boundary. So as soon as scrolling began, every new line was 8 pixels below the line it replaced, and the screen showed "two generations of text on top of each other" (a screenshot shows the "ghost output" strip on the right immediately).
+
+Fix (committed): round the screen height down to a multiple of 16 first (`and ebx, ~15`), then subtract one line — the cursor always lands on a cell boundary.
+
+### 2. Multi-sector PIO reads are unreliable in VirtualBox (worked around with "one sector at a time")
+
+Symptom: in VBox the font fails to load from disk (only the built-in 416 ASCII glyphs remain → all Chinese becomes missing-glyph boxes); `cat` on a Chinese file writes **the same value over the whole kernel area**, then a triple fault and the VM goes straight to Guru Meditation.
+
+Cause: `ata_read_sectors` issues one command for several sectors and relies on "wait for one DRQ per sector". Under VBox it times out waiting for DRQ on some sector → returns failure, **but the drive is still holding untransferred data**; the next read command accepts the leftover data as new data → directory entries/cluster chains garbage → reading the disk with a wild cluster number/length → memory stomped.
+
+Current state: `ATA_MAX_CHUNK = 1` (one sector per command); reads and writes are both stable, at the cost of a few extra seconds of font loading. The real fix: on failure, drain the data port first (`in` until DRQ clears) then retry, or retry with smaller chunks after a failure.
+
+### 3. The missing-glyph (Chinese) rendering path has a second crash point (unfixed)
+
+After limiting disk reads to a single sector, `cat DOCS/NOTES.TXT` prints the first line (ASCII) and then still crashes: registers get wild values and the stack climbs from 0x90000 all the way to 0x131BC (corrupting the first 32 KiB of the kernel image). The suspected spot is the "missing glyph" branch of `fb_putcp`: after drawing the box it only does `add [fb_cur_x], 8`, **without the right-edge overflow check normal glyphs get** — needs further investigation.
+
+## Debugging Tools (Added This Time, Kept)
+
+* One extra boot line: `fb: phys=... w=... h=... pitch=... bpp=...  modeinfo: bytesPerScanLine=... linBytesPerScanLine=... vbe=...` — see at a glance whether the framebuffer geometry the VM handed us is right (QEMU 0xFD000000 / VBox 0xE0000000, otherwise identical);
+* A **call-record ring** in `ata_read_sectors` (64 entries: LBA/sector count/target/caller); after a crash, `VBoxManage debugvm <vm> dumpvmcore` the memory and you can read out who read/wrote the disk and stomped memory;
+* A **safety gate** in the same function: absurd sector counts, or "target + length" running past the identity-mapped region (0~ident now), are rejected outright — better a "read failed" than the kernel burying itself.
+
+
+## Floppy Boot: Used to Halt in the Boot Sector (fixed, 2026-10-06)
+
+**`make test-fda` is green now**; this section stays as a "record of the trap". The symptom then: after booting the floppy image the screen was completely black (720×400 text mode, nothing printed after clearing), and QEMU's monitor showed the CPU at `EIP=0x7D78` (the `halt16` in the boot sector), `HLT=1`, real mode ⇒ the disk read had failed and halted after 3 retries; the kernel was never loaded. The root cause was **two** overlapping problems:
+
+1. **Floppies shouldn't use EDD**: the BIOS often reports "LBA extended read supported" for floppies too, but a floppy's EDD read **fails when it crosses a track** (1.44 MB has 18 sectors per track; reading 8 sectors at once easily crosses one). ⇒ `boot_drive < 0x80` always goes CHS, and the CHS branch clamps a single read to the track boundary (`read_chunk` in `boot/boot.asm`).
+2. **ISA DMA can't cross a 64 KiB physical boundary** (floppies use DMA; hard disks' EDD doesn't ⇒ this never showed up on hard disks): the destination `0x1F200` plus 4 KiB crosses `0x20000`, and the BIOS errors out immediately. ⇒ before each read, clamp the sector count to "how much is left in the current 64 KiB page"; also **don't loop a fixed number of times** — how many sectors the BIOS actually reads is up to it, so check whether `dap_lba` has reached `KERNEL_LBA + KERNEL_SECTS`.
+
+How we confirmed the fix: ① `make test-fda` green 7 runs in a row (19 assertions); ② dumped the guest's 128 KiB kernel area starting at `0x10000` with QMP `pmemsave` and compared it byte-for-byte with the image — only 1485 bytes differ, in 610 runs, and **the longest run is 14 bytes**, never a whole sector ⇒ all differences are data the kernel changed at runtime (`.bss`, shell buffers); all 256 sectors were read correctly. ③ On a boot-sector read failure the failing LBA is left at `0x7B00`, to make the next investigation easier.
+
+**Test harness** problems fixed along the way (the other side of the same trap):
+- The default screendump path used to be the fixed `build/_shot.ppm`, so two test rounds (or me and the suite) running at once would **read each other's screens** — the hard-disk round's "how the disk is read" assertion occasionally read `boot disk: CHS fallback` off the floppy screen. The default path now includes the process ID (`/tmp/kkernel-shot-<pid>.ppm`).
+- The dozens of boot lines are painted onto the VBE framebuffer one line at a time by the kernel (MMIO is slow); with only a 2-second wait before grabbing, a busy machine could capture a **half-drawn** screen ⇒ occasional false failures. Now it waits for the last line (`type "help" for commands.`) to appear before asserting one by one; a real failure OCRs the screen and saves it to `build/screen-fail.png`.
+
+
+## 9. Boundaries of the Scheduler (Kernel Threads + Preemptive Round-Robin)
+
+`kill` comes in two flavours: a **plain kernel thread** is killed outright — `sched_kill` first copies its whole TCB into `kill_space`, then `cmd_kill` returns its page directory / private page tables / image staging area to the page pool from the snapshot; a **shell thread** (0..3) can't have the thread itself killed (the keyboard hangs off it), but whatever program it's running can be — another shell sends it a `KILLREQ`, and the next time the timer interrupts it from ring 3 it winds down **on its own kernel stack** (`irq0_stub` jumps straight to `run_resume_kernel`), pages returned to the pool as usual.
+
+
+
+`kernel/sched.asm` is a toy round-robin scheduler, deliberately tiny. The following "missing" features are design choices, not omissions:
+
+- **No priorities, no block/wake**: 6 slots, 20 ms per slot, pure round-robin. A thread that wants to "wait a while" can only busy-wait or `hlt` (like `sleep`); there's no sleep queue and no `yield` semantics
+- **No "one address space per thread"**: all threads share the kernel page directory. CR3 is saved/restored with the thread, so a preemption that happens while "running a program" (CR3 switched) doesn't cross wires, but threads still share one address space
+- **Still kernel mode**: no ring 3 / TSS / syscall gate; threads are on equal footing with the kernel and anyone can modify kernel memory
+- **Printing interleaves**: the terminal's cursor position/colour is global state, so two threads printing at once interleave; when a thread prints to the screen while you're typing a command, even the prompt and echo get garbled (the command still executes — it's the display that's garbled, not the input buffer). Clean printing needs "interrupt-disabled critical sections" or a terminal lock
+- **No lock primitives**: no spinlocks / semaphores. We avoid the issue by "threads don't share mutable state"
+- **Stack fixed at 2 pages (8 KiB), unprotected**: a kernel stack overflow steps straight onto the neighbouring physical page (identity-mapped, nothing stops it)
+- **`kill` takes effect immediately**: it doesn't reclaim resources (threads have none anyway), but if it happens to kill a thread mid-print, half a line is left on screen
+- **The address space is already split per thread**: `space_pd` / `space_pt` / `space_live` / image size / fault counts all live in each thread's TCB, `space_cur` follows `sched_pick`; `TSS.esp0` is also set per thread, so two shells running ring 3 programs don't stomp each other's stacks. Two shared points remain: ① the load lock — "read file + expand + build space + copy arguments" runs one thread at a time (the staging area `PROG_ADDR` / `PROG_ARG_STR` is still global); real parallelism starts once the program is running; ② keyboard and screen — the foreground shell's program grabs the keys, background programs can't see the keyboard (per-shell consoles are the next stage)
+- **`kill`ing "a thread that's running a program"**: the thread's stack is returned by `sched_kill`, the address space is copied into `kill_space` before the slot is cleared, and `cmd_kill` tears it down with `space_destroy_at`, so no pages leak. Only the tiny window "snapshot copied, not yet torn down" remains (single CPU, can't disable interrupts for the whole thing), and the probability of truly concurrent kills of the same slot is negligible
+- **A stuck shell is rescued by another shell**: the demo program `run HANG` occupies thread 0; `Ctrl+←/→` over to another shell and `kill 0` stops its program (`shell 1`'s own keyboard is dead at that point, so the command has to come from another shell). For a shell "running a program", `kill` only kills the program, not the thread. If the program is stuck in a blocking kernel call (waiting for the keyboard, say) rather than spinning in ring 3, `KILLREQ` only takes effect once it's back in ring 3
+
+## 10. Boundaries of ring 3 (User-Mode Programs)
+
+Programs really do run at CPL=3 now (`kernel/tss.asm` rebuilds the GDT + TSS, program page-table entries carry the U/S bit), but this is "enough to explain what protection is", not a complete user-mode process:
+
+- **Only one syscall gate**: `int $0x30`, 15 functions + number 15 "exit". No `sysenter`/`syscall`, no general convention for passing pointers into the kernel — any string the kernel hands to a program has to be copied into the program's own pages first (that's where the argument page at heap-top-0x2000 comes from; forget to copy = the program crashes on first read, see [pitfalls](pitfalls.md) 6.20)
+- **The user stack is one page (4092 bytes)**: stack top = heap top-4; below that you leave the window → page fault and killed. No "program grows its own stack", no friendly guard-page message (just an ordinary page fault)
+- **The trampoline page occupies a fixed address**: the `ret` at the end of a program returns to the "exit" syscall at `0x17F000`; a program **must not use** `0x17F000` as a data buffer (EDIT's filename buffer used to live there; after the layout change it crashed on save — on exit the `ret` jumped into the page overwritten by the filename; it was moved to `0x17E000`)
+- **No `fork`/`exec`/`wait`, no signals**: each shell runs one program; exit is exit
+- **No privileged instructions**: `hlt` / `cli` / `sti` / `in` / `out` / `lgdt` … raise #GP, handled as "the program crashed" (the HANG demo used `hlt` to sleep; it tripped on this the day ring 3 landed)
+- **A few "one per system" things remain in the kernel**: the load staging area (PROG_ADDR/argument block) is serialised by a load lock; keyboard and screen exist once (§9); the page directory/private page tables/staging area are already per-thread, and `kill` reclaims them
+- **No page replacement / swap / copy-on-write**: holes in the window are "faulted in on access"; touched pages stay until teardown
+- **Kernel threads are still ring 0**: demo threads spawned by `spawn` and the shell threads are kernel mode; only programs entered via `run` are ring 3. "One address space per thread + everything in user mode" means doing all of the above together
+- **Shell threads themselves can't be killed**: `kill 0`~`kill 3` don't tear down the thread (the keyboard hangs off it; kill it and nobody collects keys), they only send a "wind down" request to the program on that thread: a ring 3 infinite loop is taken out at the next timer interrupt; a program stuck in kernel mode (inside some API) only takes effect once it returns to ring 3. There's also no "restart a shell"
+
+## 11. Boundaries of PCI Enumeration (added 2026-10)
+
+The `pci` command lists every device on bus 0, but it's a "viewer", not a full bus driver:
+
+- **Only scans bus 0**: buses behind bridges (behind PCIe roots, CardBus and the like) are invisible; real hardware with multiple bus levels needs recursive scanning.
+- **The IRQ number is read but not wired up**: `irq 11` is just a number in configuration space; the IDT has no corresponding gate, so USB can only poll for now. Using interrupts means untangling PIRQ routing first (and UHCI defaults to IRQ10/11 on the 8259).
+- **I/O BARs don't report a size**: only the base address (writing all 1s to measure the size wedges QEMU's whole configuration space, see [pitfalls](pitfalls.md) 6.32).
+- **Memory BAR sizes are occasionally too large**: we measured VGA's BAR2 as 64 KiB while QEMU's `info pci` says 4 KiB — when you actually use that region, trust the device manual.
+- **Configuration space only flips three switches**: enumeration enables I/O / MMIO / Bus Master on each device, leaves every other bit alone, and doesn't write BARs.
+- **No hotplug**: one scan at boot; devices plugged in later are never noticed (that needs the ACPI/PCIe machinery).
+
+## Pinyin Input Method
+
+- **Single characters only**: no phrases, no suggestions, one character per syllable.
+- **Candidates page**: 9 per page, `ime_page` tracks the current page; when there's more than one page the hint shows a page number like "`1/4`", and **`,` goes to the previous page / `.` to the next** (stops at either end); within a page the numbering is always `1`-`9` (matching the `1-9 pick` keys); after picking / cancelling / starting a new pinyin it returns to page 1. Arrow keys weren't used because they're ESC-prefixed and get lost or mangled into other keys in the shell.
+- **The word list is "high-frequency single characters"**: wordfreq's Chinese frequency list, top 6000 characters — not a textbook "common characters" list; rare characters not being found is normal (400 syllables cover 6000 characters, ~15 per syllable on average; the biggest is `ji` with 92, 11 pages).
+- **Shift is the toggle**: other platforms usually use Ctrl+Space; here Shift was chosen for reachability, at the cost that **pressing Shift alone toggles the mode** (combinations still work; pressed-with-another-key doesn't count).
+- **The candidate bar takes the bottom two screen rows**: it's drawn "floating" over the last two rows (one row of candidates, one row of pinyin echo; the pixels of those two rows are saved first and restored after drawing); if the line being edited falls inside them, everything shifts up one row; but if the page pool is too tight to get the 104 KiB restore buffer, it falls back to the old drawing method (print candidates on a new line, redraw the command line after picking).
+- **Paging/cancel redraw in place**: the bar floats over the bottom two rows; paging and cancelling erase and redraw, leaving nothing behind on screen.

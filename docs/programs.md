@@ -1,169 +1,188 @@
-# 给 KKernel 写程序(`int 0x30` 接口)
+[简体中文](zh-CN/programs.md)
 
-想改这个系统?**最快见效的办法是别碰内核,写个程序丢到磁盘上跑。**
-程序是平铺二进制,用 `nasm -f bin` 编出来,放进 FAT16 分区,shell 里 `run` 一下就起来了。
+# Writing programs for KKernel (the `int 0x30` interface)
 
-> 另外从 TCC 移植之后,`run` 也认 **ELF32 可执行文件**(magic `\x7fELF`):
-> 内核的 `kernel/elf.asm` 会按 program header 把 PT_LOAD 段展开成平铺镜像再跑,
-> 入口用 ELF 的 `e_entry`。TCC 在系统内编出来的程序就是这种格式(详见
-> `extensions/tcc/README.md`)。平铺 BIN 的加载路径没有变化,两种格式共存。
+Want to change this system? **The fastest way to see results is to not touch the kernel — write a
+program, drop it on the disk, and run it.** Programs are flat binaries built with `nasm -f bin`, placed
+in the FAT16 partition, and started from the shell with `run`.
 
-现成的例子在 `progs/`:
+> Also, since the TCC port, `run` recognizes **ELF32 executables** too (magic `\x7fELF`):
+> the kernel's `kernel/elf.asm` expands PT_LOAD segments from the program headers into a flat image and
+> runs it, using the ELF `e_entry` as the entry point. Programs compiled inside the system by TCC are in
+> this format (see `extensions/tcc/README.md` for details). The flat BIN loading path is unchanged; the
+> two formats coexist.
 
-| 程序 | 干什么 | 用的是哪部分接口 |
+Ready-made examples live in `progs/`:
+
+| Program | What it does | Which parts of the interface it uses |
 |---|---|---|
-| `HELLO.asm` | 最简:打印一行英文 + 一行中文 + 一个汉字 | 0 / 3 / 4 |
-| `COUNT.asm` | 循环打印、十进制/十六进制、按码位连打汉字 | 0 / 1 / 2 / 3 / 4 |
-| `CALC.asm` | **计算器**:加减乘除、小数点、平方,定点数自己算 | 6 / 9 / 10 / 13 |
-| `EDIT.asm` | **全屏文本编辑器**:可见光标(亮绿 `_`)、方向键、`Ctrl-F` 查找、存盘、打开 | 6 / 7 / 8 / 9 / 10 / 11 / 12 / 13 |
-| `PLAY.C` | **文本谱播放器**(C 写的):读 FAT 上的谱子让蜂鸣器唱 | 7 / 14 |
-| `TOUCH.asm` | **按需分页的演示**:一页一页碰内存,回头检查每页还是自己写的 | 0 / 1 / 3 / 4 |
-| `ZH.TXT` | 放进镜像的演示文本:中文/UTF-8(黄鹤楼、emoji、坏字节替换符),`cat DOCS/ZH.TXT` 看 | – |
-| `EN.TXT` | 放进镜像的演示文本:莎士比亚 Sonnet 18,`cat DOCS/EN.TXT` 看 | – |
-| `JPKR.TXT` | 放进镜像的演示文本:日文/韩文,`cat DOCS/JPKR.TXT` 看 | – |
-| `RING3.asm` | **ring 3 演示**:把 CS / CPL / SS / ESP / [ESP] 打出来,证明程序真在用户态跑、栈和弹床页都是内核给的 | 0 / 2 / 4 |
-| `FAULT.asm` | **保护演示**:故意去读内核的 `0x00100000`,被页错误干净干掉(内核自己接着用) | 0 / 4 |
+| `HELLO.asm` | Minimal: prints one line of English + one line of Chinese + one Han character | 0 / 3 / 4 |
+| `COUNT.asm` | Loops and prints, decimal/hex, prints Han characters by code point | 0 / 1 / 2 / 3 / 4 |
+| `CALC.asm` | **Calculator**: add/sub/mul/div, decimal point, square, fixed-point math done by hand | 6 / 9 / 10 / 13 |
+| `EDIT.asm` | **Full-screen text editor**: visible cursor (bright green `_`), arrow keys, `Ctrl-F` search, save, open | 6 / 7 / 8 / 9 / 10 / 11 / 12 / 13 |
+| `PLAY.C` | **Text score player** (written in C): reads a score from FAT and makes the speaker sing | 7 / 14 |
+| `TOUCH.asm` | **Demand-paging demo**: touches memory page by page, then checks each page still holds what it wrote | 0 / 1 / 3 / 4 |
+| `ZH.TXT` | Demo text baked into the image: Chinese/UTF-8 (Yellow Crane Tower, emoji, bad-byte replacement), see `cat DOCS/ZH.TXT` | – |
+| `EN.TXT` | Demo text baked into the image: Shakespeare's Sonnet 18, see `cat DOCS/EN.TXT` | – |
+| `JPKR.TXT` | Demo text baked into the image: Japanese/Korean, see `cat DOCS/JPKR.TXT` | – |
+| `RING3.asm` | **ring 3 demo**: prints CS / CPL / SS / ESP / [ESP], proving the program really runs in user mode and that the stack and trampoline page come from the kernel | 0 / 2 / 4 |
+| `FAULT.asm` | **Protection demo**: deliberately reads the kernel's `0x00100000` and is cleanly killed by a page fault (the kernel keeps running) | 0 / 4 |
 
 ---
 
-## 1. 三行 hello
+## 1. Three-line hello
 
 ```asm
 [BITS 32]
-[ORG 0x120000]          ; ← 必须写,和内核的加载地址一致
+[ORG 0x120000]          ; ← required, must match the kernel's load address
 
 start:
-    mov eax, 0          ; 功能 0:打印字符串
+    mov eax, 0          ; function 0: print a string
     mov esi, msg
     int 0x30
-    ret                 ; 返回 shell
+    ret                 ; return to the shell
 
 msg db 'hello from a program', 10, 0
 ```
 
-编译、放进镜像、运行:
+Assemble, pack, run:
 
 ```bash
-nasm -f bin progs/HELLO.asm -o build/HELLO.BIN        # 1. 汇编(平铺二进制)
-python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \    # 2. 塞进 FAT16 分区
+nasm -f bin progs/HELLO.asm -o build/HELLO.BIN        # 1. assemble (flat binary)
+python3 tools/mkfat.py build/kkernel-hd.img 6144 8 \    # 2. pack into the FAT16 partition
     HELLO.BIN=build/HELLO.BIN
-make hd                                               # 3. 启动(或 ./tools/run.sh --hd)
+make hd                                               # 3. boot (or ./tools/run.sh --hd)
 
-> run HELLO                                           # 4. 在 shell 里跑(名字大小写都行)
+> run HELLO                                           # 4. run it in the shell (name is case-insensitive)
 running HELLO.BIN
 hello from a program
 program returned to the shell
 ```
 
-`make` 已经认识 `progs/*.asm`(`$(BUILD)/%.BIN` 规则),所以自己加一个程序只要
-把 `MYPROG.asm` 放进 `progs/`、把 `MYPROG.BIN` 加进 `Makefile` 的 `PROGS` 变量、
-再在 `$(HDIMG)` 规则的 `mkfat.py` 那行补一个 `MYPROG.BIN=build/MYPROG.BIN` 就行。
+`make` already knows about `progs/*.asm` (the `$(BUILD)/%.BIN` rule), so adding your own program just
+means dropping `MYPROG.asm` into `progs/`, adding `MYPROG.BIN` to the `PROGS` variable in the
+`Makefile`, and appending `MYPROG.BIN=build/MYPROG.BIN` to the `mkfat.py` line in the `$(HDIMG)` rule.
 
-> 文件名用**大写**:ISO/FAT 的 8.3 名字惯例是大写,`nasm` 出来的文件名也得对上。
-> 顺带一提,`Makefile` 的规则 `$(BUILD)/%.BIN: progs/%.asm` 是大小写敏感的 ——
-> 源文件必须叫 `progs/MYPROG.asm`。
+> Use **uppercase** filenames: the 8.3 convention for ISO/FAT is uppercase, and the name `nasm` emits
+> has to match. Incidentally, the `Makefile` rule `$(BUILD)/%.BIN: progs/%.asm` is case-sensitive —
+> the source file must be named `progs/MYPROG.asm`.
 
-## 2. 接口一共十五个功能
+## 2. The interface: fifteen functions in total
 
-前六个是"打印/收键"的基本款:
+The first six are the "print/read a key" basics:
 
-| eax | 干什么 | 参数 | 返回 |
+| eax | What it does | Arguments | Returns |
 |---|---|---|---|
-| 0 | 打印 UTF-8 字符串(0 结尾,遇 `\n` 换行) | esi = 地址 | — |
-| 1 | 打印十进制 | ebx = 数值 | — |
-| 2 | 打印十六进制(自动补 `0x`) | ebx = 数值 | — |
-| 3 | 打印一个 Unicode 码位(汉字也行) | ebx = 码位 | — |
-| 4 | 设颜色 | bl = 属性字节 | — |
-| 5 | 等一个按键(方向键会被跳过) | — | al = ASCII |
+| 0 | Print a UTF-8 string (0-terminated, `\n` starts a new line) | esi = address | — |
+| 1 | Print decimal | ebx = value | — |
+| 2 | Print hex (prefixes `0x` automatically) | ebx = value | — |
+| 3 | Print one Unicode code point (Han characters work too) | ebx = code point | — |
+| 4 | Set color | bl = attribute byte | — |
+| 5 | Wait for a key (arrow keys are skipped) | — | al = ASCII |
 
-后九个是"全屏程序 + 发声"要用的(计算器、编辑器、播放器就靠它们):
+The next nine are what "full-screen program + sound" needs (the calculator, editor, and player rely on
+them):
 
-| eax | 干什么 | 参数 | 返回 |
+| eax | What it does | Arguments | Returns |
 |---|---|---|---|
-| 6 | 清屏(光标回左上) | — | — |
-| 7 | 读文件 | esi = 文件名, edi = 缓冲区, ecx = 上限 | eax = 字节数,失败 -1 |
-| 8 | 写文件(创建/覆盖) | esi = 文件名, edi = 数据, ecx = 字节数 | eax = 0 成功,-1 失败 |
-| 9 | 定位光标 | ebx = 行, ecx = 列(从 0 起,超界自动夹住) | — |
-| 10 | 等一个**键事件** | — | eax = ASCII 或 `0x100+编号` |
-| 11 | 屏幕尺寸 | — | eax = 列数, ebx = 行数 |
-| 12 | 取程序参数 | — | esi = 参数串(`run EDIT DOCS/NOTES.TXT` 里那截) |
-| 13 | 在指定位置画字 | esi = 串, ebx = 行, ecx = 列, edx = 最多几格 | eax = 实际占几格 |
-| 14 | **蜂鸣器**:响 freq Hz 持续 ms | ebx = 频率 Hz, ecx = 毫秒(频率 <= 0 = 静音等这么久) | — |
+| 6 | Clear the screen (cursor to top-left) | — | — |
+| 7 | Read a file | esi = filename, edi = buffer, ecx = limit | eax = bytes read, -1 on failure |
+| 8 | Write a file (create/overwrite) | esi = filename, edi = data, ecx = byte count | eax = 0 on success, -1 on failure |
+| 9 | Position the cursor | ebx = row, ecx = column (0-based, clamped if out of range) | — |
+| 10 | Wait for a **key event** | — | eax = ASCII or `0x100 + code` |
+| 11 | Screen size | — | eax = columns, ebx = rows |
+| 12 | Get the program arguments | — | esi = argument string (the part after `run EDIT DOCS/NOTES.TXT`) |
+| 13 | Draw text at a position | esi = string, ebx = row, ecx = column, edx = max cells | eax = cells actually used |
+| 14 | **Speaker**: beep at freq Hz for ms | ebx = frequency Hz, ecx = milliseconds (frequency <= 0 = silence for that long) | — |
 
-第 14 号(C 里是 `j_beep(freq_hz, ms)`,播放器 `progs/PLAY.C` 就靠它)有两点要知道:
+Function 14 (in C, `j_beep(freq_hz, ms)`; the player `progs/PLAY.C` relies on it) has two things worth
+knowing:
 
-* **音高是准的**,由 PIT 通道 2 按 1193182 Hz 分频算出来,和宿主快慢无关;
-* **时值是估的**:这次没加 IRQ0/时钟,"毫秒"是忙等数出来的(标定写在
-  `kernel/speaker.asm`)。要听声音得给 QEMU 配音频后端,见
-  [quickstart.md 第 8 节](quickstart.md);
-* 频率 <= 0 时不出声但仍然等 —— 当 `sleep` 用(谱子里的休止符就是它)。
+* **The pitch is accurate**, derived by dividing 1193182 Hz through PIT channel 2, independent of how
+  fast the host is;
+* **The duration is an estimate**: no IRQ0/timer was added this time, so "milliseconds" are counted by
+  busy-waiting (the calibration is in `kernel/speaker.asm`). To actually hear it you need to give QEMU
+  an audio backend, see [section 8 of quickstart.md](quickstart.md);
+* With frequency <= 0 it makes no sound but still waits — use it as `sleep` (the rests in a score are
+  exactly this).
 
-第 10 号返回的扩展键编号(方向键那一家):
+The extended key codes returned by function 10 (the arrow-key family):
 
 ```
 1 = ↑   2 = ↓   3 = ←   4 = →   5 = Home   6 = End
 7 = Delete   8 = PgUp   9 = PgDn
 ```
 
-别的功能号会被忽略(分发器最后直接 `ret`)。第 13 号是"不滚屏、不动光标"的画法:
-全屏程序自己决定每个字画在哪,而且遇 `\n` 就停 —— 正好一行一行画。
+Other function numbers are ignored (the dispatcher just `ret`s at the end). Function 13 is the
+"don't scroll, don't move the cursor" way of drawing: a full-screen program decides where every
+character goes, and it stops at `\n` — perfect for drawing row by row.
 
-### 寄存器约定(重要)
+### Register convention (important)
 
-`int 0x30` 之后:
+After `int 0x30`:
 
-* **eax / ebx / esi** = 返回值(不用的功能也可能被它们占着,别指望保留)
-* **ecx / edx / edi / ebp** = 保证不变
+* **eax / ebx / esi** = return values (functions that don't use them may still clobber them; don't
+  expect them preserved)
+* **ecx / edx / edi / ebp** = guaranteed unchanged
 
-为什么专门写这一段:`api_stub` 里是 `pushad`/`popad` 包起来的,`popad` 会把**返回值也一起还原掉**,
-所以它在出口处特意把那三个槽位又写回了程序看到的寄存器(见 `kernel/api.asm` 的注释)。
+Why this section exists: `api_stub` wraps everything in `pushad`/`popad`, and `popad` would **restore
+the return values too**, so at the exit it deliberately writes those three slots back into the registers
+the program sees (see the comments in `kernel/api.asm`).
 
-颜色字节和老的 VGA 文本模式一个规矩:`0x0A` 亮绿、`0x0B` 亮青、`0x0E` 亮黄、
-`0x07` 浅灰、`0x0C` 亮红。图形模式下内核会把它换算成 RGB。
+The color byte follows the old VGA text-mode rules: `0x0A` bright green, `0x0B` bright cyan, `0x0E`
+bright yellow, `0x07` light gray, `0x0C` bright red. In graphics mode the kernel converts it to RGB.
 
-其它寄存器(eax / ebx / esi 之外)不保证被保留,想留就自己 `push`。
+Other registers (beyond eax / ebx / esi) are not guaranteed preserved; `push` them yourself if you need
+them.
 
-## 3. 为什么用中断而不是 `call` 内核函数
+## 3. Why an interrupt instead of calling kernel functions
 
-内核里的函数是**绝对地址**(整个内核是一个平铺二进制,加载到 0x10000)。
-如果程序里写死 `call 0x012345`,那么内核一改代码、函数挪了位置,程序就当场炸。
+Kernel functions live at **absolute addresses** (the whole kernel is one flat binary loaded at 0x10000).
+If a program hardcodes `call 0x012345`, then the moment the kernel changes and a function moves, the
+program blows up on the spot.
 
-所以中间隔了一层中断门:`int 0x30` 走 IDT(向量号 0x30 是内核启动时用
-`idt_install` 装上的,见 `kernel/api.asm`)。程序只认功能号,内核想怎么改都行 ——
-这就是最小的"系统调用"概念。
+So there's an interrupt gate in between: `int 0x30` goes through the IDT (vector 0x30 is installed by the
+kernel at boot with `idt_install`, see `kernel/api.asm`). Programs only know function numbers, and the
+kernel can change however it likes — that's the minimal concept of a "system call".
 
-顺便说清楚几个约定:
+A few conventions, while we're here:
 
-* 程序被读进 **0x120000**(`PROG_ADDR`),所以 `[ORG 0x120000]` —— 注意这是**虚拟地址**,
-  物理页由内核每次现给(见下一条);
-* 栈还是**内核栈**(`0x90000` 往下长),程序不用自己建栈;
-* shell 用 `call 0x120000` 进去,所以程序用 `ret` 就回到 shell —— 这是最简单的返回方式;
-* **每个程序有自己的地址空间(而且是按需给的页)**:`run` 之前内核给它建一套页目录 +
-  一张空页表 —— `0x120000~0x17FFFF`(镜像窗口 384 KiB)和 `0x180000~堆顶`(堆窗口,约 2.1 MB)
-  这些窗口页在程序那套页表里全是"**不存在**",**一页物理内存都不预先给**。
-  程序碰到哪一页,14 号页错误才现拿一页、清零、填表、`iret` 重执行那条指令。
-  好处:249 字节的 `HELLO.BIN` 只吃 1 页(以前是整个窗口全给);碰到的页一定是**干净的
-  零页**(所以全局变量默认是 0),物理页每次都换一批(`run TOUCH` 最能看出来);
-  跑完连页表一起还给页池。虚拟地址不变,程序不用改。
-  镜像窗口就 384 KiB,镜像比这大 `run` 会直接拒绝;
-* 但**内核窗口照旧恒等映射**(0~ident):好处是 `int 0x30` 随手就能用、内核也能
-  直接读程序传进来的指针;代价是程序仍然能改内核内存 —— "读不到别人的页"有了,
-  "改不了内核"要等 ring 3;
-* 程序**可以**带参数:`run EDIT DOCS/NOTES.TXT` 时 shell 把 `NOTES.TXT` 写进参数块
-  `0x11F000`(`PROG_ARG_ADDR`),程序用 12 号功能取(没有参数就是空串)。
+* Programs are read into **0x120000** (`PROG_ADDR`), hence `[ORG 0x120000]` — note this is a **virtual
+  address**; the physical pages are handed out fresh by the kernel each time (see the next item);
+* The stack is still the **kernel stack** (growing down from `0x90000`); programs don't build their own;
+* The shell enters with `call 0x120000`, so a program's `ret` returns to the shell — the simplest way
+  back;
+* **Each program has its own address space (with pages handed out on demand)**: before `run`, the kernel
+  builds it a page directory + an empty page table — `0x120000~0x17FFFF` (the 384 KiB image window) and
+  `0x180000~heap top` (the heap window, about 2.1 MB). In the program's page table these window pages are
+  all "**not present**", and **not a single physical page is given up front**. Whichever page the program
+  touches, page fault 14 grabs a page, zeroes it, fills the table, and irets back to re-execute the
+  instruction.
+  Benefits: a 249-byte `HELLO.BIN` only consumes 1 page (previously the whole window was handed over);
+  pages touched are always **clean zero pages** (so globals default to 0), physical pages are a different
+  batch every time (`run TOUCH` shows this best); and when it finishes, the page tables go back to the
+  pool too. Virtual addresses don't change, so programs need no edits.
+  The image window is only 384 KiB; `run` refuses images larger than that;
+* But the **kernel window is still identity-mapped** (0~ident): the upside is that `int 0x30` is always
+  available and the kernel can directly read pointers passed in by programs; the cost is that programs
+  can still modify kernel memory — "can't read other people's pages" is done, "can't modify the kernel"
+  waits for ring 3;
+* Programs **can** take arguments: for `run EDIT DOCS/NOTES.TXT` the shell writes `NOTES.TXT` into the
+  argument block `0x11F000` (`PROG_ARG_ADDR`), and the program fetches it with function 12 (empty string
+  if there are no arguments).
 
-## 4. 一个稍复杂点的例子:`COUNT.asm`
+## 4. A slightly more complex example: `COUNT.asm`
 
 ```asm
 start:
     mov eax, 4
-    mov ebx, 0x0E           ; 亮黄
+    mov ebx, 0x0E           ; bright yellow
     int 0x30
 
     mov ebx, 1
 .loop:
-    push ebx                ; ★ 每次调用前把 ebx 存起来
-    mov eax, 1              ; 打印十进制
+    push ebx                ; ★ save ebx before each call
+    mov eax, 1              ; print decimal
     int 0x30
     mov eax, 0
     mov esi, msg_space
@@ -174,126 +193,144 @@ start:
     jbe .loop
 ```
 
-`push ebx` / `pop ebx` 是必须的:接口只承诺自己那点事,不承诺"调用前后 ebx 不变"。
+`push ebx` / `pop ebx` is mandatory: the interface only promises its own little contract, not that
+"ebx is unchanged across the call".
 
-`COUNT.asm` 里还有按码位打印汉字的玩法:
+`COUNT.asm` also has the trick of printing Han characters by code point:
 
 ```asm
-    mov ebx, 0x4F60         ; U+4F60 就是"你"
+    mov ebx, 0x4F60         ; U+4F60 is "你"
     mov eax, 3
     int 0x30
 ```
 
-只要字库里有这个码位就能画出来。内建字库只有 416 个字形(大约够 ASCII + 常用字),
-**硬盘镜像里的完整字库有 42 112 个**(CJK 基本区、扩展 A、假名、谚文、全角标点、部分 emoji)。
-软盘启动就退回内建子集 —— 那时汉字会显示成 missing glyph 的方框。
+As long as the font has that code point, it can be drawn. The built-in font has only 416 glyphs (roughly
+enough for ASCII + common characters), while **the full font in the hard-disk image has 42,112** (CJK
+basic block, extension A, kana, hangul, full-width punctuation, some emoji). Booting from floppy falls
+back to the built-in subset — Han characters then show up as missing-glyph boxes.
 
-## 5. 程序里怎么用中文
+## 5. Using Chinese in programs
 
-现成的完整演示是镜像里的 `ZH.TXT`(shell 里 `cat DOCS/ZH.TXT`):点阵汉字、4 字节 emoji、
-以及刻意写坏的字节怎么画成替换字符 `�` 而不是卡死。
+The ready-made full demo is `ZH.TXT` in the image (`cat DOCS/ZH.TXT` in the shell): bitmap Han
+characters, 4-byte emoji, and how deliberately corrupted bytes are drawn as the replacement character
+`�` instead of hanging the system.
 
-自己写的话直接写 UTF-8 字节就行,内核的 `term_print` 会自己解码:
+To write your own, just write UTF-8 bytes directly; the kernel's `term_print` decodes them:
 
 ```asm
 msg db '你好,世界!', 10, 0
 ```
 
-不用管码位,也不用管编码表。唯一的坑是**编辑器和工具链**:文件本身要存成 UTF-8
-(这个仓库里所有中文文件都是),`nasm` 只管把字节抄进去,不管它是什么编码。
+No need to think about code points or encoding tables. The only trap is **the editor and toolchain**: the
+file itself must be saved as UTF-8 (every Chinese file in this repo is), and `nasm` just copies the
+bytes without caring what encoding they are.
 
-## 6. 写"全屏程序"要记住的四件事
+## 6. Four things to remember when writing a "full-screen program"
 
-计算器和编辑器都是全屏的(自己清屏、自己决定每个字画在哪),它们踩过的坑对你也一样:
+Both the calculator and the editor are full-screen (they clear the screen themselves and decide where
+every character goes); the traps they hit apply to you too:
 
-**① 入口必须是文件的第一段代码。** 内核是从 `[ORG]` 指的那个地址开始执行的,也就是
-**文件第一个字节**。`CALC.asm` 一开始把 `api_clear` 之类的小包装函数写在文件最前面,
-结果 `run CALC` 一闪就回 shell —— 它只执行了"清屏"那句就 `ret` 了。
-要么入口放最前,要么第一句就 `jmp start`。
+**① The entry point must be the first code in the file.** The kernel starts executing at the address
+given by `[ORG]`, which is **the first byte of the file**. `CALC.asm` originally put small wrapper
+functions like `api_clear` at the very front, and `run CALC` flashed back to the shell — it executed
+only the "clear screen" line and then `ret`ed.
+Either put the entry first, or make the first instruction `jmp start`.
 
-**② 终端是"覆盖写",不是"重画"。** 一行新内容比旧的短时,旧字符会留在屏幕上:
-计算器上就会出现 `1.00.1 *1000` 这种鬼东西。所以每画一行都要**把整行补满空格**
-(`CALC.asm` 的 `pad_line`、`EDIT.asm` 的 `fill_row`)。
+**② The terminal overwrites, it doesn't redraw.** When a new line is shorter than the old one, the old
+characters stay on screen: the calculator would show garbage like `1.00.1 *1000`. So every line you draw
+must **pad the whole row with spaces** (`pad_line` in `CALC.asm`, `fill_row` in `EDIT.asm`).
 
-**③ 别把 `al` 当"临时变量"用完还拿 `eax` 当地址。** 编辑器里插入一个字符的写法是
-`mov eax, [cursor]` 然后往 `[TEXT+eax]` 写 —— 如果中间来一句 `mov al, <字符>`,
-`eax` 的低字节就被字符值顶掉了,于是写到了 `TEXT + 字符码` 上。现象特别怪:
-打字打出来的全是空行(因为原地留下的是原来的 `\n`)。
+**③ Don't use `al` as a scratch variable and then use `eax` as an address.** The editor inserts a
+character by `mov eax, [cursor]` and then writing to `[TEXT+eax]` — if a `mov al, <char>` sneaks in
+between, the low byte of `eax` is overwritten by the character value, and the write lands at
+`TEXT + char code`. The symptom is bizarre: typing produces blank lines everywhere (because what gets
+left in place is the original `\n`).
 
-**④ 可见光标不用记账 —— 前提是你本来就整屏重画。** 编辑器每敲一个键都 `api_clear`
-再整屏画一遍(见 ②),所以光标离开旧格子时,那一格会被正文(或空格)自己盖回去;
-新位置只要最后用 13 号画一个亮色的 `_`(`CURSOR_CHAR` / `CURSOR_ATTR = 0x0A`)就够了,
-不需要"先恢复再画"的备份逻辑。真正要小心的是**别越界**:光标不在正文区、或者那一列
-被长行挤到屏幕外时就别画 —— 还有,13 号的 `edx` 是**绝对列号上限**,不是"画几格"
-(传个 1 进去,图形模式下会因为"1 格放不下第 0 列之后的字"而一个字都不画)。
+**④ The visible cursor needs no bookkeeping — provided you already redraw the whole screen.** The editor
+calls `api_clear` and redraws everything on every keystroke (see ②), so when the cursor leaves an old
+cell, that cell is covered by the body text (or spaces) anyway; the new position just needs a bright `_`
+drawn last with function 13 (`CURSOR_CHAR` / `CURSOR_ATTR = 0x0A`), and no "restore then draw" backup
+logic is needed. What you do need to be careful about is **bounds**: don't draw when the cursor is
+outside the text area or when that column is pushed off screen by a long line — and note that function
+13's `edx` is an **absolute column limit**, not "how many cells to draw" (pass 1 and, in graphics mode,
+nothing is drawn at all because "1 cell can't fit a character past column 0").
 
-## 7. 一个真实的坑:加载地址选在了字库中间
+## 7. A real trap: the load address was chosen in the middle of the font
 
-程序一开始是加载到 **0x300000** 的 —— 看着挺顺眼(3 MB,离内核很远),但**它是错的**:
-完整字库当年在 0x200000,1.8 MB 一直铺到 0x3BE600,0x300000 正好落在**点阵数据中间**。
-(阶段 2-B 起字库改放恒等映射顶部 ident-2 MiB 的槽里,上面这段变成历史;下面那项离线检查
-按保守下界 `FONT_LOAD_ADDR=0x200000` 仍然守着"程序区不许压字库"。)
+Programs used to load at **0x300000** — looked reasonable (3 MB, far from the kernel), but **it was
+wrong**: the full font used to be at 0x200000, 1.8 MB stretching to 0x3BE600, and 0x300000 sat right in
+the middle of the **bitmap data**.
+(Since stage 2-B the font lives in a slot at the top of the identity map, ident-2 MiB, so the paragraph
+above is history; the offline check below still guards "the program area must not sit on the font" using
+the conservative lower bound `FONT_LOAD_ADDR=0x200000`.)
 
-后果:程序一载入就把几个字的点阵改掉了。实测 249 字节的 `HELLO.BIN` 踩掉的是
-**U+782A~U+7832 九个汉字**(砪砫砬砭砮砯砰砱砲),屏幕上那几个字会画成花屏 ——
-而错误只在显示**那几个字**时出现,很容易被当成"字库本身有问题"去查半天。
+Consequence: loading a program overwrote the bitmaps of several characters. Measured: the 249-byte
+`HELLO.BIN` trampled **nine Han characters, U+782A~U+7832** (`砪砫砬砭砮砯砰砱砲`), and those characters
+rendered as garbage — and the bug only appeared when **those characters** were displayed, so it was easy
+to spend ages investigating "the font itself is broken".
 
-顺便记一下算法(踩坑时算清楚过):字库里每个字形记录的是**相对数据区**的偏移
-(`data_off` 之后),所以一个字形在内存里的地址是
+Worth writing down the arithmetic too (it was worked out properly while chasing this): each glyph record
+in the font stores an offset **relative to the data area** (after `data_off`), so a glyph's address in
+memory is
 
 ```
-字库基址(0x200000) + data_off(full-kkf.bin 里是 0x7B610) + 该字形的 off
+font base (0x200000) + data_off (0x7B610 in full-kkf.bin) + that glyph's off
 ```
 
-而不是"基址 + off"。第一次算的时候漏了 `data_off`,算出来差 0x7B610 ≈ 482 KB,
-结论全错 —— 这一点值得记下来:**偏移量属于哪个基准,比偏移量本身重要。**
+not "base + off". The first time I forgot `data_off`, the result was off by 0x7B610 ≈ 482 KB and every
+conclusion was wrong — worth remembering: **which base an offset is relative to matters more than the
+offset itself.**
 
-这类"两个东西各占一块内存,谁也没告诉谁"的 bug 特别阴:两个功能单独测都是对的。
-现在的做法:
+This kind of "two things each own a chunk of memory and neither tells the other" bug is especially
+nasty: both features work when tested separately. What we do now:
 
-* 加载地址挪到 **0x120000**(上面是 `FILE_BUF`,下面是字库,中间 896 KB 都是空的);
-* `run` 先用 `fat_stat` 看目录项里的大小,太大直接拒绝,不让它读进来把字库盖掉
-  (当时按 `PROG_MAX_SIZE` = 896 KB 判;现在程序走"私有镜像窗口",
-  实际上限是 384 KiB,常量还留着给下面的静态检查用);
-* 测试里有一项哨兵:`run HELLO` 之后屏幕必须能正确画出 **U+7830 砰**
-  (`font still intact: 砰`)—— 这个字就在"以前会被踩掉"的那段区域里;
-* 测试里还有一项**静态检查**:从源码里读出 `PROG_ADDR` / `FONT_LOAD_ADDR`,
-  算出程序区 `[PROG_ADDR, PROG_ADDR+PROG_MAX_SIZE)` 和字库区
-  `[FONT_LOAD_ADDR, FONT_LOAD_ADDR+字库字节数)` 有没有重叠 —— 只要有人把加载地址
-  改回字库中间,这条立刻红。
+* Load address moved to **0x120000** (above it is `FILE_BUF`, below it the font, with 896 KB of empty
+  space in between);
+* `run` first uses `fat_stat` to check the size in the directory entry and refuses anything too big, so
+  it can't be read in and cover the font (at the time the check was `PROG_MAX_SIZE` = 896 KB; programs
+  now use a "private image window" with a real limit of 384 KiB, and the constant is kept for the static
+  check below);
+* One test is a sentinel: after `run HELLO` the screen must correctly draw **U+7830 砰**
+  (`font still intact: 砰`) — that character sits in the region that used to get trampled;
+* Another test is a **static check**: read `PROG_ADDR` / `FONT_LOAD_ADDR` from the source and compute
+  whether the program region `[PROG_ADDR, PROG_ADDR+PROG_MAX_SIZE)` and the font region
+  `[FONT_LOAD_ADDR, FONT_LOAD_ADDR+font byte count)` overlap — the moment someone moves the load
+  address back into the font, this goes red.
 
-想在屏幕上验证自己没踩到别的东西?用 `find_text` 那种"把期望的字渲染成图案再去截图里找"
-的办法(见 `tests/qemu_test.py`),比肉眼看可靠。
+Want to verify on screen that you haven't trampled something else? Use the `find_text` approach — render
+the expected text into a bitmap and then look for it in the screenshot (see `tests/qemu_test.py`); it's
+more reliable than eyeballing.
 
-## 8. 调试建议
+## 8. Debugging tips
 
-* 程序里乱来(比如访问没映射的地址)会触发内核的 panic 屏,上面有 EIP ——
-  不过 EIP 是内核的地址空间视角,得自己对着 `build/kernel.lst` 或
-  `nasm -l build/HELLO.lst` 反查;
-* 想单步/打断点就 `./tools/run.sh --gdb`(`-s -S`,然后 gdb `target remote :1234`);
-* 程序返回后 shell 会打 `program returned to the shell` ——
-  看不见这行就说明它没返回(死循环或者炸了)。
+* Going wild in a program (e.g. accessing an unmapped address) triggers the kernel's panic screen, which
+  shows EIP — but that EIP is from the kernel address space's point of view, so you have to look it up
+  against `build/kernel.lst` or `nasm -l build/HELLO.lst` yourself;
+* To single-step/breakpoint, use `./tools/run.sh --gdb` (`-s -S`, then gdb `target remote :1234`);
+* After a program returns, the shell prints `program returned to the shell` — if you don't see that
+  line, it didn't return (infinite loop or crashed).
 
-## 9. 想扩展接口?
+## 9. Want to extend the interface?
 
-加一个功能只要三处,都在 `kernel/api.asm`:
+Adding a function takes three places, all in `kernel/api.asm`:
 
 ```asm
 api_dispatch:
     cmp eax, 6
-    je .new_thing           ; 1) 加一个分支
+    je .new_thing           ; 1) add a branch
     ...
 .new_thing:
     ...
     ret
 
-api_usage:                  ; 2) 补一句说明(裸敲 run 就能看到)
+api_usage:                  ; 2) add a line of description (visible by just typing run)
     db '  eax=6  ...', 10
 ```
 
-3) 记得把 `api_usage` 里的话和 `progs/README.TXT`、这一页同步 ——
-三处说法不一致的话,下一个改的人(可能是三个月后的你自己)会骂人。
+3) Remember to keep the text in `api_usage`, `progs/README.TXT`, and this page in sync — if the three
+disagree, the next person to change things (probably you, three months later) will curse.
 
-还有一个上面提过的注意点,写在这里当警告:**`api_stub` 里改段寄存器会顺手改掉 `eax`**
-(`mov ax, 0x10` 会把功能号冲掉)。所以功能号是先存到 `ebp` 再恢复的。
-你自己往里加代码时,别在恢复之前碰 `eax`。
+One more caution mentioned above, repeated here as a warning: **changing segment registers inside
+`api_stub` also changes `eax`** (`mov ax, 0x10` wipes the function number). That's why the function
+number is stashed in `ebp` and restored afterwards. When you add code there yourself, don't touch `eax`
+before it is restored.

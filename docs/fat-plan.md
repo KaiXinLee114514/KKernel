@@ -1,150 +1,163 @@
-# 给 FAT 驱动加子目录和 FAT32(实施计划)
+[简体中文](zh-CN/fat-plan.md)
 
-> **状态:全部做完 ✅**(2026-02;子目录 + cd/mkdir/rmdir + FAT32 + 测试/离线断言都在 main 上)
-> 剩下的坑记在文末"没做的部分",以及 `docs/known-issues.md`。
+# Adding subdirectories and FAT32 to the FAT driver (implementation plan)
 
-这一页是**动手前的设计**,不是现状。现状见 [filesystem.md](filesystem.md)。
-两个功能都是用户点名的:FAT32 是最想要的那个,子目录紧随其后 ——
-顺序上先做子目录(小、能立刻用上),再做 FAT32(等于把驱动重写一遍)。
+> **Status: all done ✅** (2026-02; subdirectories + cd/mkdir/rmdir + FAT32 + tests/offline assertions are all on main)
+> The remaining pitfalls are recorded in "what's not done" at the end of this page, and in `known-issues.md`.
 
-## 0. 现在卡在哪
+This page is the **design written before the work**, not the current state. For the current state see
+[filesystem.md](filesystem.md). Both features were requested by users: FAT32 is the one most wanted,
+subdirectories right behind it — in order, subdirectories first (small, immediately useful), then
+FAT32 (which amounts to rewriting the driver).
 
-`kernel/fat.asm` 里所有"找文件"的代码都写死了三个假设:
+## 0. Where it's stuck today
+
+All the "find a file" code in `kernel/fat.asm` hardcodes three assumptions:
 
 ```
-1. 目录 = 根目录的固定区域(fat_root_lba 起 root_ents 个 32 字节项)  ← 子目录是簇链,不是固定区
-2. 名字 = 11 字节 8.3,没有路径概念                                   ← 需要 a/b/c.txt
-3. FAT 表项 = 16 位                                                 ← FAT32 是 32 位
+1. Directory = the fixed area of the root directory (root_ents 32-byte entries from fat_root_lba)  ← a subdirectory is a cluster chain, not a fixed area
+2. Name = 11 bytes of 8.3, with no notion of paths                                   ← need a/b/c.txt
+3. FAT entry = 16 bits                                                 ← FAT32 is 32 bits
 ```
 
-三处写死分别在 `fat_find`(146 行)、`fat_write_file` 的找空位(456 行)、
-`fat_list`(576 行)。**先把这三处抽成一个"目录游标",子目录和 FAT32 都能套进去。**
+Those three hardcoded spots are in `fat_find` (line 146), the free-slot search in `fat_write_file`
+(line 456), and `fat_list` (line 576). **First pull all three into one "directory cursor", so
+subdirectories and FAT32 both fit into it.**
 
-## 1. 子目录(先做)
+## 1. Subdirectories (do first)
 
-### 1.1 抽象:目录游标
+### 1.1 Abstraction: a directory cursor
 
 ```asm
-; 一个目录 = 要么是"根区"(固定 LBA + 项数),要么是"簇链"
-fat_dir        dd 0     ; 起始簇(0 = 根区)
-fat_dir_lba    dd 0     ; 根区模式下:当前扇区
-fat_dir_idx    dd 0     ; 当前扇区里的第几个项
+; a directory = either the "root area" (fixed LBA + entry count) or a "cluster chain"
+fat_dir        dd 0     ; starting cluster (0 = root area)
+fat_dir_lba    dd 0     ; root-area mode: current sector
+fat_dir_idx    dd 0     ; which entry within the current sector
 
-fat_dir_open:      ; esi = 路径 → 找到这个目录的第一簇(不存在则报错)
-fat_dir_entry:     ; → 取下一个有效目录项到 FAT_BUF,esi 指向它;CF=1 到头
+fat_dir_open:      ; esi = path → find the first cluster of this directory (error if it doesn't exist)
+fat_dir_entry:     ; → fetch the next valid directory entry into FAT_BUF, esi points at it; CF=1 at the end
 fat_dir_close
 ```
 
-`fat_dir_entry` 的循环:每次读一扇区(根区:顺序 LBA;子目录:沿簇链),
-扫 32 字节项,跳过 0xE5 和 LFN(attr&0x0F==0x0F),遇 0x00 收工。
+The `fat_dir_entry` loop reads one sector at a time (root area: sequential LBAs; subdirectory: along
+the cluster chain), scans the 32-byte entries, skips 0xE5 and LFNs (attr&0x0F==0x0F), and stops at
+0x00.
 
-### 1.2 路径解析
+### 1.2 Path resolution
 
 ```asm
-fat_resolve:       ; esi = "DIR/SUB/FILE.TXT" → 拆出目录部分和最后一段名字
-                   ; 逐段查:每个目录名先在当前目录里找(attr & 0x10 = 目录)
-                   ; 返回:edi = 最后的 8.3 名字缓冲、fat_dir = 目标目录首簇
+fat_resolve:       ; esi = "DIR/SUB/FILE.TXT" → split out the directory part and the last name segment
+                   ; look up segment by segment: each directory name is first searched for in the current directory (attr & 0x10 = directory)
+                   ; returns: edi = final 8.3 name buffer, fat_dir = first cluster of the target directory
 ```
 
-约定:FAT 的名字不区分大小写(`fat_name83` 已经会转大写);
-分隔符同时接受 `/` 和 `\`(vi 的命令行里 `\` 更顺手)。
+Conventions: FAT names are case-insensitive (`fat_name83` already upper-cases); both `/` and `\` are
+accepted as separators (`\` is handier on vi's command line).
 
-### 1.3 建立/删除目录
-
-```
-mkdir DIR    → 分配一个簇、清 0 → 写 "." 和 ".." 两项(.. 指向父目录,根写 0)
-             → 在父目录里找一个空位写目录项(attr = 0x10,首簇,大小 0)
-rmdir DIR    → 目录必须为空(只有 "." "..")→ 目录项首字节写 0xE5、簇链标回空闲
-```
-
-### 1.4 当前目录 + shell
+### 1.3 Creating/removing directories
 
 ```
-cwd        dd 0        ; 当前目录的首簇(0 = 根)
-cwd_path   db "\\", 0  ; 给提示符用
-cd <目录>   支持 cd ..、cd \、cd A/B
-mkdir <名>
-rmdir <名>
-ls [路径]   不带参数列当前目录
-cat <路径> / write <路径> <内容> / run <路径>
+mkdir DIR    → allocate a cluster, zero it → write "." and ".." entries (.. points at the parent, 0 for root)
+             → find a free slot in the parent directory and write the entry (attr = 0x10, first cluster, size 0)
+rmdir DIR    → the directory must be empty (only "." and "..") → write 0xE5 to the entry's first byte, mark the cluster chain free again
 ```
 
-提示符从 `> ` 变成 `\` 或 `\SUB> `(能一眼看出在哪儿)。
+### 1.4 Current directory + shell
 
-### 1.5 其它地方要跟着改
+```
+cwd        dd 0        ; first cluster of the current directory (0 = root)
+cwd_path   db "\\", 0  ; for the prompt
+cd <dir>    supports cd .., cd \, cd A/B
+mkdir <name>
+rmdir <name>
+ls [path]   with no argument, lists the current directory
+cat <path> / write <path> <content> / run <path>
+```
 
-* `cat` 的文件缓冲上限 60 KB 不变;
-* `int 0x30` 的 7/8 号(读写文件)本来就收字符串 —— 让它们吃路径即可,C 程序和 vi 自动受益;
-* vi/编辑器:文件名参数带路径就行(`run vi docs/notes.txt`),它们只管把名字交给内核。
+The prompt changes from `> ` to `\` or `\SUB> ` (so you can see at a glance where you are).
 
-## 2. FAT32(后做,等于换掉半个驱动)
+### 1.5 Other places that have to change along
 
-### 2.1 识别
+* `cat`'s file-buffer limit stays 60 KB;
+* functions 7/8 of `int 0x30` (read/write file) already take a string — just let them eat paths, and C programs and vi benefit automatically;
+* vi/editor: give the file-name argument a path (`run vi docs/notes.txt`); they only hand the name to the kernel anyway.
 
-挂载时读 BPB,**同时支持两种**:
+## 2. FAT32 (later; amounts to replacing half the driver)
+
+### 2.1 Detection
+
+Read the BPB on mount and **support both**:
 
 | | FAT16 | FAT32 |
 |---|---|---|
-| BPB 偏移 13 `spc` | 每簇扇区数 | 同 |
-| 偏移 14 `reserved` | 保留扇区 | 同 |
-| 偏移 16 `nfats` | FAT 份数 | 同 |
-| 偏移 17 `root_ents` | 根目录项数 | **必须是 0** |
-| 偏移 22 `sectors_per_fat16` | 每 FAT 扇区数 | **0**(看偏移 36) |
-| 偏移 36 `spf32` | — | 每 FAT 扇区数(32 位) |
-| 偏移 44 `root_cluster` | — | 根目录首簇(通常 2) |
-| 偏移 48 `fsinfo` | — | FSInfo 扇区号 |
-| 偏移 32 `total32` | 大分区总扇区数 | 同 |
+| BPB offset 13 `spc` | sectors per cluster | same |
+| offset 14 `reserved` | reserved sectors | same |
+| offset 16 `nfats` | number of FATs | same |
+| offset 17 `root_ents` | root-directory entries | **must be 0** |
+| offset 22 `sectors_per_fat16` | sectors per FAT | **0** (use offset 36) |
+| offset 36 `spf32` | — | sectors per FAT (32-bit) |
+| offset 44 `root_cluster` | — | root-directory first cluster (usually 2) |
+| offset 48 `fsinfo` | — | FSInfo sector number |
+| offset 32 `total32` | total sectors of a large partition | same |
 
-判定:偏移 22 == 0 → FAT32;否则按偏移 22 算。
-`fat_type`(=16/32)存起来,**FAT 表读写按它分派**:
+Detection: offset 22 == 0 → FAT32; otherwise go by offset 22. Store `fat_type` (=16/32) and
+**dispatch FAT reads/writes on it**:
 
 ```asm
-fat_get_entry:   ; 簇号 in eax → eax = 表项(FAT16: 2 字节;FAT32: 4 字节 & 0x0FFFFFFF)
-fat_set_entry:   ; FAT32 要保留高 4 位(它们不是簇号)
+fat_get_entry:   ; cluster in eax → eax = table entry (FAT16: 2 bytes; FAT32: 4 bytes & 0x0FFFFFFF)
+fat_set_entry:   ; FAT32 has to preserve the top 4 bits (they're not part of the cluster number)
 ```
 
-### 2.2 数据区与根目录
+### 2.2 Data area and root directory
 
-* FAT32 数据区起点 = 保留扇区 + nfats × spf32(**没有固定根区**);
-* 根目录 = 从 `root_cluster` 开始的簇链 → 正好复用第 1 节的"目录游标"(根也变成簇链);
-* 顺带的坑:FAT32 的"簇号高 4 位保留",比较链尾要用 `& 0x0FFFFFFF` 之后再看 `>= 0x0FFFFFF8`,
-  不然 0xFFFFFFF7 那种值会被当成合法簇;
-* FSInfo 只在写的时候更一下(空闲簇数/下一个空闲簇),内核读出来校验签名 0x41615252 就行 ——
-  不更也不影响挂载,别的系统会自己重扫。
+* FAT32 data area start = reserved sectors + nfats × spf32 (**no fixed root area**);
+* root directory = the cluster chain starting at `root_cluster` → which reuses the "directory cursor"
+  from section 1 (the root becomes a cluster chain too);
+* a pitfall along the way: FAT32's "top 4 bits of a cluster number are reserved", so comparing against
+  end-of-chain has to mask with `& 0x0FFFFFFF` before checking `>= 0x0FFFFFF8`, otherwise a value like
+  0xFFFFFFF7 gets treated as a valid cluster;
+* FSInfo only gets updated on writes (free cluster count / next free cluster); the kernel just needs
+  to read it and check the 0x41615252 signature — not updating it doesn't affect mounting, other
+  systems will rescan themselves.
 
-### 2.3 造盘工具
+### 2.3 Disk-building tool
 
-`tools/mkfat.py` 加 `--fat32`:
-* 32 位表项(`0x0FFFFFF8` 链尾、`0x0FFFFFFF` 表尾,保留高 4 位);
-* BPB 里 `root_ents=0`、`spf32`、`root_cluster=2`、FSInfo 扇区;
-* 根目录内容写在簇 2 起的链上;
-* 分区比现在大一点(16 MB 的 8 MB 分区其实放得下 FAT32,只是簇数要落进
-  FAT32 范围 ≥ 65525 —— 所以**分区要放大**到 ~40 MB,或者用 512 字节簇,
-  这一步选完写进 Makefile 的镜像大小里)。
+`tools/mkfat.py` gains `--fat32`:
+* 32-bit entries (0x0FFFFFF8 end-of-chain, 0x0FFFFFFF end-of-table, top 4 bits reserved);
+* `root_ents=0`, `spf32`, `root_cluster=2`, FSInfo sector in the BPB;
+* root directory contents written on the chain starting at cluster 2;
+* a somewhat bigger partition (an 8 MB partition of a 16 MB image actually has room for FAT32, it's
+  just that the cluster count has to land in the FAT32 range ≥ 65525 — so **the partition has to
+  grow** to ~40 MB, or use 512-byte clusters; whichever you pick goes into the image size in the
+  Makefile).
 
-### 2.4 测试怎么证明它真的是 FAT32
+### 2.4 How the tests prove it really is FAT32
 
-* `ls` / `cat` / `write` 全走一遍;
-* 离线解析镜像时**不只用我们自己的 Python 解析器** —— 用 `mtools`/`mtools` 里的 `mcopy`
-  或者 `fsck.fat -v` 交叉验证一遍(它们认 FAT32),这才是"别人也认"的硬证据;
-* 镜像挂载测试:`sudo mount -o loop,offset=... kkernel-hd.img /mnt` 也行(需要 root,
-  测试里做成"有就做,没有就跳过")。
+* run `ls` / `cat` / `write` through the whole thing;
+* when parsing the image offline, **don't just use our own Python parser** — cross-check with
+  `mtools`/`mcopy` from `mtools`, or `fsck.fat -v` (they know FAT32); that's the hard evidence that
+  "other people's tools accept it" too;
+* mount test: `sudo mount -o loop,offset=... kkernel-hd.img /mnt` works too (needs root; make it
+  "do it if we can, skip if not" in the test).
 
-## 3. 分步计划(每步都能单独跑、单独提交)
+## 3. Step-by-step plan (each step runs and commits on its own)
 
-1. **目录游标重构**(行为不变, `make test` 必须还是全绿)—— 抽 `fat_dir_open/entry/next`,
-   把 `fat_find`/`fat_list`/`fat_write_file` 改成用它;
-2. **子目录**:`fat_resolve`、`mkdir`、`cd`、`ls 路径`、`cat/run 路径`;
-3. **子目录的写入**:在子目录里建/改文件(目录项找空位要能沿簇链;必要时扩目录簇);
-4. **测试 + 文档**:本机 QEMU 断言 + 离线解析 + `fsck.fat` 交叉验证;
-5. **FAT32 识别 + 读**:挂载、`ls`、`cat`(只读先通);
-6. **FAT32 写**:建文件、改文件、分配簇(32 位表项 + FSInfo);
-7. **mkfat.py --fat32 + Makefile + 测试**:造一个 FAT32 镜像,把上面全套跑一遍;
-8. 文档收尾(README、filesystem.md、本文件改成"已完成"的记录)。
+1. **Directory-cursor refactor** (behaviour unchanged, `make test` must still be all green) — pull out
+   `fat_dir_open/entry/next` and switch `fat_find`/`fat_list`/`fat_write_file` over to it;
+2. **Subdirectories**: `fat_resolve`, `mkdir`, `cd`, `ls path`, `cat/run path`;
+3. **Writing in subdirectories**: create/modify files inside a subdirectory (the free-slot search has
+   to walk the cluster chain; extend the directory cluster when necessary);
+4. **Tests + docs**: local QEMU assertions + offline parsing + `fsck.fat` cross-check;
+5. **FAT32 detection + read**: mount, `ls`, `cat` (read-only first);
+6. **FAT32 write**: create files, modify files, allocate clusters (32-bit entries + FSInfo);
+7. **mkfat.py --fat32 + Makefile + tests**: build a FAT32 image and run the whole suite above on it;
+8. docs wrap-up (README, filesystem.md, and turn this file into a "done" record).
 
-## 4. 顺手要修的既有问题
+## 4. Existing problems to fix along the way
 
-* [known-issues.md](known-issues.md) 里的"长输出滚屏后屏幕会花"要先修 ——
-  否则新增的 `ls` 大目录、`cat` 长文件测试都会被它带崩(上一轮的测试就被它坑过);
-* `make test` 在机器被别的任务压满时会飘(测试里的固定等待不够):
-  全屏程序的读屏要"等屏幕稳定 + 认得出够多字才采信",这条已经在做了。
+* "long output garbles the screen after scrolling" from [known-issues.md](known-issues.md) has to be
+  fixed first — otherwise the new `ls` on a big directory and `cat` on a long file will drag the
+  tests down with it (last round's tests got bitten by it);
+* `make test` drifts when the machine is saturated by other work (the fixed waits in the tests aren't
+  enough): screen reads for full-screen programs have to "wait until the screen is stable and accept
+  it only when enough characters are recognisable", which is already being done.

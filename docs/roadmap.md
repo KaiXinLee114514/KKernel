@@ -1,87 +1,47 @@
-# 路线图与待办
+[简体中文](zh-CN/roadmap.md)
 
-> 原为 README §10–§11。
+# Roadmap and To-Do
 
-## 下一步:该玩点啥
+> Originally README §10–§11.
 
-**刚刚落地:PCI 总线枚举** —— `pci` 一条命令把机器上的设备全列出来(厂商:设备号、类别名、中断号),
-`pci 0:1.2` 看单台设备详情;QEMU 上正好一次看全:IDE、USB(UHCI)、显卡、网卡
-(见 [docs/pci.md](docs/pci.md))。**这是给 USB 铺的路** —— 想读 USB 键盘,得先知道
-USB 控制器在哪、它的寄存器窗口(那个 I/O BAR)开在哪儿。
+## Next Up: What to Play With
 
-再往前是 **ring 3 用户态 + rc.conf 服务/事件库** —— 程序跑在 CPL=3,内核的页它碰不到,碰了就死、内核不慌
-(见 [架构文档](architecture.md)「程序跑在 ring 3」)。再往前是**多 shell**:4 条 shell 各是一条内核线程,
-`Ctrl+←/→` 在键盘中断里换焦点,一条卡在 `run HANG` 里时另一条照样能干活(见 [架构文档](architecture.md)「多 shell」)。
-再往前一步是内核线程 + 抢占式轮转(PIT 的 IRQ0 里存现场、换栈,`ps`/`spawn`/`kill`)
-和 `date`(读 CMOS 实时时钟)。
+**Just landed: PCI bus enumeration** — a single `pci` command lists every device in the machine (vendor:device, class name, IRQ), and `pci 0:1.2` shows one device in detail; on QEMU you see the whole set at once: IDE, USB (UHCI), display, NIC (see [docs/pci.md](pci.md)). **This is the road paved for USB** — to read a USB keyboard you first need to know where the USB controller is and where its register window (that I/O BAR) is mapped.
 
-往下可以挑的:
-- **闪烁光标**:现在光标常亮,有了 100 Hz 的 tick,在 `pit_irq` 里翻转一下就行(还没做)
-- **`settime`**:往 CMOS 写时间(得先关 NMI 位、还得避开时钟更新,见
-  [docs/known-issues.md](docs/known-issues.md) 第 8 节)
-- **每个线程一套地址空间**:ring 3 有了,但地址空间那套状态还是全局的(一次只让一条
-  shell 跑程序),`space_*` 得挂到线程上才能同时跑几个进程
-- **rc.conf 的下一层**:`RC.CONF`(key=value)已经能管「开机跑哪些程序」和事件账本了
-  (见 [docs/rc-conf.md](docs/rc-conf.md));还没有依赖关系(`after=` / `requires=`)、
-  没有 `stop`(服务是跑一遍就走的程序)、没有失败重试
+Before that came **ring 3 user mode + the rc.conf service/event store** — programs run at CPL=3, can't touch kernel pages, and die if they do while the kernel stays calm (see "Programs run in ring 3" in the [architecture doc](architecture.md)). Before that, **multiple shells**: four shells, each a kernel thread, `Ctrl+←/→` switches focus in the keyboard interrupt, and when one is stuck in `run HANG` another keeps working (see "Multiple shells" in the [architecture doc](architecture.md)). One step before that: kernel threads + preemptive round-robin (save state and switch stacks in the PIT's IRQ0, `ps`/`spawn`/`kill`) and `date` (reading the CMOS real-time clock).
 
-## 还没做的(想练手就从这里挑)
+Things you could pick up next:
+- **Blinking cursor**: the cursor is solid now; with a 100 Hz tick you just flip it in `pit_irq` (not done yet)
+- **`settime`**: write the time to CMOS (must mask the NMI bit first and dodge the clock update; see [docs/known-issues.md](known-issues.md) §8)
+- **One address space per thread**: ring 3 exists, but the address-space state is still global (only one shell runs a program at a time); `space_*` has to be attached to threads before several processes can run at once
+- **The next layer of rc.conf**: `RC.CONF` (key=value) already manages "which programs run at boot" and the event log (see [docs/rc-conf.md](rc-conf.md)); still missing are dependencies (`after=` / `requires=`), `stop` (services are one-shot programs) and retry-on-failure
 
-- **长文件名(VFAT)**:`rm` / `rmdir` / `mkdir` / 子目录现在都能用了,
-  但名字还是 8.3(短名);VFAT 长名是另一套目录项编码,值得单独做一轮
-- **程序里的删除**:`rm` 是 shell 命令,`mini-libc` 里还没有 `remove()`
-  (所以编辑器存盘只能覆盖同名文件,删不掉旧的)
-- ~~保护程序搞坏内核~~:已经做了(ring 3 + TSS + U/S 位,见 [架构文档](architecture.md))—— 下一步是让内核窗口
-  彻底不出现在程序页目录里(现在还是拷一份内核页目录,只是 U/S=0)
-- ~~虚拟内存的下一层~~:按需分页、**写时复制(fork)**、**swap 页置换**、
-  **用户栈自动增长**、**大匿名堆 + `anon_alloc`** 都已经做了(见
-  [架构文档](architecture.md) 的 swap 一节);还剩 **swap 压缩 / 持久化 / 每进程配额**,
-  以及"窗口里的空洞也会给页"这个按访问给页的优化
-- **多 shell 的下一层**:现在**一次只让一条 shell 跑程序**(地址空间那套状态还是全局的),
-  被 `kill` 掉的线程也不会回收地址空间(见 [docs/known-issues.md](docs/known-issues.md) 第 9 节)。
-  想让 4 条 shell 同时跑程序,得把 `space_*` 挂到线程上,再给线程加"退出时清理"
-- **真并发管道**:现在是「先跑完 A 再喂 B」的顺序缓冲管道(见 [docs/pipes.md](docs/pipes.md)),
-  缓冲从页池借、跑完就还;要像 Unix 那样边写边读(流式大输出、`tail -f` 那种),
-  得先让调度器能同时跑多个 ring 3 程序(每任务一套地址空间)+ 管道的阻塞/唤醒原语
-- **调度器的下一层**:优先级调度、阻塞唤醒、锁(A3/A4)已经做了;剩下的还是线程共用
-  一个地址空间、也还是内核态;要往"真进程"走就得动 ring 3 + TSS + 每线程一套页目录
-  (上面那条)
-- **闪烁光标**:有定时器就能做(现在光标是常亮的;`pit_irq` 里翻转一下就行)
-- **`sleep` 的更细粒度**:现在按秒睡(tick 粒度已经到 10 ms,只是 shell 只认整秒)
-- **ELF 加载**:现在程序是平铺二进制读到固定地址(没有段、没有重定位),也不会
-  按程序要多少给多少地长大;`malloc` 已经有了(迷你 libc 里那个),但堆就固定那么大
-- **USB**:PCI 枚举已经能看见 QEMU 的 UHCI 控制器(00:01.2,BAR4 = I/O `0xC040`)和一台
-  e1000 网卡了;按图上这条路走是 **UHCI 初始化 → EP0 控制传输 → HID 键盘 → EHCI + 大容量存储**
-  (为什么按这个顺序、每步会踩什么,写在 [docs/pci.md](docs/pci.md) 结尾)
-- **鼠标(IRQ12)**:PS/2 鼠标比键盘多几个坑(要发命令、读 3 字节包)
-- **`date` 只能读不能写 / 不知道时区**:没有 `settime`(往 CMOS 写得先关 NMI 位、
-  还得避开时钟更新,见 [docs/known-issues.md](docs/known-issues.md) 第 8 节);
-  打出来的就是 CMOS 里的原始数字,不做时区换算
-- **多软盘版(mfd)**:软盘这条线已经"退休"了,但真要复古到底,可以做成
-  **一张盘一个角色**的老式发行版(像 DOS 时代装个软件要"请插入第 2 张盘"):
-  1.44 MB 一张 = 2880 扇区,内核 256 KiB 就吃掉 512 扇区,预算得掐着算。
-  它是**在软盘版的基础上改**的(复用 `boot/boot.asm` 那条 CHS 读盘路径,不另起炉灶)。
-  盘的角色(标签写在每张盘的 0 号扇区里,和 `MFLP` 魔数、盘号一起):
+## Not Done Yet (Good Places to Start)
 
-  | 盘 | 标签 | 放什么 | 现在有多大 |
+- **Long file names (VFAT)**: `rm` / `rmdir` / `mkdir` / subdirectories all work now, but names are still 8.3 (short names); VFAT long names are a separate directory-entry encoding and deserve their own round
+- **Deleting from programs**: `rm` is a shell command; `mini-libc` still has no `remove()` (so the editor can only overwrite an existing file, not delete the old one)
+- ~~Protecting the kernel from programs~~: done (ring 3 + TSS + U/S bits, see the [architecture doc](architecture.md)) — the next step is to keep the kernel window out of the program's page directory entirely (right now we still copy the kernel page directory, just with U/S=0)
+- ~~The next layer of virtual memory~~: demand paging, **copy-on-write (fork)**, **swap page replacement**, **automatic user-stack growth**, **large anonymous heap + `anon_alloc`** are all done (see the swap section of the [architecture doc](architecture.md)); what's left is **swap compression / persistence / per-process quotas**, plus the "holes in the window get pages too" fault-in-on-access optimisation
+- **The next layer of multiple shells**: right now **only one shell can run a program at a time** (the address-space state is global), and a killed thread doesn't release its address space either (see [docs/known-issues.md](known-issues.md) §9). To let four shells run programs at once, `space_*` has to move onto threads and threads need "clean up on exit"
+- **Truly concurrent pipes**: today it's a sequential buffered pipe ("finish A, then feed B", see [docs/pipes.md](pipes.md)); buffers are borrowed from the page pool and returned when done. To write-while-reading like Unix (streaming large output, `tail -f`), the scheduler must first run several ring-3 programs at once (one address space per task) + pipe blocking/wakeup primitives
+- **The next layer of the scheduler**: priority scheduling, blocking/wakeup and locks (A3/A4) are done; what remains is threads sharing one address space and still being in kernel mode; moving toward "real processes" means ring 3 + TSS + per-thread page directories (the item above)
+- **Blinking cursor**: possible now that there's a timer (the cursor is solid; just flip it in `pit_irq`)
+- **Finer-grained `sleep`**: it sleeps in whole seconds now (the tick granularity is already 10 ms, the shell just only accepts whole seconds)
+- **ELF loading**: programs are flat binaries read to a fixed address (no segments, no relocations), and they don't grow on demand; `malloc` exists (the one in mini-libc) but the heap is a fixed size
+- **USB**: PCI enumeration can already see QEMU's UHCI controller (00:01.2, BAR4 = I/O `0xC040`) and an e1000 NIC; the path on the diagram is **UHCI init → EP0 control transfers → HID keyboard → EHCI + mass storage** (why this order and what each step trips over is at the end of [docs/pci.md](pci.md))
+- **Mouse (IRQ12)**: a PS/2 mouse has a few more traps than the keyboard (you must send commands and read 3-byte packets)
+- **`date` is read-only and has no timezone**: no `settime` (writing CMOS means masking the NMI bit and dodging the clock update; see [docs/known-issues.md](known-issues.md) §8); what it prints is the raw number in CMOS, with no timezone conversion
+- **Multi-floppy edition (mfd)**: the floppy line has "retired", but if you want to go full retro you could build an old-style distribution with **one disk per role** (like the DOS era, where installing software meant "please insert disk 2"):
+  1.44 MB per disk = 2880 sectors, and a 256 KiB kernel eats 512 of them, so the budget has to be tight. It would be **a modification of the floppy edition** (reusing the CHS read path in `boot/boot.asm`, not a fresh start). Disk roles (the label lives in sector 0 of each disk, along with the `MFLP` magic and the disk number):
+
+  | Disk | Label | What goes on it | Size now |
   |----|------|--------|-----------|
-  | 1 | `minimal system` | 引导扇区 + stub + 内核(含 416 字形内置子集),开机直接进 shell | 128 KiB |
-  | 2 | `disk read/write` | FAT12/16 读写 + 程序盘(HELLO/COUNT/CALC/TOUCH/EDIT/VI/PLAY)+ 演示文本(ZH/EN/JPKR)+ `RC.CONF` | ~110 KiB |
-  | 3 | `more characters (1/2)` | 完整字库 `full-kkf.bin` 的前一半(1 张软盘塞不下 1.8 MB) | ~893 KiB |
-  | 4 | `more characters (2/2)` | 完整字库的后一半 | ~893 KiB |
-  | 5 | `add-ons` | 以后加的东西(播放器/游戏/演示程序),也可以继续往后编号 | 余量 |
+  | 1 | `minimal system` | boot sector + stub + kernel (with the built-in 416-glyph subset), boots straight into the shell | 128 KiB |
+  | 2 | `disk read/write` | FAT12/16 read/write + program disk (HELLO/COUNT/CALC/TOUCH/EDIT/VI/PLAY) + demo texts (ZH/EN/JPKR) + `RC.CONF` | ~110 KiB |
+  | 3 | `more characters (1/2)` | first half of the full font `full-kkf.bin` (1.8 MB doesn't fit on one floppy) | ~893 KiB |
+  | 4 | `more characters (2/2)` | second half of the full font | ~893 KiB |
+  | 5 | `add-ons` | things added later (player/games/demos); numbering can continue | spare |
 
-  难点不在读盘(ATA/CHS 那套现成的),在**换盘**:提示"请插入第 2 张盘"之后
-  要能发现介质已经换了 —— BIOS `INT 13h AH=16h` 的换盘检测不可靠,通常得靠
-  "读 0 号扇区、验 `MFLP` 魔数和盘号"这种土办法;换错了要提示"这张是
-  `more characters (2/2)`,不是我要的"。`make mfd` 一次生成 disk1..5 五张
-  镜像,QEMU 里可以用 monitor 的 `change floppy0` 手动换盘来试
-- **x86_64(长模式)**:现在是 32 位保护模式,全部 12.7k 行汇编都是 32 位的。
-  上 64 位不是"把寄存器改宽"就行,是一次**重写**:PAE + 4 级页表(PML4/PDPT/PD/PT)、
-  长模式 GDT/TSS + IST、IDT 门格式、`pusha/popa` 没有了、调用约定换成
-  SysV(前 6 个参数走 rdi/rsi/rdx/rcx/r8/r9)、结构体尺寸翻倍(TCB/BOOTINFO/目录项指针)、
-  程序和 libc 也得重新编成 64 位。建议**不要就地改**,另开一棵树(分支或新目录)
-  按里程碑往上爬:①引导进长模式并打印 → ②中断/键盘 → ③分页 + 堆 → ④FAT16 读
-  → ⑤ring 3 → ⑥调度器。老树留着当"能跑的演示",新树慢慢追
-- **从磁盘读内核**:现在内核还是引导扇区按固定 LBA 读的,没有"从文件系统加载内核"
-
+  The hard part isn't reading disks (the ATA/CHS machinery is ready-made), it's **swapping disks**: after "please insert disk 2" you have to detect that the medium changed — BIOS `INT 13h AH=16h` media-change detection is unreliable, so you usually fall back to the crude method of "read sector 0, verify the `MFLP` magic and disk number"; if the wrong disk is inserted, say "this one is `more characters (2/2)`, not the one I asked for". `make mfd` generates disk1..5 in one go, and in QEMU you can swap disks by hand with the monitor's `change floppy0`
+- **x86_64 (long mode)**: this is 32-bit protected mode, and all 12.7k lines of assembly are 32-bit. Going 64-bit isn't "make the registers wider", it's a **rewrite**: PAE + 4-level page tables (PML4/PDPT/PD/PT), long-mode GDT/TSS + IST, IDT gate format, no more `pusha/popa`, the SysV calling convention (first 6 args in rdi/rsi/rdx/rcx/r8/r9), doubled struct sizes (TCB/BOOTINFO/directory-entry pointers), and programs and libc rebuilt as 64-bit. The recommendation is **not to convert in place** but to start a new tree (branch or new directory) and climb milestone by milestone: ① boot into long mode and print → ② interrupts/keyboard → ③ paging + heap → ④ FAT16 read → ⑤ ring 3 → ⑥ scheduler. Keep the old tree as the "it runs" demo and let the new one catch up slowly
+- **Loading the kernel from disk**: the kernel is still read by the boot sector from fixed LBAs; there's no "load the kernel from a filesystem"

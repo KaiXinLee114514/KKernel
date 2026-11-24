@@ -1,128 +1,153 @@
-# 踩过的坑（调试笔记）
+[简体中文](zh-CN/pitfalls.md)
 
-> 这一节是开发过程中真实踩过的坑和排查过程——每个都能对应到一次具体的死机/数据损坏。原为 README §6。
+# Pitfalls we've stepped on (debugging notes)
 
+> This section is the collection of traps actually hit during development and the debugging that
+> followed — each one maps to a specific hang or data corruption. Originally README §6.
 
-## 6.1 软盘的 BIOS 不支持 LBA 扩展读
+## 6.1 The floppy BIOS doesn't support LBA extended reads
 
-最开始只写了 `int 0x13 AH=42h`(LBA 扩展读,一次读 8 个扇区),结果 QEMU 里直接 `DISK READ FAILED`。
+The first version only did `int 0x13 AH=42h` (LBA extended read, 8 sectors at a time), and QEMU
+immediately answered `DISK READ FAILED`.
 
-用 `tests/probe_disk.asm` 探针实测了三种读法(同一个镜像,分别当软盘和硬盘挂):
+Using the `tests/probe_disk.asm` probe I measured three read methods against the same image, mounted
+once as a floppy and once as a hard disk:
 
-| 读法 | 软盘 `-fda` | 硬盘 `-hda` |
+| Method | Floppy `-fda` | Hard disk `-hda` |
 |---|---|---|
-| `AH=42h` LBA 读 8 扇区 | ❌ `CF=1 AH=01`(功能无效) | ✅ 成功,数据正确 |
-| `AH=02h` CHS 读 1 扇区 | ✅ 成功,数据正确 | ❌ `CF=1 AH=20`(几何不对) |
-| `AH=41h` EDD 支持探测 | `CF=1`(老实说"不支持") | `CF=0` |
+| `AH=42h` LBA read, 8 sectors | ❌ `CF=1 AH=01` (function not supported) | ✅ works, data correct |
+| `AH=02h` CHS read, 1 sector | ✅ works, data correct | ❌ `CF=1 AH=20` (bad geometry) |
+| `AH=41h` EDD support probe | `CF=1` (honestly says "no") | `CF=0` |
 
-**结论**:软盘的 BIOS 压根不认 LBA 扩展读,只有硬盘认。所以正确做法是:
+**Conclusion**: the floppy BIOS simply doesn't recognize LBA extended reads; only hard disks do. So
+the right approach is:
 
-1. 先问 `AH=41h` 支不支持(检查 `CF`、`BX=0xAA55`、`CX` 的 bit0)
-2. 支持 → 走 LBA,一次读 8 扇区
-3. 不支持 → 退回 CHS,**而且每次都要截断到"本磁道还剩几扇区"**(CHS 读不能跨磁道)
+1. First ask `AH=41h` whether it's supported (check `CF`, `BX=0xAA55`, bit0 of `CX`)
+2. Supported → go LBA, read 8 sectors at a time
+3. Not supported → fall back to CHS, **and truncate every read to "how many sectors are left on this
+   track"** (CHS reads must not cross tracks)
 
-`boot/boot.asm` 现在两条路都有,`make test-fda` / `make test-hda` 各测一条。
-这个探针留在 `tests/probe_disk.asm` 里 —— 你要是换个 BIOS 环境,先跑它。
+`boot/boot.asm` now has both paths, and `make test-fda` / `make test-hda` each exercise one.
+The probe is kept in `tests/probe_disk.asm` — if you switch to a different BIOS environment, run it
+first.
 
-⚠️ 但**别只看 `AH=41h` 的答复**:有的 BIOS 对软盘也报"支持 EDD",真读起来跨磁道就失败。
-所以引导扇区现在是"**盘号 < 0x80 一律走 CHS**",不问它。这是 6.33 那个坑的另一半。
+⚠️ But **don't trust the `AH=41h` answer alone**: some BIOSes claim EDD support for floppies too and
+then fail the moment a read crosses a track. So the boot sector now says "**drive number < 0x80 always
+goes CHS**" and doesn't ask. That's the other half of the 6.33 trap.
 
-## 6.2 一次要 255 个扇区,只有第一个是真的
+## 6.2 Asked for 255 sectors, only the first one was real
 
-读磁盘字库时,命令发出去状态也正常,但内存里**只有第一个扇区是数据,后面全是 0** ——
-屏幕上每个字都成了 missing glyph 的方框。
+When reading the on-disk font, the command went out and the status looked fine, but in memory **only
+the first sector held data, everything after was zeros** — every character on screen turned into a
+missing-glyph box.
 
-原因:ATA 规范允许驱动器**只传一部分**,PIO 模式下每传一个扇区都得等一次 `DRQ`。
-改成分块(16 扇区一块)+ 每扇区都 `ata_wait_drq` 才读全。
+Cause: the ATA spec allows a drive to **transfer only part of the request**, and in PIO mode you must
+wait for `DRQ` before each sector. Switching to chunked reads (16 sectors per chunk) with an
+`ata_wait_drq` before every sector read the whole thing.
 
-## 6.3 `mov al, 0xE0` 把 LBA 弄丢了
+## 6.3 `mov al, 0xE0` threw away the LBA
 
-选盘的字节要写进 `al`,而 LBA 正好在 `eax` 里 —— 低 8 位当场被覆盖,
-"读 LBA 0x1E0"变成"读 LBA 0x00"。教训是**看内存里的字节,别信"函数返回成功"**。
+The drive-select byte has to go into `al`, and the LBA happens to live in `eax` — the low 8 bits got
+clobbered on the spot, turning "read LBA 0x1E0" into "read LBA 0x00". The lesson: **look at the bytes
+in memory, don't trust "the function returned success"**.
 
-## 6.4 `mov ax, 0x10` 把系统调用号冲掉了
+## 6.4 `mov ax, 0x10` wiped out the syscall number
 
-`int 0x30` 的入口要先把自己换到内核数据段(`mov ax, 0x10`)—— 而功能号正好在 `eax` 里。
-于是分发器看到的永远是 `0x10`,所有功能都匹配不上。修法是先把功能号存到 `ebp`。
+The `int 0x30` entry has to switch itself to the kernel data segment first (`mov ax, 0x10`) — and the
+function number happens to be in `eax`. So the dispatcher always saw `0x10` and no function ever
+matched. The fix is to stash the function number in `ebp` first.
 
-这类"低 16 位被顺手写掉"的坑出现了两次(6.3 和 6.4),都是同一个原因:
-**保护模式里段寄存器只有 16 位,而 `eax` 的低半截在别处有用。**
+This class of "the low 16 bits got written over in passing" bit us twice (6.3 and 6.4), both for the
+same reason: **in protected mode segment registers are only 16 bits wide, and the low half of `eax` is
+useful elsewhere.**
 
-## 6.5 程序加载地址选在了字库中间(最阴的一个)
+## 6.5 The program load address landed in the middle of the font (the nastiest one)
 
-程序本来是加载到 `0x300000` 的 —— 离内核很远,看着挺顺眼。但完整字库是读到 `0x200000` 的,
-1.8 MB 一直铺到 `0x3BE600`,**`0x300000` 正好落在点阵数据中间**:
-程序一载入就把几个汉字的点阵覆盖掉了(249 字节的 `HELLO.BIN` 踩掉 U+782A~U+7832 九个汉字,
-"砰"会画成花屏)。
+The program used to load at `0x300000` — far from the kernel, looked perfectly reasonable. But the
+full font was read to `0x200000`, 1.8 MB stretching to `0x3BE600`, and **`0x300000` sits right in the
+middle of the bitmap data**: the moment the program loaded, it overwrote the bitmaps for a handful of
+Chinese characters (the 249-byte `HELLO.BIN` trampled nine characters, U+782A~U+7832, and "砰" would
+render as garbage).
 
-阴在哪:**两个功能单独测都是对的** —— `run HELLO` 正常、中文也正常显示,
-只有"跑完程序之后再显示那几个特定的字"才看得出来,我一开始甚至怀疑是字库文件坏了。
+Why it was so nasty: **both features worked when tested separately** — `run HELLO` was fine, Chinese
+display was fine. It only showed up when you "ran the program and then displayed those particular
+characters", and at first I even suspected the font file was corrupt.
 
-修法三件事:
+The fix was three things:
 
-1. 加载地址挪到 `0x120000`(上面是 `FILE_BUF`,下面是字库,中间 896 KB 全是空的);
-2. `run` 先用 `fat_stat` 看目录项里的文件大小,太大直接拒绝,不让它读进来把字库盖掉
-   (当时按 `PROG_MAX_SIZE` = 896 KB 判;后来程序改用"私有镜像窗口",
-   实际上限变成 384 KiB(现在由镜像窗口决定)—— 见第 5 节);
-3. 测试里加了两道锁:一道**哨兵**(`run HELLO` 之后屏幕必须能正确画出 U+7830 砰,
-   它的点阵就在以前会被踩掉的那段里),一道**静态检查**(从源码里读出 `PROG_ADDR` /
-   `FONT_LOAD_ADDR` 和字库文件大小,算程序区和字库区有没有重叠)。
-   两道锁都实测过"改回旧地址就会红"。
+1. Move the load address to `0x120000` (above it is `FILE_BUF`, below it the font, and the 896 KB in
+   between is all free);
+2. `run` first uses `fat_stat` to read the size from the directory entry and refuses anything too big,
+   so it can't be read in and cover the font (at the time the check was `PROG_MAX_SIZE` = 896 KB;
+   later programs switched to a "private image window", so the real limit became 384 KiB (now decided
+   by the image window) — see section 5);
+3. Two locks were added to the tests: a **sentinel** (`run HELLO` must be followed by the screen
+   correctly drawing U+7830 砰, whose bitmap lives in the region that used to get trampled), and a
+   **static check** (read `PROG_ADDR` / `FONT_LOAD_ADDR` and the font file size from the source and
+   compute whether the program region and font region overlap). Both locks were verified to "go red if
+   you change the address back".
 
-顺带记一个算错过的地方:字形记录的是**相对数据区**的偏移,所以字形地址是
-`字库基址 + data_off + off`,不是 `基址 + off` —— 漏掉 `data_off` 差了 482 KB,
-"哪几个字被踩掉"的结论会全错。**偏移量属于哪个基准,比偏移量本身重要。**
+While at it, one place I miscalculated: a glyph record stores an offset **relative to the data area**,
+so a glyph's address is `font base + data_off + off`, not `base + off` — forgetting `data_off` is a
+482 KB error and makes the "which characters got trampled" conclusion completely wrong. **Which base an
+offset is relative to matters more than the offset itself.**
 
-## 6.6 panic 屏里 EFLAGS 多了个 bit16,不是 bug
+## 6.6 The extra bit16 in EFLAGS on the panic screen is not a bug
 
-除零的 panic 屏打出 `EFLAGS = 0x00010046`,而开机时明明是 `0x00000046`,多出来的 `0x10000` 是 bit16(RF,Resume Flag)。
-这是 CPU 自己加的:**故障类异常会把 RF 压进异常帧**,这样 `iret` 回去重试那条指令时不会立刻又炸一次。
-我为了这个 `0x10046` 查了一轮(还先把它错看成了 bit8 的 TF),最后在 `idt.asm` 里写清楚了。
+The divide-by-zero panic screen printed `EFLAGS = 0x00010046`, while at boot it was clearly
+`0x00000046`; the extra `0x10000` is bit16 (RF, Resume Flag). The CPU adds it itself: **fault-class
+exceptions push RF into the exception frame** so that `iret`ing back to retry the instruction doesn't
+immediately fault again. I spent a round chasing that `0x10046` (and first misread it as bit8, TF),
+before writing it down clearly in `idt.asm`.
 
-## 6.7 同一行连续打印会被自己盖掉 / `div` 会冲掉颜色寄存器
+## 6.7 Printing the same line twice overwrites itself / `div` clobbers the color register
 
-- 早期 VGA 驱动每次打印都"回到行首",导致同一行第二次 `print` 把第一次的内容盖了 ——
-  后来改成**只有换行才重新定位**。
-- 打印十进制时用 `div`,而 `div` 会把 `edx` 当余数输出 —— 而颜色正好存在 `dl` 里,
-  结果数字颜色全乱。改成**颜色存内存**,不放在寄存器里。
+- The early VGA driver "returned to column 0" on every print, so a second `print` on the same line
+  covered the first — later changed so that **only a newline repositions**.
+- Decimal printing used `div`, and `div` puts the remainder in `edx` — while the color happened to
+  live in `dl`, so the digits came out in random colors. Changed to **store the color in memory**
+  instead of a register.
 
-## 6.8 VGA 文本模式只有 ASCII 字形
+## 6.8 VGA text mode only has ASCII glyphs
 
-屏幕上写中文会变成乱码(BIOS 自带字模只有 ASCII)。
+Writing Chinese to the screen produces mojibake (the BIOS font only contains ASCII).
 
-别想着"换个字模就能显示中文":VGA 文本模式一个字符格**只有 8 像素宽**
-(字模是 8×N 的点阵,高度可以用 CRTC 的 Maximum Scan Line 调到 16 甚至 32),
-而标准汉字是 **16×16** —— 8 像素宽的格子根本塞不下一个汉字,换字模也救不了。
-真要显示中文只有进图形模式自己画点阵(见第 4 节)。
-(文本模式那条路我也试到底了:字模塞进 VGA plane 2、汉字劈成两个字符格,
-寄存器细节写在 [font/README.md](font/README.md) 里,但上限只有 63 个字,所以默认走图形模式,
-那个实验仍可用 `make run-font` 跑。)
+Don't think "just swap the font and Chinese will display": in VGA text mode a character cell is **only
+8 pixels wide** (the font is an 8×N bitmap; the height can be raised to 16 or even 32 via CRTC Maximum
+Scan Line), while a standard Chinese character is **16×16** — an 8-pixel-wide cell simply cannot hold
+one, and no font swap will save you. To really display Chinese you have to enter graphics mode and
+draw the bitmap yourself (see section 4).
+(I did take the text-mode path to its limit: stuff the font into VGA plane 2, split a Chinese character
+across two cells; the register details are in [font/README.md](../font/README.md), but the ceiling is 63
+characters, so graphics mode is the default and that experiment can still be run with
+`make run-font`.)
 
-## 6.9 `not` 不改标志位(页池分配器跳过了一整段空闲页)
+## 6.9 `not` doesn't set flags (the page allocator skipped a whole run of free pages)
 
-位图分配器找空闲页,第一版我这么写:
+For the bitmap allocator's free-page search, my first version looked like this:
 
 ```asm
     mov eax, [esi + edx*4]
-    not eax                ; 0 位(空闲页)取反变成 1
-    jnz .found             ; ✗ 这个 ZF 是**上一条**指令留下的
+    not eax                ; invert so 0 bits (free pages) become 1
+    jnz .found             ; ✗ this ZF was left by the **previous** instruction
 ```
 
-`not` 和 `mov` 一样**不影响标志位**。于是 `jnz` 判断的是别人剩下的标志,
-结果全看运气:页池明明全空,`debug ptest` 第一次分配却拿到第 33 页(`0x00420000`),
-前面 32 页像"已被占用"一样被跳过。换成真正会设标志的指令就好:
+`not`, like `mov`, **does not affect flags**. So `jnz` tested flags left over from something else, and
+the result was pure luck: with the page pool completely empty, the first `debug ptest` allocation got
+page 33 (`0x00420000`), as if the first 32 pages were "already in use". Use an instruction that
+actually sets flags:
 
 ```asm
-    cmp eax, -1            ; 全 1 = 这个 dword 全占满
+    cmp eax, -1            ; all ones = this dword is fully occupied
     jne .found
 ```
 
-坑点:`not` / `mov` / `lea` 不动标志位,后面别紧跟条件跳转。
-(`inc`/`dec` 只是**不改 CF**,ZF/SF 照改,所以 `inc edx` + `cmp` 那套是安全的。)
+Trap: `not` / `mov` / `lea` don't touch flags, so never follow them directly with a conditional jump.
+(`inc`/`dec` only **don't change CF**; they do update ZF/SF, so `inc edx` + `cmp` is safe.)
 
-## 6.10 "建空间"把"镜像多大"一起清了(程序跑的是整个窗口的零字节)
+## 6.10 "Create space" also cleared "how big the image is" (the program ran a whole window of zero bytes)
 
-按需分页第一版:CPU 一碰 0x120000 就红屏,报的却是
+First version of demand paging: the CPU touched 0x120000 and got a red screen, reporting:
 
 ```
 EXCEPTION 0E: page fault
@@ -130,319 +155,365 @@ EIP = 0x00200008   CS = 0x00000008   EFLAGS = 0x00010203
 CR2 (faulting address) = 0x5CD90000
 ```
 
-CR2 是个野地址(不是 0x120000),说明**第一次补页其实成功了**,程序跑起来了 ——
-只是跑的内容不对。把物理内存 dump 下来读 `space_*` 变量才看清:
+CR2 was a wild address (not 0x120000), which meant **the first page-in had actually succeeded** and the
+program was running — just running the wrong content. Only after dumping physical memory and reading
+the `space_*` variables did it become clear:
 
 ```
-space_img_bytes = 0x00000000     ← ✗ 镜像大小是 0
-space_pf_run    = 0x000000d0     ← 补了整个窗口(当时 208 页)一页不落
+space_img_bytes = 0x00000000     ← ✗ image size is 0
+space_pf_run    = 0x000000d0     ← faulted in the whole window (208 pages then), every single one
 pf_off          = 0x0007f000
-pf_len          = 0x00000000     ← 每页都算"文件之外",一句都没拷
+pf_len          = 0x00000000     ← every page counted as "outside the file", nothing copied
 ```
 
-`space_img_bytes` = 0 时,补页逻辑认为**整个窗口都是 `.bss`**,于是每一页都给零页:
-程序执行的是整个窗口的 0 字节(`add [eax], al` 一路乱跳),最后跳到 0x00200008 那种
-野地方 → 二次页错误 → 红屏。
+With `space_img_bytes` = 0, the fault-in logic believed **the whole window was `.bss`**, so it handed a
+zero page to every page: the program executed the entire window of zero bytes (`add [eax], al` bouncing
+around), eventually jumped somewhere wild like 0x00200008 → secondary page fault → red screen.
 
-根因不是补页逻辑,是**调用顺序**:`cmd_run` 里先 `space_set_image`(写大小)、
-后 `space_create`(建空间),而 `space_create` 开头会把自己那堆状态清零 ——
-顺手把刚写进去的大小也清了。修法两条:create 里**不许清输入参数**
-`space_img_bytes`,调用顺序改成 create → set_image。教训:初始化函数"重置自己的状态"时,
-别把**别人刚给你的输入**一起重置 —— 这类症状(数据全是 0)和"逻辑写错"长得一模一样,
-最省事的查法是 dump 内存看变量,而不是盯着代码猜。
+The root cause wasn't the fault-in logic but the **call order**: in `cmd_run`, `space_set_image`
+(writes the size) came before `space_create` (creates the space), and `space_create` zeroes its own
+state at the top — wiping the size that had just been written. Two fixes: create must **not clear the
+input parameter** `space_img_bytes`, and the call order becomes create → set_image. Lesson: when an init
+function "resets its own state", don't reset **the input someone just gave you** — this symptom
+(everything is 0) looks exactly like a logic error, and the cheapest way to find it is to dump memory
+and look at the variables rather than staring at the code.
 
-## 6.11 `mov ebx, 10` 把刚解出来的数字冲掉了(sleep 2 睡了 10 秒)
+## 6.11 `mov ebx, 10` clobbered the just-parsed digit (`sleep 2` slept 10 seconds)
 
-加定时器那天,`uptime` 一切正常,`sleep 2` 却报:
+The day I added the timer, `uptime` was fine but `sleep 2` reported:
 
 ```
 > sleep 2
 slept 10 s (1000 ticks)
 ```
 
-2 秒变成了 10 秒 —— 说明解析出来的数字根本不是 2。看 `parse_dec` 的循环:
+2 seconds became 10 — so the parsed number was not 2 at all. Looking at the `parse_dec` loop:
 
 ```asm
 .next:
     mov bl, [esi]
-    sub bl, '0'          ; ← 数字取到了,存在 bl
-    mov ebx, 10          ; ✗ bl 也是 ebx 的一部分,这一句把数字冲成了 10
+    sub bl, '0'          ; ← digit fetched, stored in bl
+    mov ebx, 10          ; ✗ bl is part of ebx; this overwrites the digit with 10
     mul ebx              ; eax = eax×10
     movzx ebx, bl
-    add eax, ebx         ; 于是加的是 10
+    add eax, ebx         ; so it adds 10
 ```
 
-`mul ebx` 的乘数要用 ebx,而刚解出来的数字正好存在 bl 里 —— 一个字一个字敲进去的
-`2` 被乘数覆盖了,最后 `1 * 10 + 10` 那种算法得出了 10。修法是**先乘再回读字符**:
+`mul ebx` needs the multiplier in ebx, and the digit just parsed sits in bl — the `2` I typed one
+character at a time got overwritten by the multiplier, and the final `1 * 10 + 10` arithmetic produced
+10. The fix is **multiply first, then re-read the character**:
 
 ```asm
     mov ebx, 10
     mul ebx
     test edx, edx
     jnz .bad
-    movzx ebx, byte [esi]   ; ← 回读原字符,不依赖"上一次读到的寄存器"
+    movzx ebx, byte [esi]   ; ← re-read the original character, don't rely on "the register from last read"
     sub ebx, '0'
     add eax, ebx
 ```
 
-这已经是同一类错的**第二次**了(更早那次是 `mov ebx, [shell_len]` 覆盖了存首字节的 `bl`),
-所以教训记牢:在 x86 里**"al/ax/eax 是同一个寄存器"** —— 往 ebx 写值就会改 bl,
-往 eax 写值就会改 al。手上有"临时值"时,先想想下一条指令会不会顺手把它覆盖掉;
-能被覆盖的临时值,要么放别的寄存器,要么**从内存重新读一次**。
+This was already the **second** time for this class of bug (the earlier one was `mov ebx, [shell_len]`
+clobbering the `bl` holding the first byte), so the lesson is burned in: in x86 **"al/ax/eax are the
+same register"** — writing to ebx changes bl, writing to eax changes al. When you're holding a
+"temporary value", think about whether the next instruction will overwrite it in passing; a temporary
+that can be clobbered should either live in another register or be **re-read from memory**.
 
-## 6.12 测试台认不出"星期三"(OCR 的锅),还有 `-qmp` 必须带 `unix:`
+## 6.12 The test harness can't recognize "Wednesday" (OCR's fault), and `-qmp` must have `unix:`
 
-做 CMOS 时钟时撞上两个跟内核代码无关、但很费人的坑:
+Building the CMOS clock hit two traps unrelated to kernel code but very time-consuming:
 
-- **抓屏 OCR 认不出中文星期**:`tests/qemu_test.py` 的 `screen_text()` 是拿字库点阵
-  去比对屏幕像素的,`date` 打的 `星期三` 会被认成 `??????`。所以测试套件里
-  **只断言 ASCII 部分**(时间戳、`RTC: BCD...`、格式参数),星期几得人眼看截图。
-- **QEMU 的 `-qmp` 参数必须写成 `unix:/path/to.sock`**:少写 `unix:` 前缀 QEMU 直接退出
-  (`'...' is not a valid char driver`)。`-monitor` 不用带前缀,`-qmp` 必须带 ——
-  排查时还顺手发现一个上次没杀干净的 QEMU 一直占着 `build/kkernel-hd.img`。
+- **Screenshot OCR can't read Chinese weekdays**: `tests/qemu_test.py`'s `screen_text()` compares screen
+  pixels against the font bitmaps, so the `星期三` printed by `date` comes out as `??????`. That's why
+  the test suite **only asserts on the ASCII part** (timestamp, `RTC: BCD...`, format arguments), and
+  the weekday has to be checked by a human looking at the screenshot.
+- **QEMU's `-qmp` argument must be written as `unix:/path/to.sock`**: leave off the `unix:` prefix and
+  QEMU exits immediately (`'...' is not a valid char driver`). `-monitor` doesn't need the prefix,
+  `-qmp` does — while debugging this I also found a QEMU from a previous run that hadn't been killed
+  cleanly and was still holding `build/kkernel-hd.img`.
 
-## 6.13 换栈只能在中断入口做(设计时就得想清楚"换完从哪继续")
+## 6.13 Stack switching may only happen at interrupt entry (decide "where to resume" at design time)
 
-做抢占时最危险的一步是"把 esp 换成另一个线程的栈"。如果让 `sched_pick` 自己在函数里换
-esp 再 `ret`,那就完蛋了:被弹出的返回地址是从**新栈**上取的,而那里躺着的是新线程的
-现场 —— 一 `ret` 就跳到别人的寄存器值上当代码跑。所以这里分工是死的:`sched_pick`
-只负责"下一个是谁"并把它**返回**,换 esp 的动作由 `irq0_stub` 这条中断入口自己做;
-入口这层没有 `ret`(而是 `popad` + `add esp,8` + `iret`),换完栈正好接着把新线程的现场
-弹回寄存器、`iret` 过去。
-一句话:esp 一改,栈上所有东西的含义就全变了 —— 谁改 esp,谁就必须负责"换完从哪继续"。
+The most dangerous step when adding preemption is "swap esp to another thread's stack". If you let
+`sched_pick` swap esp inside the function and then `ret`, you're doomed: the return address popped comes
+from the **new stack**, where the new thread's frame sits — one `ret` and you jump into somebody else's
+register values and execute them as code. So the division of labor is fixed: `sched_pick` only decides
+"who's next" and **returns** it; the actual esp swap is done by the interrupt entry `irq0_stub` itself.
+That entry layer has no `ret` (it does `popad` + `add esp,8` + `iret`), so right after the swap it pops
+the new thread's frame back into registers and irets away.
+In one sentence: the moment esp changes, the meaning of everything on the stack changes — whoever
+changes esp is responsible for "where execution resumes".
 
-## 6.14 把一个函数插进了"顺序落下"的代码路径中间(第一行输入被吞)
+## 6.14 Inserted a function into the middle of a fall-through code path (first line of input swallowed)
 
-`shell_readline` 和 `shell_readline_resume` 是**故意连着写的**:前者只清一下长度,然后
-顺序落进后者的循环体,共用一个函数体(前者是"新的一行",后者是"接着编辑原来那半行")。
-我后来把新写的 `shell_wait_key` 插在了这两段中间,编译一点问题没有 —— 但 `shell_readline`
-落到的地方从"读行循环"变成了"等一个键然后 `ret`",表现出来是:**第一条命令打得进屏幕、
-却不执行任何命令**(每个键都被当成"这一行读完了",字符全丢)。教训:往汇编里插函数时
-挑 `ret` / 注释块那种干净边界,别插进"上一个函数体靠 fall-through 接着往下走"的地方。
+`shell_readline` and `shell_readline_resume` are **deliberately written back to back**: the former only
+resets the length, then falls through into the latter's loop body, sharing one function body (the former
+is "a new line", the latter is "keep editing the half-line that was there"). I later inserted the
+newly written `shell_wait_key` between the two; it compiled without a complaint — but `shell_readline`
+now fell into "wait for a key then `ret`" instead of the read-line loop, and the symptom was: **the
+first command echoed to the screen but no command ever executed** (every key was treated as "this line
+is done", all characters dropped). Lesson: when inserting a function into assembly, pick a clean
+boundary such as a `ret` or a comment block; never insert into a spot where "the previous function body
+continues by fall-through".
 
-## 6.15 非活动 shell 睡在 `kbd_getchar` 里会抢走"叫醒字节"
+## 6.15 An inactive shell sleeping in `kbd_getchar` steals the "wakeup byte"
 
-换 shell 时,我是往键盘环形缓冲里塞一个 `0x00` 当闹钟,把睡在 `kbd_getchar` 内部的
-`hlt` 上的那条线程叫醒。问题是:**只有一条线程能拿到这个字节** —— 要是被另一条非活动
-shell 抢了,它就继续在里面等真正的按键,换回来时既不重画提示符、还会把本该给活动 shell
-的按键吃掉。改法是在 shell 这层自己包一个等键循环(`shell_wait_key`):只有"我是活动
-shell 而且缓冲区里真有键"时才调 `kbd_getchar`,否则 `hlt` 睡在**自己**的循环里(定时器
-一响就醒,顺便重查自己还是不是活动的)。
+When switching shells, I used to stuff a `0x00` into the keyboard ring buffer as an alarm clock to wake
+the thread sleeping on the `hlt` inside `kbd_getchar`. The problem: **only one thread can get that
+byte** — if an inactive shell grabbed it, that shell went back to waiting for real keys, and when you
+switched back it wouldn't redraw the prompt and would eat keys meant for the active shell. The fix was
+to wrap our own wait-for-key loop at the shell layer (`shell_wait_key`): only call `kbd_getchar` when
+"I am the active shell and there really is a key in the buffer", otherwise `hlt` inside **its own** loop
+(the timer wakes it every tick, and it rechecks whether it's still active).
 
-## 6.16 测试别用固定 `sleep` 等屏幕:字是"画"出来的,不是瞬间出现的
+## 6.16 Don't wait for the screen with a fixed `sleep` in tests: characters are "drawn", not instant
 
-多 shell 落地之后,hd 套件突然多了 8 条失败:文件明明写进去了,`ls` 里却"看不到" `TEST.TXT`;
-`run` 的接口说明、`address space destroyed`、`demand paging: 34 page(s)` 也全都"消失"。
-代码一条没坏 —— 我把同一串命令在干净虚拟机上慢慢敲,全都对。
+After multi-shell landed, the hd suite suddenly had 8 extra failures: files were written, yet `ls`
+"couldn't see" `TEST.TXT`; the `run` usage text, `address space destroyed`, `demand paging: 34 page(s)`
+all "disappeared". Not a line of code was broken — I typed the same command sequence slowly on a clean
+VM and everything was correct.
 
-真相在截图里:抓屏那一刻,`ls` 的**最后一行才画了一半**(末尾是半个 `CHELL…`),
-`TEST.TXT` 还在下面没轮到。内核往 VBE 帧缓冲画字走的是 MMIO,一屏要好几秒;而测试的
-`run()` 敲完命令只 `sleep(0.9)` 就抓屏断言。4 条 shell 线程和 100 Hz 定时器把 guest 拖慢
-一点,这 0.9 秒就不够用了。
+The truth was in the screenshot: at capture time, the **last line of `ls` was only half drawn** (ending
+in half a `CHELL…`), with `TEST.TXT` still below, not reached yet. The kernel draws characters into the
+VBE framebuffer over MMIO, and a full screen takes several seconds; the test's `run()` typed the
+command and only `sleep(0.9)` before capturing and asserting. Four shell threads and the 100 Hz timer
+slow the guest down a bit, and 0.9 seconds stops being enough.
 
-改法有两层:`run()` 敲完命令先等屏幕"静下来"(连续两次抓屏一模一样),断言则改用
-`wait_for("要看到的字")` 轮询到出现为止。教训:**测屏幕内容的用例,永远不要赌一个固定的
-等待时间** —— 要么等"屏幕不再变",要么等"某个字真的出现了"。
+The fix has two layers: `run()` now waits for the screen to "go quiet" (two consecutive identical
+captures) after typing, and assertions use `wait_for("text to see")` polling until it appears. Lesson:
+**never bet on a fixed wait time in a test that checks screen content** — either wait for "the screen
+stopped changing" or wait for "some text actually appeared".
 
-## 6.17 页表是**逐级**查权限的:PD 那级忘了 U/S,程序第一条指令就死
+## 6.17 Page tables check permissions **level by level**: forget U/S at the PD level and the program dies on its first instruction
 
-给程序页表项加了 `PAGE_USER` 还是不行,程序在 0x120000 就吃 `page fault at 0x00120000`
-(错误码 bit0=1 = "页在,但没你的份")。原因:权限不只看最后一级 PTE,**PD 那一项也算** ——
-`space_create` 里挂私有页表时 `or eax, PAGE_P|PAGE_RW` 少了 `PAGE_USER`。两级都加才对。
+Adding `PAGE_USER` to the program's page-table entries still wasn't enough; the program took a
+`page fault at 0x00120000` at 0x120000 (error code bit0=1 = "page is there, but it's not yours").
+Cause: permissions aren't only in the final-level PTE, **the PD entry counts too** — in `space_create`,
+hooking up the private page table did `or eax, PAGE_P|PAGE_RW` and forgot `PAGE_USER`. Both levels have
+to have it.
 
-## 6.18 缺页补页要**按页对齐**地拷
+## 6.18 Fault-in copies must be **page-aligned**
 
-镜像页缺页时从暂存区拷数据,原来是这样写的:`pf_off = 出错地址 - SPACE_IMG_VA`,
-然后从 `SPACE_IMG_VA + pf_off` 拷一整页。**顺序执行的程序永远看不出问题** ——
-它总是走到页边界才缺页,`pf_off` 正好是页首。直到 ring 3 出现"从页中间进代码"的
-`call`:第一次取指落在 `0x121C10`,于是把 `0x121C10` 往后的字节拷到了页首 ——
-整页错位,程序跑的是"别人家的字节"(现象是崩在一个莫名其妙的地址上)。
-正确的写法是先 `and eax, 0xFFFFF000` 再当偏移。
+When an image page faulted, data was copied from the staging area like this: `pf_off = faulting address
+- SPACE_IMG_VA`, then copy a whole page from `SPACE_IMG_VA + pf_off`. **A straight-line program never
+shows the bug** — it only faults at page boundaries, so `pf_off` is always page-aligned. Then ring 3
+produced a `call` that entered code mid-page: the first instruction fetch landed at `0x121C10`, so the
+bytes from `0x121C10` onward were copied to the start of the page — the whole page shifted, and the
+program ran "somebody else's bytes" (symptom: crashing at a nonsense address).
+The correct form is to `and eax, 0xFFFFF000` first and use that as the offset.
 
-## 6.19 `hlt` 是特权指令:演示程序自己先死了
+## 6.19 `hlt` is privileged: the demo program killed itself first
 
-`HANG.BIN` 原来用 `hlt` 当"睡 10 ms"(ring 0 时没问题)。程序搬进 ring 3 之后,
-执行到 `hlt` 直接 #GP,被内核按"异常"处理掉 —— 演示"卡住一条 shell"的程序自己先崩了。
-改成空转忙等(`dec ecx / jnz`),反正定时器每 20 ms 抢占一次,别的 shell 照样能干活。
+`HANG.BIN` used `hlt` as "sleep 10 ms" (fine in ring 0). After the program moved to ring 3, executing
+`hlt` raised #GP and the kernel handled it as an exception — the demo that was supposed to "hang one
+shell" crashed itself first. Changed to a busy spin (`dec ecx / jnz`); the timer preempts every 20 ms,
+so the other shells still make progress.
 
-## 6.20 内核指针不能交给 ring 3 程序
+## 6.20 Kernel pointers must not be handed to ring3 programs
 
-API 12(取参数)以前返回内核里那个参数缓冲区 `0x11F004`。ring 0 时天经地义,
-ring 3 里程序一读就吃页错误(C 程序 `CHELLO.BIN` 崩在 `0x00012D72`,那正是内核里
-那个空串 `api_empty`)。修法:在程序自己的堆窗口里留一页当参数页,装载器把
-"魔数 + 参数字符串"整块拷进去,API 12 返回那儿的地址。**凡是返回指针的 API,
-都要问一句"这个地址在程序自己空间里吗"**。
+API 12 (get argument) used to return the kernel's argument buffer `0x11F004`. Perfectly natural in ring
+0; in ring 3 the program took a page fault on the first read (the C program `CHELLO.BIN` crashed at
+`0x00012D72`, which is exactly the empty string `api_empty` in the kernel). The fix: reserve a page in
+the program's own heap window as the argument page, have the loader copy "magic number + argument
+string" into it as one block, and API 12 returns the address there. **Every API that returns a pointer
+should be asked "is this address inside the program's own space?"**
 
-## 6.21 nasm 三个小坑(`-f bin` 写 ring 3 时踩的)
+## 6.21 Three small nasm traps (hit while writing ring 3 with `-f bin`)
 
-- 对**标签**做 `&` / `>>` 会直接报 `` `&' operator may only be applied to scalar values ``
-  (`dd label` 可以,那只是把地址当数据写)—— GDT 里 TSS 描述符的 base 改成开机运行时回填。
-- `xxx.yyy:` 这种"带前缀的局部标签"会把**后面**的局部标签前缀改成 `xxx.yyy`,
-  于是一整片 `cmd_run.nomem` 都变成未定义。落点要用全局标签(`run_resume_kernel`)。
-- 单引号字符串里 `''` 不是转义(`'the kernel''s'` 会报 `comma expected`)。
+- `&` / `>>` on a **label** fails outright with `` `&' operator may only be applied to scalar values ``
+  (`dd label` is fine, that just writes the address as data) — the TSS descriptor base in the GDT was
+  changed to be filled in at boot time instead.
+- A "prefixed local label" like `xxx.yyy:` changes the prefix of **subsequent** local labels to
+  `xxx.yyy`, so a whole region of `cmd_run.nomem` becomes undefined. Targets need to use global labels
+  (`run_resume_kernel`).
+- Inside single-quoted strings `''` is not an escape (`'the kernel''s'` reports `comma expected`).
 
-## 6.22 读配置的缓冲区压在了 FAT 的扇区缓冲里(读回来 0 字节)
+## 6.22 The config-read buffer sat inside FAT's sector buffer (read back 0 bytes)
 
-`rc_load` 得先把 `RC.CONF` 读进内存再解析。第一版图省事,挑了个看着"空着"的固定地址
-`0x10C000` —— 那地方**在 `FAT_BUF`(0x100000~0x10FFFF)里面**。`fat_read_file` 是一边读扇区
-一边往 `FAT_BUF` 拷、再复制到目的地的,目的地就在它自己那块缓冲里,于是内容被踩烂,
-解析出来 0 个 key。
+`rc_load` has to read `RC.CONF` into memory before parsing. The first version, to save effort, picked a
+fixed address `0x10C000` that looked "empty" — that address is **inside `FAT_BUF`
+(0x100000~0x10FFFF)**. `fat_read_file` reads sectors into `FAT_BUF` and then copies to the destination;
+the destination was inside that same buffer, so the content got trampled and parsing produced 0 keys.
 
-症状很能骗人:开机那次读得到 9 个 key(那时还没人动过 `FAT_BUF`),`write RC.CONF ...` 之后
-再 `rc reload` 就变成 `RC.CONF, 0 keys`。
+The symptom is very deceptive: at boot it read 9 keys (nobody had touched `FAT_BUF` yet), but after
+`write RC.CONF ...` a subsequent `rc reload` reported `RC.CONF, 0 keys`.
 
-教训:内核里挑缓冲区要**先看内存布局注释**(`kernel/kmain.asm` 文件头那张表),
-别自己"看着空"就填;更稳的是干脆用内核自己的静态缓冲(`kernel/rc.asm` 里 `rc_buf times RC_MAX db 0`)。
+Lesson: when picking a buffer in the kernel, **read the memory layout comment first** (the table at the
+top of `kernel/kmain.asm`); don't just fill in whatever "looks empty". Better still, use the kernel's own
+static buffer (`rc_buf times RC_MAX db 0` in `kernel/rc.asm`).
 
-## 6.23 循环里 `push` 没配对 `pop`:`ret` 跳到了 `0x00000007`
+## 6.23 Unbalanced `push` in a loop: `ret` jumped to `0x00000007`
 
-`rc list` 列完两个服务就 `KERNEL PANIC`,`EIP = 0x00000007`。原因:循环体里为了保住 `ecx`
-先 `push ecx`,列完这一项却直接 `jmp .loop` 回去 —— 每一项多压 4 字节,`popad` 从**错位**的
-栈上恢复寄存器,`ret` 自然飞到野地址。改成**循环下标放内存变量**(`rc_lst_i`),栈一个字节都不动,
-这类 bug 就绝迹了。
+`rc list` printed the two services and then `KERNEL PANIC`, `EIP = 0x00000007`. Cause: to preserve
+`ecx` the loop body did `push ecx` first, but after listing the entry it jumped straight back with
+`jmp .loop` — 4 extra bytes pushed per item, so `popad` restored registers from a **misaligned** stack
+and `ret` naturally flew to a wild address. Changed to **keep the loop index in a memory variable**
+(`rc_lst_i`), not touching the stack at all, and this class of bug went extinct.
 
-顺带一条:`pushad` 里改返回值要写 `[esp + 28]`(eax 在 pushad 帧里的偏移),
-这种"约定"一定要写在函数注释里,不然下一个人照样踩。
+One more: to change a return value inside a `pushad` frame you must write `[esp + 28]` (eax's offset in
+the pushad frame); make sure this "convention" is written in the function comment, or the next person
+will step on it too.
 
-## 6.24 两个"看不见的约定":偷改寄存器 + `strip_name` 把第一个空格改 0
+## 6.24 Two "invisible contracts": clobbered registers + `strip_name` zeroing the first space
 
-一个早上抓到两个同类的坑,都出在"小工具函数"上:
+One morning I caught two traps of the same kind, both in "small utility functions":
 
-* `rc_streq_nocase`(比字符串)内部用 `bl` 存字符,却**没保住 ebx**。`rc_get` 拿 ebx 存
-  "要找的 key 指针",于是只有第 1 个 key 能查到 —— 症状是 `hostname` 有值,`autostart` /
-  `on_crash` 全显示"(没设)",`services 0 (0)`。
-* `rc` 的 `cmd_rc` 调了 `strip_name`(shell 里"去掉参数尾巴空格"的老函数)。它实际干的是
-  **把第一个空格改成 0** —— 那是给"只吃一个参数"的命令(`cat FILE`、`run PROG`)准备的,
-  于是 `rc get hostname` 里的 `hostname` 被吃掉、掉进了 `.bad_arg` 分支。
+* `rc_streq_nocase` (string compare) used `bl` to hold a character but **didn't preserve ebx**. `rc_get`
+  used ebx to hold "the key pointer to find", so only the first key could be found — the symptom was
+  that `hostname` had a value while `autostart` / `on_crash` all showed "(not set)" and
+  `services 0 (0)`.
+* The `rc` command's `cmd_rc` called `strip_name` (the shell's old "trim trailing spaces from the
+  argument" function). What it actually does is **replace the first space with 0** — that was written
+  for commands taking exactly one argument (`cat FILE`, `run PROG`) — so in `rc get hostname` the
+  `hostname` got eaten and execution fell into the `.bad_arg` branch.
 
-教训:工具函数要么写清"我改哪些寄存器",要么进出门 `push`/`pop` 全包;
-调用别人写的老函数前,先把它的**注释和实现**都读一遍(名字描述的往往不是全部事实)。
+Lesson: a utility function should either document "which registers I clobber" or wrap its whole body in
+`push`/`pop`; before calling an old function someone else wrote, read both its **comment and its
+implementation** (the name rarely tells the whole truth).
 
-## 6.25 中断门会清 IF,而 `jmp` 不会替你恢复它
+## 6.25 Interrupt gates clear IF, and `jmp` won't restore it for you
 
-程序是**走中断门**进内核的(`int 0x30`、14 号页错误都算),而 x86 的中断门这条硬件路径会
-**把 EFLAGS.IF 清 0**。程序退出后内核走的是 `jmp run_resume_kernel`(不是 `iret`),于是
-IF=0 一路回到了 shell —— 后果特别唬人:定时器(IRQ0)和键盘(IRQ1)的中断被 8259 挂着没人取
-(`info pic` 里 `pic0: irr=03 imr=fc isr=00`),shell 那句 `hlt` 一进去就永远等不到人叫醒它,
-整个系统看着像死机,但 CPU 好端端停在 `hlt`、PIC 掩码也是好的。
-排查招式:`info registers` 看 `EFL` 里有没有 `0x200`(`00000206` 有 = 中断开着,`00000097` 没有
-= 中断被关了),再 `info pic` 看 `irr` 有没有挂着 —— 两者一对就能分清"真死机"和"只是中断关了"。
-修法:`run_resume_kernel` 在换回内核页目录之后补一条 `sti`。
+The program enters the kernel **through an interrupt gate** (`int 0x30` and page fault 14 both count),
+and that hardware path in x86 **clears EFLAGS.IF**. After the program exits, the kernel goes through
+`jmp run_resume_kernel` (not `iret`), so IF=0 all the way back into the shell — with a truly scary
+consequence: timer (IRQ0) and keyboard (IRQ1) interrupts were left hanging in the 8259 with nobody
+taking them (`pic0: irr=03 imr=fc isr=00` in `info pic`), and the shell's `hlt` never got a wakeup, so
+the whole system looked hung — while the CPU was sitting happily in `hlt` and the PIC mask was fine.
 
-## 6.26 配置空间读出来全是 0:忘了把 bit31 置 1
+Debugging moves: `info registers` to see whether `EFL` contains `0x200` (`00000206` = interrupts on,
+`00000097` = interrupts off), then `info pic` to see whether `irr` has anything pending — comparing the
+two tells "really hung" apart from "just interrupts disabled".
+Fix: `run_resume_kernel` adds a `sti` after switching back to the kernel page directory.
 
-PCI 的机制 #1 是"写地址(0xCF8)、读数据(0xCFC)",那个地址的 **bit31 必须是 1**,
-表示"这次访问要真的发出去"。忘了置 1 的话 CPU 根本不会发起配置周期,
-读回来的就是 0x00000000 —— 屏幕上表现为"每台设备都读成 0000:0000",而且不报错。
-先怀疑地址寄存器,再怀疑设备。
+## 6.26 Config space reads all zeros: forgot to set bit31
 
-## 6.27 只扫 func 0 会漏掉设备的"兄弟"
+PCI mechanism #1 is "write address (0xCF8), read data (0xCFC)", and **bit31 of that address must be 1**,
+meaning "actually issue this access". Forget to set it and the CPU never starts a config cycle; you read
+back 0x00000000 — on screen every device reads as `0000:0000`, with no error reported. Suspect the
+address register before the device.
 
-一个 PCI 设备最多有 8 个功能(function)。ISA 桥(00:01.0)自己只是个桥,
-它的 **IDE 控制器(00:01.1)、USB 控制器(00:01.2)、电源管理(00:01.3)全是它的功能**。
-判断方法:读设备头部的 header type,bit7 = 1 说明是"多功能设备",
-这时候 func 1~7 都要扫。只扫 func 0 的话,你的机器上"看不到 IDE 也看不到 USB"。
+## 6.27 Scanning only func 0 misses a device's "siblings"
 
-## 6.28 不存在的设备返回 0xFFFF,不是 0
+A PCI device can have up to 8 functions. The ISA bridge (00:01.0) is just a bridge; its **IDE controller
+(00:01.1), USB controller (00:01.2), and power management (00:01.3) are all its functions**. How to
+tell: read the header type at the start of the device header; bit7 = 1 means "multi-function device",
+in which case funcs 1~7 all need scanning. Scan only func 0 and "you can't see IDE or USB" on your
+machine.
 
-读取一个空槽位,配置空间返回 **0xFFFF**(厂商号 0xFFFF 是"没有设备"的约定),
-而不是 0。所以判断"这里有没有设备"要用 `cmp eax, 0xFFFFFFFF`。
-另外 0x00000000 是另一种情况:设备在、但寄存器就是 0。
+## 6.28 Absent devices return 0xFFFF, not 0
 
-## 6.29 写命令寄存器要用 16 位写(status 是"写 1 清")
+Reading an empty slot returns **0xFFFF** from config space (vendor ID 0xFFFF is the "no device"
+convention), not 0. So test "is there a device here" with `cmp eax, 0xFFFFFFFF`.
+Also, 0x00000000 is a different case: the device is there, but the register really is 0.
 
-命令寄存器(command)和状态寄存器(status)共用 offset 4:低 16 位是命令(读写)、
-高 16 位是状态(**写 1 才清**)。想开 Bus Master 就只写低 16 位(`out dx, ax`),
-用 32 位写会把高位的状态位全清掉 —— 那会把"设备报过什么错"这类信息擦掉。
-我们枚举时会给每台设备打开 I/O + MMIO + Bus Master,用的就是 16 位写。
+## 6.29 Write the command register with a 16-bit write (status is write-1-to-clear)
 
-## 6.30 手写 push/pop 不配平:`ret` 飞到了 0x9208
+The command register and status register share offset 4: the low 16 bits are command (read/write), the
+high 16 bits are status (**write 1 to clear**). To enable Bus Master, write only the low 16 bits
+(`out dx, ax`); a 32-bit write clears all the high status bits — erasing information like "what errors
+the device has reported". Our enumeration enables I/O + MMIO + Bus Master on every device, using 16-bit
+writes.
 
-给 PCI 写十六进制打印时,我手写了三份 `pci_ph1/2/4`,其中一份最后**多 pop 了一个寄存器**,
-于是 `ret` 弹出来的是栈上的脏数据(0x9208)⇒ 开机就
-`*** KERNEL PANIC *** / EXCEPTION 0E: page fault / EIP = 0x00009208`。
-教训:**要么老老实实 pushad/popad,要么一个字节都别多动栈**(和 6.23 是同一个坑的两种形状)。
-重写成一个 `pushad/popad` + `shr edx, cl` 的循环就再没出过事。
+## 6.30 Unbalanced hand-written push/pop: `ret` flew to 0x9208
 
-## 6.31 QEMU 的 USB 键盘会把 `sendkey` 抢走(窗口看着像死了)
+Writing hex printing for PCI, I hand-wrote three variants `pci_ph1/2/4`, and one of them **popped one
+register too many** at the end, so `ret` popped dirty stack data (0x9208) ⇒ at boot:
+`*** KERNEL PANIC *** / EXCEPTION 0E: page fault / EIP = 0x00009208`.
+Lesson: **either use pushad/popad honestly, or don't move the stack by a single extra byte** (same trap
+as 6.23, two shapes). Rewritten as one loop with `pushad/popad` + `shr edx, cl`, it never happened
+again.
 
-两个连着的坑:
-1. `-device usb-kbd` 单独用会报 `No 'usb-bus' bus found for device 'usb-kbd'` ——
-   得先有 `-usb`(它顺手把机器自带的 PIIX3 UHCI 控制器挂到 00:01.2)。
-2. **一旦真插了 usb-kbd,QEMU 的 `sendkey` 就改投 USB 键盘** ⇒ 我们的 PS/2 驱动
-   一个键也收不到,测起来像"系统死了"。所以 Makefile 和测试台都只用 `-usb`
-   (要的就是那台 UHCI 控制器),不插 USB 键盘。
+## 6.31 QEMU's USB keyboard steals `sendkey` (the window looks dead)
 
-## 6.32 I/O BAR 写全 1 量大小,会把整个配置空间搞挂
+Two traps in a row:
+1. Using `-device usb-kbd` alone reports `No 'usb-bus' bus found for device 'usb-kbd'` — you need
+   `-usb` first (which also attaches the machine's built-in PIIX3 UHCI controller at 00:01.2).
+2. **Once a usb-kbd is really plugged in, QEMU's `sendkey` goes to the USB keyboard instead** ⇒ our
+   PS/2 driver receives nothing and the tests look like "the system died". So the Makefile and the test
+   harness only use `-usb` (we want that UHCI controller) and never plug in a USB keyboard.
 
-"往 BAR 写全 1、读回来反推大小"是 PCI 的标准做法,但它在这台 QEMU 上只对**内存 BAR** 安全:
-拿 IDE 的 BAR4(I/O BAR)这么量一次,之后**所有**设备的配置空间都读成 0x0004 / 全 0,
-连它自己的大小都读成 62224 这种鬼数字(真值 16 字节)。
-所以 `kernel/pci.asm` 现在只量内存 BAR,I/O BAR 直接给基址 —— 反正 USB 驱动要的
-UHCI BAR4 就是个 I/O 基址(`0xC040`),地址够用,不用知道大小。
+## 6.32 Writing all-ones to an I/O BAR to size it breaks the whole config space
 
-## 6.33 软盘:EDD 跨磁道 + ISA DMA 跨 64 KiB(两个坑叠在一起)
+"Write all ones to the BAR, read it back and invert to get the size" is the standard PCI trick, but on
+this QEMU it is only safe for **memory BARs**: doing it once on the IDE's BAR4 (an I/O BAR) made the
+config space of **every** device read back 0x0004 / all zeros, even its own size reading as a nonsense
+number like 62224 (the true size is 16 bytes). So `kernel/pci.asm` now only sizes memory BARs and takes
+I/O BARs' bases as given — the UHCI BAR4 the USB driver needs is an I/O base (`0xC040`), and knowing the
+address is enough; we don't need the size.
 
-`make test-fda` 曾经整组全红:软盘镜像开机**屏幕全黑**,QEMU monitor 看 CPU 停在
-`EIP=0x7D78`(引导扇区那个 `halt16`)、`HLT=1`、还是实模式 —— 读盘失败、重试三次、停机。
-坑是**两个叠在一起**,而且各自都能单独要命:
+## 6.33 Floppy: EDD crossing tracks + ISA DMA crossing 64 KiB (two traps stacked)
 
-1. **软盘走了 EDD/LBA**:BIOS 嘴上说支持,但软盘的 EDD 读**跨磁道就失败**
-   (1.44 MB 每磁道 18 扇区,一次读 8 扇区很容易跨)⇒ 盘号 `< 0x80` 一律走 CHS。
-2. **ISA DMA 不能跨 64 KiB 物理边界**:软盘读盘走 DMA(硬盘的 EDD 不走,所以硬盘上一直
-   没问题)。目的地址 `0x1F200` 再读 4 KiB 就跨过 `0x20000`,BIOS 直接报错 ⇒ 每次读之前
-   把扇区数夹到"当前 64 KiB 页里还剩多少",见 `boot/boot.asm` 的 `read_chunk`。
-   还有一条:**别按固定次数循环** —— 实际读几个扇区由 BIOS 决定,得看 `dap_lba` 有没有
-   走到 `KERNEL_LBA + KERNEL_SECTS`。
+`make test-fda` once went entirely red: the floppy image booted to a **black screen**, and QEMU monitor
+showed the CPU stopped at `EIP=0x7D78` (the boot sector's `halt16`), `HLT=1`, still in real mode — disk
+read failed, retried three times, halted. The trap was **two stacked together**, and either one alone
+was fatal:
 
-怎么确认它真的读全了:`make test-fda` 连跑 7 次全绿只是第一层;真正较真的是把客户机
-`0x10000` 起的 128 KiB 内核区用 QMP `pmemsave` dump 出来、跟镜像逐字节比 ——
-1485 个字节不同、分成 610 段、**最长一段才 14 字节**,没有一整扇区的差 ⇒ 差的全是内核
-运行时自己改的数据(`.bss`、shell 缓冲区),256 个扇区一个不少。
+1. **The floppy took the EDD/LBA path**: the BIOS claimed support, but floppy EDD reads **fail when
+   crossing a track** (1.44 MB has 18 sectors per track; reading 8 at a time crosses easily) ⇒ drive
+   numbers `< 0x80` always go CHS.
+2. **ISA DMA cannot cross a 64 KiB physical boundary**: floppy reads use DMA (hard-disk EDD doesn't, so
+   hard disks were always fine). The destination address `0x1F200` plus a 4 KiB read crosses `0x20000`
+   and the BIOS errors out ⇒ clamp the sector count before every read to "how much is left in the
+   current 64 KiB page"; see `read_chunk` in `boot/boot.asm`.
+   One more: **don't loop a fixed number of times** — how many sectors actually got read is decided by
+   the BIOS, so check whether `dap_lba` has reached `KERNEL_LBA + KERNEL_SECTS`.
 
-## 6.34 测试抓屏:别用固定路径,也别在"画到一半"时断言
+How to confirm it really read everything: `make test-fda` passing 7 times in a row is only the first
+layer; the strict check is dumping the 128 KiB kernel region starting at guest `0x10000` with QMP
+`pmemsave` and comparing it byte by byte against the image — 1485 bytes differ, split into 610 runs,
+**the longest run only 14 bytes**, and no whole-sector difference ⇒ every difference is data the kernel
+changed itself at runtime (`.bss`, shell buffers), and all 256 sectors are there.
 
-两个测试台自己的坑,都表现为"偶发一条假失败":
+## 6.34 Test screenshots: don't use a fixed path, and don't assert while it's half drawn
 
-- 抓屏原来固定写 `build/_shot.ppm`。两轮测试(或者我和测试台)同时开着时,会**读到别人家的
-  屏幕** —— 硬盘那轮的「读盘方式」断言就偶发读到软盘屏幕上的 `boot disk: CHS fallback`。
-  现在默认路径带进程号(`/tmp/kkernel-shot-<pid>.ppm`)。
-- 开机那几十行是内核**一行一行往 VBE 帧缓冲上画**的(MMIO,一屏好几秒),而抓屏只等了 2 秒。
-  机器一忙就可能拍到画到一半的屏幕。现在先等最后一行出现(最多 10 秒)再逐条断言;
-  真失败时把屏幕 OCR 出来、存 `build/screen-fail.png`,不用再靠猜。
-- 同一个毛病在最简单的 `--shell` 分支上也咬了一口:`run()` 原来"敲完 sleep 0.7 秒"就断言,
-  `debug`(不带子命令)那行用法在忙一点的机器上就是画不完 ⇒ `make test-shell` 稳定假失败。
-  现在 `run()` 敲之前、敲之后都等屏幕静下来(连续两次抓屏一模一样)。
-  ⚠️ 这个分支里**不能**直接用外面那个 `wait_idle`:它是在 hd 模式那段才定义的,
-  软盘跑 `--shell` 时还没轮到 ⇒ `NameError`;分支里自己写一份最省心
-  (和 6.x 的 `wait_for` 是同一个坑)。
+Two traps in the test harness itself, both showing up as "one flaky false failure":
 
-## 6.35 帧缓冲滚屏:格子对齐 + "别把慢当成坏"
+- Screenshots used to be written to a fixed `build/_shot.ppm`. With two test rounds running at once (or
+  me and the harness), it would **read somebody else's screen** — the hard-disk round's "read method"
+  assertion occasionally saw `boot disk: CHS fallback` from the floppy screen. The default path now
+  includes the pid (`/tmp/kkernel-shot-<pid>.ppm`).
+- The several dozen boot lines are drawn by the kernel **one line at a time into the VBE framebuffer**
+  (MMIO, several seconds per screen), while the screenshot only waited 2 seconds. On a busy machine you
+  could capture a half-drawn screen. Now it waits for the last line to appear (up to 10 seconds) before
+  asserting line by line; on a real failure it OCRs the screen and saves `build/screen-fail.png`, so you
+  don't have to guess.
+- The same problem bit the simplest `--shell` branch too: `run()` used to "type, sleep 0.7 seconds, then
+  assert", and the usage line printed by `debug` (with no subcommand) simply doesn't finish drawing on a
+  busy machine ⇒ `make test-shell` failed reliably-but-falsely. Now `run()` waits for the screen to go
+  quiet both before and after typing (two consecutive identical captures).
+  ⚠️ In that branch you **cannot** use the outer `wait_idle` directly: it is defined in the hd-mode
+  section, which the floppy `--shell` run hasn't reached ⇒ `NameError`; writing a local copy in the
+  branch is the least painful (same trap as `wait_for` in 6.x).
 
-图形模式(VBE)下的终端是**自己往帧缓冲里画字**的,滚屏就是 `rep movsd` 整块往上搬 16 行。
-踩过两个坑:
+## 6.35 Framebuffer scrolling: cell alignment + "don't mistake slow for broken"
 
-1. **600 像素 ÷ 16 = 37.5**:底边原来夹到 `600-16 = 584`,而 `584 % 16 = 8` —— 滚一次屏之后,
-   新写的每一行都比滚上去的旧行低 8 像素,"两代文字"叠在一起,整屏花掉。
-   现在先把高度按 16 对齐(`fb_height & ~15` → 592)再减一行,光标永远落在格子线上。
-2. **慢不等于坏**:往 VBE 帧缓冲写字在 QEMU 里是 MMIO,画满一屏 2 KB 中文要好几秒。
-   当时一半的"花屏"其实是测试台抓到了画到一半的屏幕(固定 sleep 不够)——
-   修对齐 + 修测试台的等待(6.34)之后,同一批断言全绿。
+The terminal in graphics mode (VBE) **draws characters into the framebuffer itself**, and scrolling is a
+`rep movsd` moving 16 rows up as a block. Two traps:
 
-hd 套件里现在有专门的断言:2 KB 中文滚过几屏之后,再用 `uptime` 的输出当探针,
-确认屏幕还是"读得出来"的。
+1. **600 pixels ÷ 16 = 37.5**: the bottom edge used to be clamped to `600-16 = 584`, and `584 % 16 = 8` —
+   after one scroll, every newly written row sat 8 pixels lower than the old rows scrolled up, so "two
+   generations of text" overlapped and the whole screen turned to garbage. Now the height is first
+   aligned to 16 (`fb_height & ~15` → 592) and then one row subtracted, so the cursor always lands on a
+   cell line.
+2. **Slow is not the same as broken**: writing to the VBE framebuffer in QEMU is MMIO, and a full screen
+   of 2 KB of Chinese takes several seconds. Half of the "garbled screens" back then were actually the
+   harness capturing a half-drawn screen (the fixed sleep wasn't enough) — after fixing the alignment
+   and the harness's waiting (6.34), the same assertions all passed.
 
-## 6.36 把内存里的变量当函数 `call`,跳进了数据区
+The hd suite now has a dedicated assertion: after 2 KB of Chinese has scrolled several screens, use the
+output of `uptime` as a probe to confirm the screen is still "readable".
 
-给 `spawn` 加"记住这条线程出生在哪条 shell 上"的时候,我写了一句
+## 6.36 Called a memory variable as a function, jumped into the data area
+
+Adding "remember which shell this thread was born on" to `spawn`, I wrote
 
 ```asm
-call sched_cur          ; ✗ sched_cur 是 dd,不是函数
+call sched_cur          ; ✗ sched_cur is a dd, not a function
 ```
 
-`sched_cur` 是**内核数据区里的一个 `dd`**(存着当前线程号),不是函数。
-于是 `call` 把返回地址压栈、跳进数据区,CPU 在那儿执行零字节,一路跑过
-`sched_live` / `sched_ticks`,最后在 `sched_cur` 自己的存储附近炸了:
+`sched_cur` is **a `dd` in the kernel data area** (holding the current thread number), not a function.
+So `call` pushed the return address and jumped into the data area, where the CPU executed zero bytes,
+ran straight through `sched_live` / `sched_ticks`, and finally blew up near `sched_cur`'s own storage:
 
 ```
 *** KERNEL PANIC ***
@@ -451,45 +522,50 @@ EIP = 0x0001D1BA   CS = 0x00000008   EFLAGS = 0x00010202
 CR2 (faulting address) = 0x38000004
 ```
 
-**怎么定位的**(这招值得记住):`EIP = 0x1D1BA` 是**代码地址**,而内核里所有代码都在
-`0x10000` 之后 —— 拿 `nasm -l build/kernel.lst` 的列表一查,`0xD1B1` 那一行写的是
+**How I located it** (a trick worth remembering): `EIP = 0x1D1BA` is a **code address**, while all kernel
+code lives after `0x10000` — checking the listing from `nasm -l build/kernel.lst`, the line at `0xD1B1`
+reads:
 
 ```
 0xD1B1:   367 0000D1B1 00000000     <1> sched_cur       dd 0
 ```
 
-也就是说 **EIP 落在 `sched_cur` 自己身上**:`call` 真的跳进了数据区。
-改成 `mov eax, [sched_cur]` 就好了。
+In other words, **EIP landed on `sched_cur` itself**: `call` really did jump into the data area. Changing
+it to `mov eax, [sched_cur]` fixed it.
 
-教训:**`call` / `jmp` 的目标必须是代码标签**;变量一律用 `[...]` 取值。
-还有一个同族的坑:同一个表达式写成 `call [mem]` 也不行 —— 那会跳到"那个变量**存的值**"
-所指的地址去,而它多半是个线程号(0/1/2),不是代码。
+Lesson: **the target of `call` / `jmp` must be a code label**; variables are always read with `[...]`.
+One more trap in the same family: writing the same expression as `call [mem]` is also wrong — that jumps
+to the address held in **the value stored in the variable**, which is most likely a thread number
+(0/1/2), not code.
 
-## 6.37 TCB 从 32 字节变 40:全仓的 `shl 5` 都得改
+## 6.37 TCB grew from 32 bytes to 40: every `shl 5` in the repo had to change
 
-TCB 原来正好 32 字节,于是全仓拿 `shl X, 5` 当"×结构体大小"用(好写、好快)。
-这次要加一个字段(出生在哪条 shell 上),32 就不够了 —— 40 不是 2 的幂,
-所有下标计算都得变成 `imul X, TCB_SIZE`。
+The TCB used to be exactly 32 bytes, so the whole repo used `shl X, 5` as "× struct size" (easy to
+write, fast). This time a field had to be added (which shell it was born on), and 32 was no longer
+enough — 40 is not a power of two, so every index computation had to become `imul X, TCB_SIZE`.
 
-踩过的地方:**改完忘了某一处 `shl`**,那处就会按 32 字节算下标,
-读出来的 esp/cr3/state 全是错位的(症状五花八门:`ps` 显示的线程号对不上、
-kill 杀错对象、甚至切栈切到别人家)。所以现在全仓统一用一个宏:
+Where it bit: **I changed everything but forgot one `shl`**, and that site computed indices as if the
+TCB were 32 bytes, so the esp/cr3/state it read were all shifted (symptoms varied wildly: thread numbers
+in `ps` didn't match, kill killed the wrong target, stack switches even landed on someone else's). So now
+the whole repo uses one macro:
 
 ```asm
 %define TCB_OFF(id) (((id) * TCB_SIZE))
 ```
 
-**下次加字段只改 `TCB_SIZE` 一个地方**。真要偷懒也行:干脆别用 32 的倍数,
-40 这种"不是 2 的幂"其实更安全 —— `shl 5` 会立刻算错,错得响亮,而不是悄悄对一半。
+**Next time a field is added, only `TCB_SIZE` changes.** If you really want to be lazy, go further: don't
+use a multiple of 32 at all — a non-power-of-two like 40 is actually safer, because `shl 5` is instantly
+wrong, loudly wrong, instead of quietly half-right.
 
-## 6.38 萌文案里的字形,得先去字库查一遍
+## 6.38 Glyphs in cute text need to be checked against the font first
 
-给提示符写萌文案时我第一版用的是标准 kaomoji:`(｡•́︿•̀｡)`,结果一上机全是方块。
-原因:字库(42112 个字形)里**半角片假名 `U+FF61-FF9F` 一个不缺**,`｡ ･ ﾟ ノ ｰ` 都有,
-但 `• U+2022`、`́ U+0301`、`̀ U+0300`、`︿ U+FE3F`、`ω U+03C9`、`∀ U+2200` 都没有;
-换了字库也用不了 —— 缺字形的地方只能显示替换符。
+Writing cute text for the prompt, my first version used a standard kaomoji: `(｡•́︿•̀｡)`, and it came up
+as boxes on the machine. Cause: the font (42112 glyphs) has **every half-width katakana
+`U+FF61-FF9F`**, including `｡ ･ ﾟ ノ ｰ`, but `• U+2022`, `́ U+0301`, `̀ U+0300`, `︿ U+FE3F`,
+`ω U+03C9`, `∀ U+2200` are all absent; a different font wouldn't help either — missing glyphs can only
+show the replacement character.
 
-所以写文案前先查一遍:
+So check before writing text:
 
 ```sh
 python3 - <<'EOF'
@@ -507,29 +583,34 @@ for ch in dict.fromkeys(want):
 EOF
 ```
 
-另外:`style` 换样式会改提示符本身,**测试断言别依赖提示符里的非 ASCII 字符** ——
-测试台的 OCR 只认它字库里的字符,`かいかーねる` 在断言里永远是 `??????`,
-所以套件里只用 `C:\>` / `prompt style: dos` 这种纯 ASCII 的东西做断言。
+Also: `style` changes the prompt itself, so **test assertions must not depend on non-ASCII characters in
+the prompt** — the harness's OCR only knows the characters in its font, and `かいかーねる` is always
+`??????` in an assertion. That's why the suite only asserts on pure ASCII things like `C:\>` /
+`prompt style: dos`.
 
-## 6.39 帧缓冲慢,是因为每画一个字就要碰一次显存
+## 6.39 The framebuffer is slow because every glyph touches video memory once
 
-`cat DOCS/README.TXT`(2 KB 中文)在 VBE 800x600 下要 5.7 秒。慢的根源不是"画字算法",
-而是**每画一个字符就往显存(MMIO)写 16 次**——显存写比内存慢得多。
+`cat DOCS/README.TXT` (2 KB of Chinese) took 5.7 seconds at VBE 800x600. The root cause isn't the "glyph
+drawing algorithm" but **writing to video memory (MMIO) 16 times per character** — video memory writes
+are far slower than ordinary memory.
 
-改法是给终端加一块"当前行"的行缓冲(`kernel/fbterm.asm`,13 页 = 53 KB,开机时从
-物理页池 `pmem_alloc_pages` 申请):
+The fix is to give the terminal a "current line" line buffer (`kernel/fbterm.asm`, 13 pages = 53 KB,
+allocated from the physical page pool with `pmem_alloc_pages` at boot):
 
-- 画字只写这块 RAM,并记下脏段的左右边界 `[x0, x1)`
-- 到 `fb_newline` / 滚屏 / 退格,才 `fb_flush` 一次,把脏段整段搬进显存
-- 滚屏、清屏之后 `fb_lb_forget` 让缓冲失效,否则会把旧像素糊回干净屏幕
-- 分配不到页(或 pitch 超限)就 `fb_lb_base = 0`,自动退回逐字直写
+- Drawing writes only to this RAM, recording the dirty span's left/right bounds `[x0, x1)`
+- On `fb_newline` / scroll / backspace, call `fb_flush` once to move the dirty span into video memory
+- After scrolling or clearing the screen, `fb_lb_forget` invalidates the buffer, otherwise old pixels get
+  smeared back onto a clean screen
+- If pages can't be allocated (or pitch is out of range), set `fb_lb_base = 0` and fall back to
+  character-by-character direct writes automatically
 
-顺带两个坑:
+Two side traps:
 
-1. **睡下去的 `hlt` 前要 `call fb_flush`**,否则"没换行的半行字"(提示符之类)会
-   一直不显示——它还在 RAM 里,没等到换行没机会刷。
-2. **`pmem_init` 得在 `fb_init` 之前**:行缓冲要用页池,页池初始化又要趁还没开分页。
+1. **`call fb_flush` before going to sleep in `hlt`**, otherwise a "half line with no newline" (the
+   prompt, for instance) never shows up — it's still in RAM, waiting for a newline that never comes.
+2. **`pmem_init` must come before `fb_init`**: the line buffer needs the page pool, and the page pool has
+   to be initialized while paging is still off.
 
-改完同一时刻 A/B 实测:5.69 s → **0.90 s(约 6.3 倍)**,而改前/改后最终屏的
-sha256 **完全一致**——纯提速,一个像素都没变。教训:**先量再改;改完拿像素证明观感没变**。
-
+A/B measured at the same moment after the change: 5.69 s → **0.90 s (about 6.3×)**, while the sha256 of
+the final screen before and after is **exactly identical** — pure speedup, not a pixel changed. Lesson:
+**measure before you change; after changing, prove with pixels that the look didn't change.**
