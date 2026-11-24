@@ -166,6 +166,7 @@ docs/        architecture, pitfalls, shell commands, subsystem docs
 | [docs/font.md](docs/font.md) | Chinese and font data |
 | [docs/rc-conf.md](docs/rc-conf.md) | `RC.CONF` configuration keys |
 | [docs/known-issues.md](docs/known-issues.md) | known limitations and flaky-test notes |
+| [docs/x64.md](docs/x64.md) | x86-64 start64: switch to long mode and run the independent 64-bit kernel |
 | [docs/design-multishell-cow.md](docs/design-multishell-cow.md) | multi-shell virtual console + fork/memory CoW design draft |
 
 ## Known limitations

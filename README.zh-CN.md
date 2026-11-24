@@ -166,6 +166,7 @@ docs/        架构、踩坑、shell 命令、子系统文档
 | [docs/zh-CN/font.md](docs/zh-CN/font.md) | 中文与字库数据 |
 | [docs/zh-CN/rc-conf.md](docs/zh-CN/rc-conf.md) | `RC.CONF` 配置项 |
 | [docs/zh-CN/known-issues.md](docs/zh-CN/known-issues.md) | 已知限制与 flaky 测试说明 |
+| [docs/zh-CN/x64.md](docs/zh-CN/x64.md) | x86-64 start64：切长模式跑独立 64 位内核 |
 | [docs/zh-CN/design-multishell-cow.md](docs/zh-CN/design-multishell-cow.md) | 多 shell 虚拟控制台 + fork/内存 CoW 设计稿 |
 
 ## 已知限制
