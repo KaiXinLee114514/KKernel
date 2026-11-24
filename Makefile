@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check k64 test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check k64 test-k64 test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -402,12 +402,18 @@ makefile-check:
 docs-check:
 	@bash tools/check-docs.sh
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug test-tty test-login test-sched test-jobctl test-wait-race test-swap
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug test-tty test-login test-sched test-jobctl test-wait-race test-swap test-k64
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --usbdisk --font font/full-kkf.bin
+
+# x86-64:start64 → 加载 BIN/K64.BIN 切长模式,64 位内核横幅/info/echo/ticks/reboot
+test-k64: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
+	@echo "── x86-64:start64 → 长模式 64 位内核(--k64)──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --k64 --font font/full-kkf.bin
 
 # USB 键盘自测:QEMU 只插 usb-kbd(sendkey 全部改投 USB 键盘),能登录、能敲命令才算过。
 # 这台内核只有 UHCI(USB1.1 全速 12Mbps),QEMU 的 usb-kbd 就是以全速设备接进来的。

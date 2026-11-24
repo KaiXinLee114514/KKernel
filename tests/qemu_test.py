@@ -1021,6 +1021,7 @@ def main() -> int:
     wait_race_mode = "--wait-race" in argv  # wait 竞态:两个并发实例各自 fork/wait 50 轮,退出码不串
     swap_mode = "--swap" in argv            # swap:页换出/换入 + 大匿名堆(默认 -m 16)
     swap_cold_mode = "--swap-cold" in argv  # swap 对照:大内存下全部驻留(-m 64,不换出)
+    k64_mode = "--k64" in argv              # x86-64:start64 → 长模式 → 独立 64 位内核
     mem_mib = 128                           # QEMU 物理内存(-m):swap 测试用 16/64
     if "--mem" in argv:
         mem_mib = int(argv[argv.index("--mem") + 1])
@@ -1033,7 +1034,7 @@ def main() -> int:
                          "--usb-ehci", "--usb-hotplug",
                          "--mine", "--proc",
                          "--tty", "--login", "--sched", "--jobctl", "--wait-race",
-                         "--swap", "--swap-cold")]
+                         "--swap", "--swap-cold", "--k64")]
     if "--mem" in argv:
         i = argv.index("--mem")
         del argv[i:i + 2]
@@ -1104,10 +1105,14 @@ def main() -> int:
     qmp_sock = f"{sock}.qmp"
     if os.path.exists(qmp_sock):
         os.unlink(qmp_sock)
+    # ★ x86-64 start64 用例:qemu-system-i386 的 CPU 模型都把长模式(CPUID LM 位)过滤掉了,
+    #   必须用真正的 x86_64 模拟器;其他用例继续用 i386(行为/速度都一致)。
+    qemu_bin = "/usr/bin/qemu-system-x86_64" if k64_mode else "qemu-system-i386"
+    k64_args = ["-cpu", "qemu64"] if k64_mode else []
     qemu = subprocess.Popen(
-        ["qemu-system-i386", *drive,
+        [qemu_bin, *drive,
          "-m", str(mem_mib),
-         "-display", "none", "-no-reboot",
+         "-display", "none", "-no-reboot", *k64_args,
          # 挂一个 USB 控制器给 PCI 枚举断言用(以后 USB 驱动也用它)。
          # 用 `-usb` 而不是 `-device piix3-usb-uhci`:前者把机器自带的 UHCI 挂在
          # 00:01.2(和 QEMU 的 info pci / 真实 PIIX3 一样),后者会另起一个 00:04.0 的,
@@ -1214,6 +1219,56 @@ def main() -> int:
                 shot.save("build/screen.png")
                 print(f"(图形模式 {shot.size[0]}×{shot.size[1]},已存 build/screen.png)")
             return 0
+
+        if k64_mode:
+            # ---- x86-64 start64:32 位内核 → 长模式 → 独立 64 位内核(Phase 1 MVP)----
+            results = []
+
+            def k64_run(line: str, wait: float = 1.0) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            def k64_text() -> str:
+                if graphics:
+                    return "\n".join(screen_text(shot, glyphs))
+                return "\n".join(mon.screen())
+
+            mon.type_text("start64")
+            mon.sendkey("ret")
+            results.append(("start64 切长模式进 64 位内核(横幅)",
+                            wait_has("KKernel x86-64", 20.0) and wait_has("long mode: enabled", 3.0),
+                            "KKernel x86-64 / long mode: enabled"))
+            results.append(("64 位 shell 提示符 k64>", wait_has("k64>", 8.0), "k64> "))
+
+            k64_run("info", 1.2)
+            results.append(("info:PAE=1 且 LME=1", has("PAE=1") and has("LME=1"), "PAE=1 LME=1"))
+            results.append(("info:CPU / CR0 / CR4 / EFER 信息",
+                            has("CPU:") and has("EFER=") and has("CR0="),
+                            "CPU: ... CR0=0x... CR4=0x... EFER=0x..."))
+
+            k64_run("echo hello64", 1.0)
+            results.append(("echo hello64(64 位键盘/控制台)", has("hello64"), "hello64"))
+
+            k64_run("ticks", 1.0)
+            m = re.search(r"ticks:\s*(\d+)", k64_text())
+            results.append(("ticks 计数(PIT 100 Hz)", bool(m) and int(m.group(1)) > 0,
+                            "ticks: <正整数>"))
+
+            # reboot:64 位内核用 0xCF9 复位,QEMU -no-reboot 下应当直接退出
+            mon.type_text("reboot")
+            mon.sendkey("ret")
+            t0 = time.monotonic()
+            exited = False
+            while time.monotonic() - t0 < 15.0:
+                if qemu.poll() is not None:
+                    exited = True
+                    break
+                time.sleep(0.3)
+            results.append(("reboot 重启机器(QEMU -no-reboot 下退出)", exited,
+                            "64 位内核的 reboot 生效"))
+            return report(results)
 
         if tty_mode:
             # ---- TTY:两问向导 → 登录 → ANSI / ASCII 降级行为 ----
