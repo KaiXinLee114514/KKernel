@@ -2484,8 +2484,11 @@ def main() -> int:
                 = 3 条 spawn 出来的 shell 内核栈 15 页(每线程 16 KiB 栈 4 页
                   + 底下 1 页 guard 页)
                 + 行缓冲 13 页 + 输入法悬浮条还原缓冲 26 页[两行]
-                + 恒等映射 4 MiB 以上每 4 MiB 一张页表(动态从页池拿)"""
-                return (layout_val("pages") - 54
+                + 恒等映射 4 MiB 以上每 4 MiB 一张页表(动态从页池拿)
+                + x64 长模式结构区预留 64 页(0x03000000,池覆盖到那里时才扣)"""
+                pool_end = layout_pool()[1]
+                x64_reserved = 64 if pool_end > 0x03000000 else 0
+                return (layout_val("pages") - 54 - x64_reserved
                         - (layout_val("ident") // 0x400000 - 1))
             pool_start, pool_end = layout_pool()
             results.append(("layout 行: RAM → 恒等映射 → 页池,大小自洽",

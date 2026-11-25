@@ -61,6 +61,76 @@ pmem_init:
     ret
 
 ; ---------------------------------------------------------------------------
+;  pmem_reserve:把一个固定物理区间标记成"已占用"
+;
+;  给"固定地址的内核结构"预留(例如 x64 长模式的页表/boot_info/K64 镜像):
+;  这些页不是 pmem_alloc 分出来的,但也绝不能被页池再发出去 —— 否则分配器
+;  会踩进正在使用的页表/启动结构里。
+;
+;  eax = 起始物理地址,ecx = 字节数。只有**落在页池内**的部分会被标记:
+;  小内存机器上池子到不了这个区间时,整个调用是安全的空操作(不越界写位图)。
+;  区间已经占用的页不重复计数。
+;  返回 eax = 实际新标记的页数。所有寄存器保持(内部 pushad/popad)。
+; ---------------------------------------------------------------------------
+pmem_reserve:
+    pushad
+    ; 区间 [esi, edi):先按池范围裁一刀
+    mov esi, eax
+    add ecx, eax
+    mov edi, ecx
+    mov eax, [pmem_start]
+    cmp esi, eax
+    jae .start_ok
+    mov esi, eax
+.start_ok:
+    mov eax, [pmem_end]
+    cmp edi, eax
+    jbe .end_ok
+    mov edi, eax
+.end_ok:
+    ; 页对齐(起点向下、终点向上),再裁一次
+    and esi, 0xFFFFF000
+    add edi, 0xFFF
+    and edi, 0xFFFFF000
+    mov eax, [pmem_start]
+    cmp esi, eax
+    jae .start_ok2
+    mov esi, eax
+.start_ok2:
+    mov eax, [pmem_end]
+    cmp edi, eax
+    jbe .end_ok2
+    mov edi, eax
+.end_ok2:
+    xor ebp, ebp                       ; 新标记的页数
+.reserve_loop:
+    cmp esi, edi
+    jae .done
+    mov eax, esi
+    sub eax, [pmem_start]
+    shr eax, 12                        ; 页号
+    cmp eax, [pmem_total]
+    jae .done
+    mov edx, eax
+    shr edx, 5                         ; 位图 dword 下标
+    mov ecx, eax
+    and ecx, 31                        ; 位号
+    mov eax, [PMEM_BITMAP + edx * 4]
+    bt  eax, ecx
+    jc  .next                          ; 已经被占用:不重复计数
+    bts dword [PMEM_BITMAP + edx * 4], ecx
+    dec dword [pmem_free_count]
+    inc dword [pmem_alloced]
+    inc ebp
+.next:
+    add esi, PAGE_BYTES
+    jmp .reserve_loop
+.done:
+    mov [esp + 28], ebp                ; pushad 帧里的 eax 槽 = 返回值
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
 ;  pmem_alloc:要一页 → eax = 物理地址(4 KiB 对齐);页池空了返回 0
 ;  破坏 ebx / ecx / edx
 ; ---------------------------------------------------------------------------

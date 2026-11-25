@@ -198,6 +198,13 @@ COL_ERR    equ 0x0C                    ; 亮红
     ;    那时还没开分页,地址本来就是线性=物理,直接访问没有问题。
     call pmem_init
 
+    ; ---- 预留 x64 长模式结构区(页表 / boot_info / K64 装载地址 / 64 位栈)----
+    ;   这些结构在固定物理地址 0x03000000,不能也被页池当成空闲页发出去。
+    ;   小内存机器上页池到不了那里,pmem_reserve 会安全跳过。
+    mov eax, X64_REGION_BASE
+    mov ecx, X64_REGION_SIZE
+    call pmem_reserve
+
     ; 图形模式:先把帧缓冲终端初始化(它自己会清屏,所以要在任何打印之前)
     cmp dword [vbe_ok], 0
     je .skip_fb_early

@@ -20,6 +20,13 @@
 BLK_FAT_STATE_BUF equ 0x3C6000          ; blkdev:USB 挂载时保存 ATA FAT 挂载状态的缓冲
 BLK_FAT_STATE_MAX equ 4096              ; 状态区上限(4 KiB)
 
+; ---- x64 长模式结构区(32→64 位切换用)----
+;   固定在 0x03000000:既不在内核 heap(0x180000–0x6E0000),也由 kmain 在
+;   pmem_init 之后调 pmem_reserve 标记为已占用,防止页池分配踩进来。
+;   (旧地址 0x1E0000-0x200000 落在 heap 里:QEMU 侥幸,VBox 里 triple fault。)
+X64_REGION_BASE equ 0x03000000
+X64_REGION_SIZE equ 0x00040000          ; 256 KiB(64 页)
+
 kmain:                                  ; 32 位内核入口(stub 里 jmp 0x10000 跳过来)
 ;  ⚠️ 第一个被 include 的文件决定 0x10000 处的第一条指令 —— 因为 `kmain:` 本身不占字节。
 ;     所以入口代码必须排在第一个,别的模块(哪怕是被前面引用的)都放后面。
