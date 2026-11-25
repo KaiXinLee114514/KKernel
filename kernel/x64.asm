@@ -3,26 +3,35 @@
 ;
 ;  shell 里敲 `start64`:
 ;    1) CPUID 查 PAE(leaf 1 EDX bit6)和长模式(leaf 0x80000001 EDX bit29)
-;    2) FAT 里读 BIN/K64.BIN(≤128 KiB)到物理 0x200000
-;    3) 在 0x1FF000 填 boot_info(magic 'K64I'),把帧缓冲/E820/栈顶交给 64 位内核
-;    4) 在 0x1E0000 建 PML4/PDPT/PD:
+;    2) FAT 里读 BIN/K64.BIN(≤128 KiB)到物理 0x03010000
+;    3) 在 0x0300F000 填 boot_info(magic 'K64I'),把帧缓冲/E820/栈顶交给 64 位内核
+;    4) 在 0x03000000 建 PML4/PDPT/PD:
 ;         PML4[0] → PDPT;PDPT[0] → PD0(0-1GiB 2 MiB 大页)
 ;         PDPT[3] → PD3(0xC0000000-0xFFFFFFFF,覆盖 VBE LFB)
-;    5) CR4.PAE=1,CR3=PML4,EFER.LME=1,CR0.PG=1,远跳 0x08:0x200000
+;    5) CR4.PAE=1,CR3=PML4,EFER.LME=1,CR0.PG=1,远跳 0x08:0x03010000
+;
+;  ★ 物理布局为什么要挑 0x03000000(48 MiB)这一片:
+;    32 位内核的 kernel heap 是 0x180000-0x6E0000,pmem 页池从 0x400000 起,
+;    低区缓冲也全在 16 MiB 以下。把这些结构放在 heap 里,QEMU 侥幸能跑,
+;    VirtualBox 会在切页表后的 lgdt 处给我一记 GURU_MEDITATION(实测)。
+;    0x03000000 在 heap 之外、又远低于 64 MiB,普通小内存机器也够不着。
 ;
 ;  注意:32 位内核的页表(CR3=0x1000)就此退役。跳过去之后不再回来。
 ; ============================================================================
 
 ; ---- 物理布局(和 kernel64/start.asm 的约定,改一边必须改另一边)----
-BOOT_INFO64   equ 0x1FF000              ; boot_info(4 KiB 页,低区空闲物理页)
-K64_LOAD_ADDR equ 0x200000              ; K64.BIN 加载地址
+;  ★ 必须避开:kernel heap 0x180000-0x6E0000、pmem 页池(0x400000 起)。
+;    这一组全部在 0x03000000(48 MiB)区,64 MiB 以上 RAM 才够用。
+BOOT_INFO64   equ 0x0300F000            ; boot_info(4 KiB 页,0x03000000 区)
+K64_LOAD_ADDR equ 0x03010000            ; K64.BIN 加载地址(= kernel64 的 ORG)
 K64_MAX_SIZE  equ 0x20000               ; 128 KiB 上限
 K64I_MAGIC    equ 0x4934364B            ; 'K64I'
-X64_PML4      equ 0x1E0000
-X64_PDPT      equ 0x1E1000
-X64_PD0       equ 0x1E2000
-X64_PD3       equ 0x1E3000
-X64_STACK_TOP equ 0x1EF000              ; 64 位栈顶(栈向 0x1E4000 长)
+X64_PML4      equ 0x03000000            ; 页表区 0x03000000-0x03003FFF(16 KiB)
+X64_PDPT      equ 0x03001000
+X64_PD0       equ 0x03002000
+X64_PD3       equ 0x03003000
+X64_STACK_TOP equ 0x0300D000            ; 64 位栈顶(栈向 0x03004000 长)
+X64_RAM_MIN   equ 0x04000000            ; 至少 64 MiB 物理内存才够这套布局
 
 ; ---------------------------------------------------------------------------
 ;  cmd_start64:shell 命令
@@ -33,6 +42,9 @@ cmd_start64:
     call x64_supported
     test eax, eax
     jz .no_cpu
+    ; ---- 1b) RAM 够吗:新布局在 0x03000000(48 MiB)以上,留到 64 MiB 才稳 ----
+    cmp dword [ident_limit], X64_RAM_MIN
+    jb .need_ram
     ; ---- 2) 找 BIN/K64.BIN,量大小 ----
     mov esi, [cmd_arg]
     call strip_name
@@ -65,6 +77,12 @@ cmd_start64:
     mov al, COL_ERR
     call term_set_color
     mov esi, msg_x64_nocpu
+    call term_print
+    jmp .fail_done
+.need_ram:
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_x64_needram
     call term_print
     jmp .fail_done
 .no_file:
@@ -218,7 +236,7 @@ x64_switch:
     mov [X64_PDPT + 24], eax            ; PDPT 项 8 字节,第 3 项在 +24
     mov dword [X64_PDPT + 28], 0
 
-    ; ---- 6) 切模式前先把栈换到安全区(0x1E0000-0x1FFFFF 里)----
+    ; ---- 6) 切模式前先把栈换到安全区(0x03004000-0x0300D000)----
     mov esp, X64_STACK_TOP
     ; ---- 7) 关 32 位分页 ----
     mov eax, cr0
@@ -275,8 +293,9 @@ x64_file_size  dd 0
 
 x64_path_k64   db 'BIN/K64.BIN', 0
 
-msg_x64_jump   db 'start64: jumping to 64-bit kernel at 0x00200000 (long mode)', 10, 0
+msg_x64_jump   db 'start64: jumping to 64-bit kernel at 0x03010000 (long mode)', 10, 0
 msg_x64_nocpu  db 'start64: CPU does not support long mode (PAE/LM)', 10, 0
+msg_x64_needram db 'start64: need more RAM (at least 64 MiB)', 10, 0
 msg_x64_nofile db 'start64: BIN/K64.BIN not found (rebuild the disk image)', 10, 0
 msg_x64_toobig db 'start64: K64.BIN too big (max 128 KiB)', 10, 0
 msg_x64_readerr db 'start64: read error', 10, 0
