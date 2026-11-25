@@ -51,6 +51,28 @@ PAGE_SWAP       equ 0x200              ; PTE bit9:present=0 + bit9 = 在 swap �
 swap_init:
     pushad
     mov dword [swap_enabled], 0
+    ; ---- 0) 先确认磁盘够大(swap 头在 LBA 32768,小镜像直接读就是越界)----
+    ;  QEMU 对越界读静默返回零,VirtualBox 会报 "ATA ... disk read error"。
+    ;  16 MB 的普通测试镜像只有 32768 个扇区(0..32767),所以这里必须问容量。
+    mov eax, [ata_sectors]
+    test eax, eax
+    jnz .have_sectors
+    call ata_identify                    ; 失败 → ata_sectors = 0
+    mov eax, [ata_sectors]
+    test eax, eax
+    jz .out                              ; 没有硬盘/不支持 IDENTIFY:保持静默(和以前一样)
+.have_sectors:
+    cmp eax, SWAP_LBA + SWAP_HDR_SECTORS
+    jae .read_hdr
+    ; ---- 磁盘太小:明说一句然后禁用(不再发越界读命令)----
+    mov al, COL_ERR
+    call term_set_color
+    mov esi, msg_swap_small
+    call term_print
+    mov al, COL_NORMAL
+    call term_set_color
+    jmp .out
+.read_hdr:
     ; ---- 1) 读 swap 头(一个扇区)----
     mov eax, SWAP_LBA
     mov ecx, 1
@@ -668,6 +690,7 @@ sf_pt        dd 0
 sf_j         dd 0
 sw_tmp       dd 0
 
+msg_swap_small db 'swap: disabled (disk too small)', 10, 0
 msg_swap_boot  db 'swap: ', 0
 msg_swap_boot2 db ' slots x 4 KiB (16 MiB), frame metadata ', 0
 msg_swap_boot3 db ' pages', 10, 0

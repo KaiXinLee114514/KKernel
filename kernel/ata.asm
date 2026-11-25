@@ -156,6 +156,92 @@ ata_setup_lba:
     ret
 
 ; ---------------------------------------------------------------------------
+;  ata_identify:IDENTIFY DEVICE(0xEC)读盘参数,总扇区数存 [ata_sectors]
+;  返回 eax = 0 成功 / -1 失败(没盘、ATAPI 或不支持)。只改 eax。
+;
+;  为什么要它:swap 区头在 LBA 32768,16 MB 的测试镜像只有 32768 个扇区,
+;  不先问一句"盘多大"就直接读就是越界 —— QEMU 返回零糊弄过去,VirtualBox
+;  会报 "disk read error"。所以先 IDENTIFY,再让 swap_init 判断容量。
+; ---------------------------------------------------------------------------
+ata_identify:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    mov dword [ata_sectors], 0
+    ; ---- 选盘(LBA 模式;IDENTIFY 不看 LBA,只要主/从选对)----
+    mov al, [ata_drive]
+    and al, 1
+    shl al, 4
+    or  al, 0xA0
+    mov dx, ATA_DRIVE
+    out dx, al
+    call ata_delay400
+    ; ---- 参数清零 ----
+    xor eax, eax
+    mov dx, ATA_SECCNT
+    out dx, al
+    mov dx, ATA_LBA_LO
+    out dx, al
+    mov dx, ATA_LBA_MID
+    out dx, al
+    mov dx, ATA_LBA_HI
+    out dx, al
+    ; ---- 命令 0xEC:IDENTIFY DEVICE ----
+    mov dx, ATA_CMD
+    mov al, 0xEC
+    out dx, al
+    ; ---- 状态 0x00 / 0xFF = 这个位置没有设备(浮动总线)----
+    mov dx, ATA_STATUS
+    in al, dx
+    cmp al, 0
+    je .fail
+    cmp al, 0xFF
+    je .fail
+    ; ---- 等 BSY 清 ----
+    call ata_wait_ready
+    jc .fail
+    ; ---- 不是 ATA 的话 LBA_MID/HI 会被塞魔法值(ATAPI / SATA)----
+    mov dx, ATA_LBA_MID
+    in al, dx
+    test al, al
+    jnz .fail
+    mov dx, ATA_LBA_HI
+    in al, dx
+    test al, al
+    jnz .fail
+    ; ---- 等 DRQ,搬 256 个 word = 512 字节 ----
+    call ata_wait_drq
+    jc .fail
+    mov edi, ata_ident_buf
+    mov ecx, 256
+    mov dx, ATA_DATA
+    cld
+    rep insw
+    ; ---- word 49 bit9:LBA 寻址支持?(不支持的老盘不谈容量)----
+    test word [ata_ident_buf + 98], 0x0200
+    jz .fail
+    ; ---- word 60/61 = LBA28 总扇区数(低字在前)----
+    mov eax, [ata_ident_buf + 120]
+    test eax, eax
+    jz .fail
+    mov [ata_sectors], eax
+    xor eax, eax
+    jmp .out
+.fail:
+    mov dword [ata_sectors], 0
+    mov eax, -1
+.out:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+
+; ---------------------------------------------------------------------------
 ;  ata_read_sectors:eax = LBA,ecx = 扇区数,edi = 目标地址;返回 eax = 0 成功 / -1 失败
 ;
 ;  ★ 调用者的寄存器(ebx/ecx/edx/esi/edi/ebp)必须原样保留,只有 eax 是返回值。
@@ -380,6 +466,8 @@ ata_buf    dd 0
 ata_src    dd 0
 ata_left   dd 0
 ata_chunk  db 1
+ata_ident_buf times 512 db 0         ; IDENTIFY DEVICE 的 256 个 word
+ata_sectors   dd 0                   ; 当前盘总扇区数(LBA28;0 = 未知/没盘)
 ; ATA 调用记录(环形,64 条 × 16 字节):LBA / 扇区数 / 目标 / 调用者返回地址
 ATA_LOG_N  equ 64
 ata_log    times (ATA_LOG_N * 16) db 0
