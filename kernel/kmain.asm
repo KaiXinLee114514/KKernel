@@ -305,6 +305,9 @@ COL_ERR    equ 0x0C                    ; 亮红
 
     ; ---- 开分页 ----
     call paging_init
+    ; ---- VMSVGA:开分页之后再初始化 SVGA FIFO 显示更新(要 paging_map 映射 FIFO 区)----
+    ;   注意必须放在 paging_init 之后:fb_init 的时候分页还没开,那时映射不了。
+    call svga_try_init
     call swap_init                        ; Phase C:swap 区(没有 swap 头的镜像里静默禁用)
     ; 双重故障任务门:内核栈溢出/guard 页等致命错时,用独立任务/独立栈报个信
     call df_task_init

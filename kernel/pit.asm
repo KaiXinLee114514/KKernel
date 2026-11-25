@@ -121,6 +121,7 @@ pit_irq:
     out PIC1_CMD, al
     pop eax
     call usb_poll                   ; USB 键盘(没初始化/没键盘时立刻返回)
+    call svga_tick                  ; VMSVGA:低频全屏兜底刷新(QEMU 上是空操作)
     ret
 
 ; ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "pmem.asm"                      ; 物理页池(位图分配器,paging_map 会找它要页)
 %include "elf.asm"                       ; ELF32 可执行文件装载器(TCC 程序用)
 %include "fbterm.asm"                   ; 帧缓冲终端(图形模式)
+%include "svga.asm"                   ; VMSVGA(VirtualBox/VMware)显示更新:SVGA FIFO UPDATE
 %include "vgafont.asm"                   ; 自定义点阵字模(文本模式实验)
 %include "keyboard.asm"                  ; PS/2 键盘(顺手重映射 PIC)
 %include "pit.asm"                       ; PIT 定时器(IRQ0,100 Hz 心跳)

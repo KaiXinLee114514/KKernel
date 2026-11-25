@@ -75,6 +75,8 @@ fb_clear:
     ;   糊回干净的屏幕上(现象:清屏之后屏幕上还挂着半行字)。
     call fb_lb_forget
     call fb_home
+    ; ---- VMSVGA:整屏内容变了,推一次全屏更新 ----
+    call svga_full_update
     popad
     ret
 
@@ -112,6 +114,8 @@ fb_scroll:
     ; 脏标志和行号都作废。虽然刚刷过(dirty=0),但行号必须失效,
     ; 否则光标落回最后一行时会被错当成"还在缓冲里",把旧像素刷到底行去。
     call fb_lb_forget
+    ; ---- VMSVGA:滚屏后全屏内容整体上移,推一次全屏更新 ----
+    call svga_full_update
     popad
     ret
 
@@ -183,6 +187,9 @@ fb_flush:
     add edi, [fb_pitch]
     dec ebp
     jnz .row
+    ; ---- VMSVGA:只置脏,由 svga_tick 低频整屏刷新同步给宿主显示 ----
+    ;  (逐行小矩形 UPDATE 在 VMSVGA 上会被合并/乱序,实测会造成拼帧)
+    mov byte [svga_dirty], 1
 .reset:
     mov eax, [fb_width]
     mov [fb_lb_x0], eax
