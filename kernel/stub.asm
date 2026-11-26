@@ -143,6 +143,36 @@ stub_entry:
     mov si, msg_vbe_ok
     call print16
 
+    ; ---- 1.5) VirtualBox 兼容性:VMSVGA 的 legacy VBE 扫描输出刷新不可靠 ——
+    ;   实测 32 位内核在 VBox 里连续输出会叠字/拼帧(QEMU 和真机没事),而
+    ;   64 位内核直接画 LFB 却正常。VBox 的 VBE OEM 厂商字符串是 "VirtualB",
+    ;   QEMU(SeaBIOS)等其它环境不是。检测到就跳过 VBE、退回 VGA 文本模式:
+    ;   80x25、仅 ASCII,但显示完全可靠。判定放在 VBE 4F00 之后、设模式之前,
+    ;   不需要在实模式里访问 PCI 配置空间。
+    mov ax, [VBE_INFO + 0x08]
+    mov fs, ax
+    mov si, [VBE_INFO + 0x06]
+    cmp byte [fs:si + 0], 'V'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 1], 'i'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 2], 'r'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 3], 't'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 4], 'u'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 5], 'a'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 6], 'l'
+    jne .oem_not_vbox
+    cmp byte [fs:si + 7], 'B'
+    jne .oem_not_vbox
+    mov si, msg_vmsvga_text
+    call print16
+    jmp .no_vbe
+.oem_not_vbox:
+
     ; ---- 2) 在模式列表里找合用的模式 ----
     ; 模式列表是"远指针"存在 VbeInfoBlock +0x0E(偏移)+0x10(段)
     mov ax, [VBE_INFO + 0x10]
@@ -323,6 +353,7 @@ msg_hello   db 'KKernel: real-mode stub', 13, 10, 0
 msg_vbe_ok  db '  VBE found, picking a mode...', 13, 10, 0
 msg_mode_ok db '  graphics mode set (see kernel output)', 13, 10, 0
 msg_no_vbe  db '  no usable VBE mode - falling back to text mode', 13, 10, 0
+msg_vmsvga_text db '  VirtualBox VMSVGA detected - using VGA text mode (VBE refresh is unreliable there)', 13, 10, 0
 
 boot_drive db 0
 cand_mode  dw 0

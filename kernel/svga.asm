@@ -205,6 +205,11 @@ svga_tick:
 svga_try_init:
     pushad
     mov byte [svga_ok], 0
+    ; 文本模式(没开 VBE,如 VirtualBox 兼容路径)下没有帧缓冲可更新,直接跳过
+    cmp dword [vbe_ok], 0
+    je .out
+    cmp dword [fb_phys], 0
+    je .out
     ; ---- 1) 扫 PCI bus0 slot2..7,找 15AD:0405 ----
     xor ebx, ebx                    ; ebx = slot
 .slot_loop:
