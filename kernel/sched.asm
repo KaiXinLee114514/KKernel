@@ -31,7 +31,7 @@
 ; ============================================================================
 
 SCHED_MAX         equ 16                ; 最多几个进程/线程(含 0 号 = shell 自己)
-TCB_SIZE          equ 256               ; 每个 TCB 256 字节(A2/A3+B+C + Phase D/E 字段;全仓步长走 TCB_SIZE 宏)
+TCB_SIZE          equ 264               ; 每个 TCB 264 字节(A2/A3+B+C + Phase D/E + POSIX 字段;全仓步长走 TCB_SIZE 宏)
 TCB_ESP           equ 0                 ; 被切走时保存的 esp(指向它的现场)
 TCB_CR3           equ 4                 ; 它的页目录(程序在跑时可能是程序自己的)
 TCB_STATE         equ 8                 ; 见下面的 ST_*
@@ -135,6 +135,11 @@ TCB_API_NAME      equ 240               ; 本次文件 API 的文件名指针
 TCB_API_BUF       equ 244               ; 本次文件 API 的缓冲区指针
 TCB_API_MAX       equ 248               ; 本次文件 API 的字节上限
 TCB_API_DIR       equ 252               ; 本次文件 API 调用前的 [fat_dir](调完恢复)
+; ---- POSIX 转译层:每线程 brk 指针(int 0x80 的 sys_brk)----
+;   0 = 还没初始化(第一次 brk 时置成程序堆窗口起点 SPACE_HEAP_VA)。
+;   堆窗口 [SPACE_HEAP_VA, SPACE_HEAP_VA + TCB_SP_HEAPPAGES*4096) 缺页时由
+;   paging.asm 的 .heap 路径自动补零页,所以 brk 只需要记账/边界检查。
+TCB_POSIX_BRK     equ 256               ; POSIX 程序的 brk(堆顶)指针
 ; ★ 为什么用 TCB_SIZE 宏而不是固定移位:TCB 从 32 → 40 → 108 → 112 一路长,全仓的
 ;   下标步长都靠这个宏(踩过:改完忘了某个 shl/imul,TCB 全错位)。
 %define TCB_OFF(id) (((id) * TCB_SIZE))

@@ -1352,6 +1352,8 @@ process_spawn_kernel:
 ; ---------------------------------------------------------------------------
 process_exec:
     pushad
+    ; POSIX fd 表是全局的:新程序装载前清空,不把上一个程序的 fd 带过去
+    call posix_fd_reset
     ; ---- Phase B:shell 的 run 会先把"名字+参数"放进子进程的 EXECBUF 页 ----
     ;   普通调用(fork <prog>)是 eax = 名字指针;bundle 模式则从 TCB 里取。
     mov dword [proc_exec_bundle], 0
