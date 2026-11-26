@@ -168,6 +168,9 @@ k64: $(BUILD)/K64.BIN
 #  否则 elf_load 会往 0x11F000(内核参数块)拷东西;整个 ELF 只留一个 0x120000 起的段。
 POSIX_DIR    := $(BUILD)/posix
 P1_HELLO_ELF := $(POSIX_DIR)/P1_HELLO.ELF
+P2_FILE_ELF  := $(POSIX_DIR)/P2_FILE.ELF
+P2_BRK_ELF   := $(POSIX_DIR)/P2_BRK.ELF
+P2_DATA_TXT  := $(POSIX_DIR)/P2_DATA.TXT
 LD32         := ld -m elf_i386
 
 $(POSIX_DIR):
@@ -179,6 +182,24 @@ $(POSIX_DIR)/p1_hello.o: tools/posix/p1_hello.asm | $(POSIX_DIR)
 $(P1_HELLO_ELF): $(POSIX_DIR)/p1_hello.o | $(POSIX_DIR)
 	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
 	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
+
+$(POSIX_DIR)/p2_file.o: tools/posix/p2_file.asm | $(POSIX_DIR)
+	$(NASM) -f elf32 $< -o $@ -l $(POSIX_DIR)/p2_file.lst
+
+$(P2_FILE_ELF): $(POSIX_DIR)/p2_file.o | $(POSIX_DIR)
+	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
+	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
+
+$(POSIX_DIR)/p2_brk.o: tools/posix/p2_brk.asm | $(POSIX_DIR)
+	$(NASM) -f elf32 $< -o $@ -l $(POSIX_DIR)/p2_brk.lst
+
+$(P2_BRK_ELF): $(POSIX_DIR)/p2_brk.o | $(POSIX_DIR)
+	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
+	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
+
+# P2 测试数据:open/read 的目标文本文件(内容固定)
+$(P2_DATA_TXT): | $(POSIX_DIR)
+	@printf 'p2 data ok\n' > $@
 
 $(BUILD)/stub.bin: kernel/stub.asm | $(BUILD)
 	$(NASM) -f bin kernel/stub.asm -o $@ -l $(BUILD)/stub.lst
@@ -277,7 +298,9 @@ MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    DOCS/ZH.TXT=progs/ZH.TXT DOCS/EN.TXT=progs/EN.TXT DOCS/JPKR.TXT=progs/JPKR.TXT \
 	    DOCS/NOTE.TXT=progs/NOTES.TXT DOCS/Long_Note.txt=progs/NOTES.TXT \
 	    SRC/ SRC/T1.C=progs/T1.C SRC/T2.C=progs/T2.C SRC/TCC_INC.C=progs/TCC_INC.C \
-	    TEST/ TEST/HELLO.BIN=$(BUILD)/HELLO.BIN TEST/P1_HELLO.ELF=$(P1_HELLO_ELF) TEST/LONGNAME_TEST.txt=progs/README.TXT \
+	    TEST/ TEST/HELLO.BIN=$(BUILD)/HELLO.BIN TEST/P1_HELLO.ELF=$(P1_HELLO_ELF) \
+	    TEST/P2_FILE.ELF=$(P2_FILE_ELF) TEST/P2_BRK.ELF=$(P2_BRK_ELF) TEST/P2_DATA.TXT=$(P2_DATA_TXT) \
+	    TEST/LONGNAME_TEST.txt=progs/README.TXT \
 	    TEST/BIGDIR/ $(BIGDIR_SPECS) \
 	    DEV/ DEV/README.TXT=progs/DEV_README.TXT \
 	    DEV/NULL=progs/DEV_NODE.txt DEV/ZERO=progs/DEV_NODE.txt \
@@ -287,7 +310,7 @@ MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    INCLUDE/ $(TCCINC_FILES)
 
 $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
-          $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(P1_HELLO_ELF) $(BUILD)/TCC.BIN \
+          $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT) $(BUILD)/TCC.BIN \
           $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
           progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
           $(wildcard tccinc/*.h) \
@@ -323,7 +346,7 @@ hd: $(HDIMG)
 HD32IMG := $(BUILD)/kkernel-hd32.img
 
 $(HD32IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
-            $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
+            $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
             progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
             $(wildcard tccinc/*.h) \
             $(BUILD)/bigdir/.stamp
@@ -434,8 +457,8 @@ test-k64: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --k64 --font font/full-kkf.bin
 
-test-posix: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT $(P1_HELLO_ELF)
-	@echo "── POSIX 转译层 P1:int 0x80 write(1)/exit(0)(--posix)──"
+test-posix: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT)
+	@echo "── POSIX 转译层 P1+P2:int 0x80 write/exit/read + open/read/write/lseek/close + brk(--posix)──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --posix --font font/full-kkf.bin
 

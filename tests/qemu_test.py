@@ -2103,6 +2103,33 @@ def main() -> int:
             results.append(("程序退出后页池没泄漏",
                             free_before > 0 and free_after == free_before,
                             f"free: {free_after} pages(运行前 {free_before} pages)"))
+
+            # ---- P2:文件系统调用(open/read/write/lseek/close)----
+            p_run("clear", 0.5)
+            p_run("run TEST/P2_FILE.ELF", 5.0)
+            results.append(("P2 open/read 后再 write 到屏幕:p2 data ok",
+                            wait_has("p2-file: p2 data ok", 20.0),
+                            "p2-file: p2 data ok"))
+            results.append(("P2 文件程序 close/exit 后返回 shell",
+                            wait_has("p2-file: done", 20.0)
+                            and wait_has("program returned to the shell", 20.0),
+                            "p2-file: done + program returned to the shell"))
+
+            # ---- P2:brk 程序堆 ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P2_BRK.ELF", 5.0)
+            results.append(("P2 brk 申请堆页并写读校验",
+                            wait_has("p2-brk: ok", 20.0),
+                            "p2-brk: ok"))
+            results.append(("P2 brk 程序退出后返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+
+            p_run("debug pmem", 1.4)
+            free_after2 = p_free_pages()
+            results.append(("P2 程序退出后页池没泄漏",
+                            free_before > 0 and free_after2 == free_before,
+                            f"free: {free_after2} pages(运行前 {free_before} pages)"))
             return report(results)
 
         if mine_mode:
