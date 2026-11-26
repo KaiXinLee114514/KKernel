@@ -470,6 +470,7 @@ COL_ERR    equ 0x0C                    ; 亮红
     ; ---- 文件系统 + 程序接口 ----
     call fat_mount
     call api_install
+    call posix_install                  ; int 0x80:i386 Linux ABI 转译层(P1)
     cmp byte [fat_ok], 0
     je .fs_none_print
     cmp byte [fat_fat32], 0

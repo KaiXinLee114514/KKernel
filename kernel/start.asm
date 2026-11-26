@@ -44,6 +44,7 @@ kmain:                                  ; 32 位内核入口(stub 里 jmp 0x1000
 %include "dev.asm"                       ; /DEV 设备抽象层(虚拟设备:NULL/ZERO/RTC/...)
 %include "pipe.asm"                      ; 顺序管道:输出捕获 + stdin 读管
 %include "api.asm"                    ; 程序接口 int 0x30
+%include "posix.asm"                  ; i386 Linux ABI 转译层 int 0x80(P1)
 %include "speaker.asm"                   ; PC 蜂鸣器(beep,忙等标定见文件开头)
 %include "idt.asm"                       ; IDT / 异常 / panic 屏
 %include "fpu.asm"                       ; x87 浮点单元初始化

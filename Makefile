@@ -118,7 +118,7 @@ VI_OBJS     := $(addprefix $(BUILD)/vi/,$(notdir $(patsubst %.c,%.o,$(wildcard e
 
 PROG_BINS   := $(addprefix $(BUILD)/,$(PROGS) $(C_PROGS))
 
-.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check k64 test-k64 test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
+.PHONY: all run run-font font-full hd hd32 ext ext-img run-ext subset test makefile-check docs-check k64 test-k64 test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-mine test-posix test-tty test-login test-sched test-jobctl test-wait-race test-swap test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug div font clean lst cc-check pinyin
 
 all: $(IMG) $(HDIMG)
 
@@ -160,6 +160,25 @@ $(BUILD)/K64.BIN: $(K64_SRCS) $(K64_FONT) | $(BUILD)
 
 k64: $(BUILD)/K64.BIN
 	@printf '   64 位内核: %s(%s 字节)\n' "$(BUILD)/K64.BIN" "$$(stat -c %s $(BUILD)/K64.BIN)"
+
+# ---- POSIX 转译层(P1):int 0x80 测试程序(裸汇编 ELF,i386 Linux ABI)----
+#  内核侧 kernel/posix.asm 提供 int 0x80;测试程序是**真的 ELF**(和 TCC 产物一个
+#  装载路径),链接地址必须从 0x120000 起(KKernel ELF 装载器的程序窗口)。
+#  -n(nmagic):不要让 ld 在 0x120000 下面再塞一个映射 ELF 头的 PT_LOAD 段,
+#  否则 elf_load 会往 0x11F000(内核参数块)拷东西;整个 ELF 只留一个 0x120000 起的段。
+POSIX_DIR    := $(BUILD)/posix
+P1_HELLO_ELF := $(POSIX_DIR)/P1_HELLO.ELF
+LD32         := ld -m elf_i386
+
+$(POSIX_DIR):
+	@mkdir -p $(POSIX_DIR)
+
+$(POSIX_DIR)/p1_hello.o: tools/posix/p1_hello.asm | $(POSIX_DIR)
+	$(NASM) -f elf32 $< -o $@ -l $(POSIX_DIR)/p1_hello.lst
+
+$(P1_HELLO_ELF): $(POSIX_DIR)/p1_hello.o | $(POSIX_DIR)
+	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
+	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
 
 $(BUILD)/stub.bin: kernel/stub.asm | $(BUILD)
 	$(NASM) -f bin kernel/stub.asm -o $@ -l $(BUILD)/stub.lst
@@ -258,7 +277,7 @@ MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    DOCS/ZH.TXT=progs/ZH.TXT DOCS/EN.TXT=progs/EN.TXT DOCS/JPKR.TXT=progs/JPKR.TXT \
 	    DOCS/NOTE.TXT=progs/NOTES.TXT DOCS/Long_Note.txt=progs/NOTES.TXT \
 	    SRC/ SRC/T1.C=progs/T1.C SRC/T2.C=progs/T2.C SRC/TCC_INC.C=progs/TCC_INC.C \
-	    TEST/ TEST/HELLO.BIN=$(BUILD)/HELLO.BIN TEST/LONGNAME_TEST.txt=progs/README.TXT \
+	    TEST/ TEST/HELLO.BIN=$(BUILD)/HELLO.BIN TEST/P1_HELLO.ELF=$(P1_HELLO_ELF) TEST/LONGNAME_TEST.txt=progs/README.TXT \
 	    TEST/BIGDIR/ $(BIGDIR_SPECS) \
 	    DEV/ DEV/README.TXT=progs/DEV_README.TXT \
 	    DEV/NULL=progs/DEV_NODE.txt DEV/ZERO=progs/DEV_NODE.txt \
@@ -268,7 +287,7 @@ MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    INCLUDE/ $(TCCINC_FILES)
 
 $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
-          $(PINYIN_BIN) $(BUILD)/K64.BIN $(BUILD)/TCC.BIN \
+          $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(P1_HELLO_ELF) $(BUILD)/TCC.BIN \
           $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
           progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
           $(wildcard tccinc/*.h) \
@@ -304,7 +323,7 @@ hd: $(HDIMG)
 HD32IMG := $(BUILD)/kkernel-hd32.img
 
 $(HD32IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
-            $(PINYIN_BIN) $(BUILD)/K64.BIN $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
+            $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
             progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
             $(wildcard tccinc/*.h) \
             $(BUILD)/bigdir/.stamp
@@ -402,7 +421,7 @@ makefile-check:
 docs-check:
 	@bash tools/check-docs.sh
 
-test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug test-tty test-login test-sched test-jobctl test-wait-race test-swap test-k64
+test: makefile-check test-fda test-hda test-proc test-div test-pgfault test-kbd test-shell test-hd-font test-hd32 test-usb test-usb-kbd test-usb-rw test-usb-rw32 test-usb-ehci test-usb-hotplug test-tty test-login test-sched test-jobctl test-wait-race test-swap test-k64 test-posix
 
 test-usb: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── USB 大容量储存(只读裸盘):QEMU 挂一个假 U 盘 ──"
@@ -414,6 +433,11 @@ test-k64: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	@echo "── x86-64:start64 → 长模式 64 位内核(--k64)──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --k64 --font font/full-kkf.bin
+
+test-posix: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT $(P1_HELLO_ELF)
+	@echo "── POSIX 转译层 P1:int 0x80 write(1)/exit(0)(--posix)──"
+	$(MAKE) -s -B $(HDIMG)
+	python3 -u tests/qemu_test.py $(HDIMG) --hda --posix --font font/full-kkf.bin
 
 # USB 键盘自测:QEMU 只插 usb-kbd(sendkey 全部改投 USB 键盘),能登录、能敲命令才算过。
 # 这台内核只有 UHCI(USB1.1 全速 12Mbps),QEMU 的 usb-kbd 就是以全速设备接进来的。

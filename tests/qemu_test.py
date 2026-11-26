@@ -1022,6 +1022,7 @@ def main() -> int:
     swap_mode = "--swap" in argv            # swap:页换出/换入 + 大匿名堆(默认 -m 16)
     swap_cold_mode = "--swap-cold" in argv  # swap 对照:大内存下全部驻留(-m 64,不换出)
     k64_mode = "--k64" in argv              # x86-64:start64 → 长模式 → 独立 64 位内核
+    posix_mode = "--posix" in argv          # POSIX 转译层:int 0x80 sys_write/sys_exit
     mem_mib = 128                           # QEMU 物理内存(-m):swap 测试用 16/64
     if "--mem" in argv:
         mem_mib = int(argv[argv.index("--mem") + 1])
@@ -1034,7 +1035,7 @@ def main() -> int:
                          "--usb-ehci", "--usb-hotplug",
                          "--mine", "--proc",
                          "--tty", "--login", "--sched", "--jobctl", "--wait-race",
-                         "--swap", "--swap-cold", "--k64")]
+                         "--swap", "--swap-cold", "--k64", "--posix")]
     if "--mem" in argv:
         i = argv.index("--mem")
         del argv[i:i + 2]
@@ -2062,6 +2063,47 @@ def main() -> int:
         mode = ("boot disk: LBA (EDD multi-sector read)" if as_hdd
                 else "boot disk: CHS fallback (BIOS has no LBA)")
         print(f'(模式: {"图形 VBE" if graphics else "VGA 文本"})')
+
+        if posix_mode:
+            # ---- POSIX 转译层 P1:int 0x80 sys_write(1) / sys_exit(0) ----
+            #  真的跑一个 Linux i386 ELF(裸汇编,无 libc):write(1,...) → exit(0)。
+            results = []
+
+            def p_run(line: str, wait: float = 1.0) -> None:
+                mon.type_text(line)
+                mon.sendkey("ret")
+                time.sleep(wait)
+                rescan()
+
+            def p_text() -> str:
+                if graphics:
+                    return "\n".join(screen_text(shot, glyphs))
+                return "\n".join(mon.screen())
+
+            def p_free_pages() -> int:
+                m = re.search(r"free: (\d+) pages", p_text())
+                return int(m.group(1)) if m else -1
+
+            p_run("clear", 0.6)
+            p_run("debug pmem", 1.2)
+            free_before = p_free_pages()
+            results.append(("跑程序前能读到页池空闲数", free_before > 0,
+                            f"free: {free_before} pages"))
+
+            p_run("run TEST/P1_HELLO.ELF", 5.0)
+            results.append(("int 0x80 sys_write(1,...) 输出 hello",
+                            wait_has("hello from int 0x80", 20.0),
+                            "hello from int 0x80"))
+            results.append(("sys_exit(0) 后返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+
+            p_run("debug pmem", 1.4)
+            free_after = p_free_pages()
+            results.append(("程序退出后页池没泄漏",
+                            free_before > 0 and free_after == free_before,
+                            f"free: {free_after} pages(运行前 {free_before} pages)"))
+            return report(results)
 
         if mine_mode:
             # ---- 扫雷(progs/MINE.C → BIN/MINE.BIN)----
