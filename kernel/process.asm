@@ -1354,6 +1354,18 @@ process_spawn_kernel:
 ; ---------------------------------------------------------------------------
 process_exec:
     pushad
+    ; 入参 eax = 名字指针;下面的 CR3 切换会踩掉 eax,所以先存全局
+    mov [proc_exec_nameptr], eax
+    ; ---- 0) 切到内核页目录 ----
+    ;  从 ring3 的 execve(系统调用)进来时 CR3 还指着旧页目录:
+    ;   · PROG_ADDR(0x120000)在旧用户页目录里是"程序镜像窗口",不是内核暂存区,
+    ;     读文件/展开 ELF 会写进旧窗口页,space_destroy 后数据就没了;
+    ;   · space_destroy 把旧 PD/PT 还回页池后,页池分配会覆盖正在用的页表。
+    ;  内核线程调用(shell 的 run/fork)本来就是 0x1000,这里重复设置无害。
+    call process_cur_tcb
+    mov dword [eax + TCB_CR3], 0x1000
+    mov eax, 0x1000
+    mov cr3, eax
     ; POSIX fd 表是全局的:新程序装载前清空,不把上一个程序的 fd 带过去
     call posix_fd_reset
     ; ---- Phase B:shell 的 run 会先把"名字+参数"放进子进程的 EXECBUF 页 ----
@@ -1361,7 +1373,7 @@ process_exec:
     mov dword [proc_exec_bundle], 0
     mov dword [proc_exec_argsptr], 0
     mov dword [proc_exec_quiet], 1
-    mov esi, eax                        ; 先存"名字指针"(下面 process_cur_tcb 会踩 eax)
+    mov esi, [proc_exec_nameptr]        ; 名字指针(入口已存;CR3 切换/posix_fd_reset 会踩 eax)
     call process_cur_tcb
     mov ecx, [eax + TCB_EXECBUF]
     test ecx, ecx
@@ -1413,6 +1425,7 @@ process_exec:
     call fat_stat
     cmp eax, -1
     je .try_bin
+    ; stat 成功:继续原来的尺寸检查
     cmp eax, (SPACE_IMG_PAGES - 1) * 4096
     ja .nofile
     mov [proc_exec_size], eax
@@ -1478,6 +1491,7 @@ process_exec:
     call proc_exec_fs_unlock
 
     ; ---- 3) 旧空间先拆(第一次 exec 时什么也没有)----
+    ;  (CR3 已在入口切到内核页目录,见下面说明)
     call space_destroy
 
     ; ---- 4) 镜像拷进本进程自己的暂存区 ----
@@ -1615,8 +1629,24 @@ process_exec:
     mov [fat_dir], eax
     call proc_exec_fs_unlock
     call loader_unlock
+    ; 从 ring3 的 execve 进来:文件找不到要返回 -ENOENT 给调用者(旧进程还在),
+    ; 不能像内核线程那样 process_exit。其它失败(OOM 等)发生在旧地址空间已拆之后,
+    ; 无法返回,仍走 process_exit。
+    cmp dword [proc_exec_error_mode], 0
+    jne .err_nofile
     mov esi, msg_exec_nofile
     jmp .die
+.err_nofile:
+    mov dword [proc_exec_error_mode], 0
+    ; 恢复旧地址空间的页目录 —— ring3 的 execve 失败要回到旧程序继续跑,
+    ; 而入口已经切到内核页目录(旧程序的代码页在内核页目录下没映射)。
+    call process_cur_tcb
+    mov edx, [eax + TCB_SP_PD]
+    mov cr3, edx
+    mov [eax + TCB_CR3], edx
+    popad
+    mov eax, -2                         ; -ENOENT
+    ret
 .nomem:
     mov eax, [proc_exec_dir]
     mov [fat_dir], eax
@@ -1742,6 +1772,7 @@ sp_level        dd 0
 sig_buf         times 24 db 0
 
 proc_exec_name  dd 0                    ; shell "fork <程序>" 传进来的名字指针
+proc_exec_nameptr dd 0                  ; 入参名字指针(入口 CR3 切换会踩 eax,先存这里)
 proc_exec_bundle dd 0                   ; 作业载荷页(名字+参数,0 = 没有)
 proc_exec_argsptr dd 0                  ; 载荷里的参数字符串指针(0 = 没参数)
 proc_exec_quiet dd 1                    ; 1 = 静音(fork <prog>;0 = 作业,要打 running/space 行)
@@ -1754,6 +1785,7 @@ proc_exec_size  dd 0
 proc_exec_entry dd 0
 proc_exec_pages dd 0
 proc_exec_tried dd 0
+proc_exec_error_mode dd 0               ; 1 = 从 ring3 系统调用进来:失败要返回 -ENOENT 而不是 process_exit
 
 nm_child        db 'child', 0
 nm_demo         db 'demo', 0

@@ -27,7 +27,9 @@
 ;      2   sys_fork()                            复制当前进程,子进程返回 0,父进程返回子 pid
 ;      20  sys_getpid()                          → 当前进程 pid
 ;      114 sys_wait4(pid, status*, options, ru)  等子进程退出/停止;options 只认 WNOHANG/WUNTRACED
-;  说明:P4 先做 fork/getpid/wait4(execve 在后续 P4c);fd 继承先不做(fd 表是全局的,
+;      37  sys_kill(pid, sig)                   只支持 pid>0;sig 支持 KILL/TERM/INT/STOP/CONT
+;      11  sys_execve(path, argv, envp)         替换当前进程映像;argv/envp 先忽略
+;  说明:P4 分段做 fork/getpid/wait4/kill/execve;fd 继承先不做(fd 表是全局的,
 ;      fork 天然共享、execve 会清空),写进 docs 已知限制。
 ;  目录 fd:open 只读打开目录成功,PFD_FLAGS 的 bit2 置位;read/write/lseek → -EISDIR。
 ;  其它编号一律 eax = -ENOSYS;fd 不合法 = -EBADF。
@@ -64,6 +66,19 @@ POSIX_EPERM     equ 1
 POSIX_ESRCH     equ 3
 POSIX_ECHILD    equ 10
 POSIX_EAGAIN    equ 11
+; P4b:kill 支持的最小信号集(Linux i386 信号号)
+POSIX_SIGINT    equ 2
+POSIX_SIGKILL   equ 9
+POSIX_SIGTERM   equ 15
+POSIX_SIGCONT   equ 18
+POSIX_SIGSTOP   equ 19
+; 拼 process.asm 的 signal_t:class<<24 | action<<16 | level
+; (用 user 类 + user 级:同 uid 的进程之间可以发;super 类留给原生 int 0x30)
+POSIX_SIGKILL_T equ (2 << 24) | (1 << 16) | 2   ; class=user action=kill level=user
+POSIX_SIGTERM_T equ (2 << 24) | (2 << 16) | 2   ; class=user action=term level=user
+POSIX_SIGINTR_T equ (2 << 24) | (5 << 16) | 2   ; class=user action=intr level=user
+POSIX_SIGSTOP_T equ (2 << 24) | (3 << 16) | 2   ; class=user action=stop level=user
+POSIX_SIGCONT_T equ (2 << 24) | (4 << 16) | 2   ; class=user action=cont level=user
 
 ; ---- P3:stat 模式位 / ioctl ----
 S_IFREG         equ 0x8000
@@ -162,6 +177,10 @@ posix_dispatch:
     je sys_getpid
     cmp eax, 114
     je sys_wait4
+    cmp eax, 37
+    je sys_kill
+    cmp eax, 11
+    je sys_execve
     cmp eax, 3
     je sys_read
     cmp eax, 4
@@ -289,6 +308,112 @@ sys_wait4:
     mov dword [esp + 28], -POSIX_ENOSYS
 .wf_out:
     popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_kill(pid, sig):kill(37)
+;  Linux 参数:ebx=pid,ecx=sig。P4b 只支持 pid > 0。
+;  sig 支持:KILL(9)/TERM(15)/INT(2)/STOP(19)/CONT(18);sig=0 只探测(返回 0)。
+;  返回:0 成功 / -ESRCH(没有该进程)/ -EPERM(权限不够)/ -EINVAL(信号不支持)/
+;        -ENOSYS(暂不支持的 pid 形式)。
+;  实现:映射到 process.asm 的 signal_t,调 process_signal_send(带 uid 权限检查)。
+; ---------------------------------------------------------------------------
+sys_kill:
+    ; ebx = pid, ecx = sig
+    cmp ebx, 1
+    jl .kill_enosys                     ; pid 0 / 负数(进程组语义):暂不支持
+    mov ebp, ebx                        ; ebp = pid(下面要用别的东西)
+    mov eax, ecx                        ; eax = sig
+    test eax, eax
+    jz .kill_zero                       ; kill(pid, 0) = 探测,直接成功
+    ; ---- 先确认目标 TCB 存在(非空槽),区分 ESRCH 与 EPERM ----
+    mov edx, ebp
+    dec edx                             ; pid - 1 = TCB 槽号
+    cmp edx, SCHED_MAX
+    jae .kill_esrch
+    imul edx, TCB_SIZE
+    add edx, tcb_table
+    cmp dword [edx + TCB_STATE], ST_EMPTY
+    je .kill_esrch
+    ; ---- 信号号 → signal_t ----
+    cmp eax, POSIX_SIGKILL
+    je .kill_kill
+    cmp eax, POSIX_SIGTERM
+    je .kill_term
+    cmp eax, POSIX_SIGINT
+    je .kill_intr
+    cmp eax, POSIX_SIGSTOP
+    je .kill_stop
+    cmp eax, POSIX_SIGCONT
+    je .kill_cont
+    mov eax, -POSIX_EINVAL
+    ret
+.kill_kill:
+    mov ebx, POSIX_SIGKILL_T
+    jmp .kill_send
+.kill_term:
+    mov ebx, POSIX_SIGTERM_T
+    jmp .kill_send
+.kill_intr:
+    mov ebx, POSIX_SIGINTR_T
+    jmp .kill_send
+.kill_stop:
+    mov ebx, POSIX_SIGSTOP_T
+    jmp .kill_send
+.kill_cont:
+    mov ebx, POSIX_SIGCONT_T
+.kill_send:
+    mov eax, ebp                        ; eax = pid
+    call process_signal_send            ; eax = 0 成功 / -1 失败(权限/状态)
+    cmp eax, -1
+    jne .kill_ok
+    mov eax, -POSIX_EPERM
+    ret
+.kill_ok:
+    xor eax, eax
+    ret
+.kill_zero:
+    xor eax, eax
+    ret
+.kill_esrch:
+    mov eax, -POSIX_ESRCH
+    ret
+.kill_enosys:
+    mov eax, -POSIX_ENOSYS
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_execve(path, argv, envp):execve(11)
+;  Linux 参数:ebx=pathname,ecx=argv,edx=envp(P4c 先忽略 argv/envp —— 新程序
+;  拿不到参数,shell 的 run 仍走原生 int 0x30 的带参数路径)。
+;  行为:把 pathname 拷进内核缓冲 → process_exec 替换当前进程映像;
+;        成功不返回(iret 到新程序入口),失败返回 -ENOENT / -ENAMETOOLONG。
+;  process.asm 侧配合:exec 前切内核页目录(CR3=0x1000)+ ring3 错误返回模式。
+; ---------------------------------------------------------------------------
+sys_execve:
+    ; ---- 1) 拷贝 pathname(此刻 CR3 还是用户页目录,可直接读用户地址)----
+    mov esi, ebx
+    mov edi, posix_exec_path
+    mov ecx, 63
+.ex_copy:
+    mov al, [esi]
+    mov [edi], al
+    inc esi
+    inc edi
+    test al, al
+    jz .ex_copied
+    dec ecx
+    jnz .ex_copy
+    mov eax, -POSIX_ENAMETOOLONG
+    ret
+.ex_copied:
+    ; ---- 2) 走 process_exec 的 ring3 错误返回模式 ----
+    ;  保证走"普通调用"分支(不用 TCB_EXECBUF 作业载荷):execve 自己给了路径。
+    call process_cur_tcb
+    mov dword [eax + TCB_EXECBUF], 0
+    mov dword [proc_exec_error_mode], 1
+    mov eax, posix_exec_path
+    call process_exec                   ; 成功不返回;失败(-ENOENT)会返回
     ret
 
 ; ---------------------------------------------------------------------------
@@ -1302,3 +1427,4 @@ posix_ret           dd 0
 posix_path_tmp      times POSIX_FD_PATHLEN db 0
 posix_fd_tab        times POSIX_FD_FILE_MAX * POSIX_FD_ENT db 0
 posix_scratch       times POSIX_SCRATCH_SIZE db 0
+posix_exec_path     times 64 db 0       ; execve 的 pathname 内核缓冲

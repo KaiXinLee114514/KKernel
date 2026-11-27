@@ -175,6 +175,8 @@ P3_STAT_ELF  := $(POSIX_DIR)/P3_STAT.ELF
 P3_DENTS_ELF := $(POSIX_DIR)/P3_DENTS.ELF
 P3_TIME_ELF  := $(POSIX_DIR)/P3_TIME.ELF
 P4_FORK_ELF  := $(POSIX_DIR)/P4_FORK.ELF
+P4_KILL_ELF  := $(POSIX_DIR)/P4_KILL.ELF
+P4_EXEC_ELF  := $(POSIX_DIR)/P4_EXEC.ELF
 LD32         := ld -m elf_i386
 
 $(POSIX_DIR):
@@ -230,6 +232,20 @@ $(POSIX_DIR)/p4_fork.o: tools/posix/p4_fork.asm | $(POSIX_DIR)
 	$(NASM) -f elf32 $< -o $@ -l $(POSIX_DIR)/p4_fork.lst
 
 $(P4_FORK_ELF): $(POSIX_DIR)/p4_fork.o | $(POSIX_DIR)
+	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
+	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
+
+$(POSIX_DIR)/p4_kill.o: tools/posix/p4_kill.asm | $(POSIX_DIR)
+	$(NASM) -f elf32 $< -o $@ -l $(POSIX_DIR)/p4_kill.lst
+
+$(P4_KILL_ELF): $(POSIX_DIR)/p4_kill.o | $(POSIX_DIR)
+	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
+	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
+
+$(POSIX_DIR)/p4_exec.o: tools/posix/p4_exec.asm | $(POSIX_DIR)
+	$(NASM) -f elf32 $< -o $@ -l $(POSIX_DIR)/p4_exec.lst
+
+$(P4_EXEC_ELF): $(POSIX_DIR)/p4_exec.o | $(POSIX_DIR)
 	$(LD32) -static -n -Ttext=0x120000 -e _start --build-id=none -o $@ $<
 	@printf '   POSIX 测试程序: %s %s 字节\n' "$@" "$$(stat -c %s $@)"
 
@@ -333,7 +349,7 @@ MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 	    TEST/ TEST/HELLO.BIN=$(BUILD)/HELLO.BIN TEST/P1_HELLO.ELF=$(P1_HELLO_ELF) \
 	    TEST/P2_FILE.ELF=$(P2_FILE_ELF) TEST/P2_BRK.ELF=$(P2_BRK_ELF) TEST/P2_DATA.TXT=$(P2_DATA_TXT) \
 	    TEST/P3_STAT.ELF=$(P3_STAT_ELF) TEST/P3_DENTS.ELF=$(P3_DENTS_ELF) TEST/P3_TIME.ELF=$(P3_TIME_ELF) \
-	    TEST/P4_FORK.ELF=$(P4_FORK_ELF) \
+	    TEST/P4_FORK.ELF=$(P4_FORK_ELF) TEST/P4_KILL.ELF=$(P4_KILL_ELF) TEST/P4_EXEC.ELF=$(P4_EXEC_ELF) \
 	    TEST/LONGNAME_TEST.txt=progs/README.TXT \
 	    TEST/BIGDIR/ $(BIGDIR_SPECS) \
 	    DEV/ DEV/README.TXT=progs/DEV_README.TXT \
@@ -345,7 +361,7 @@ MKFAT_FILES := BIN/ BIN/K64.BIN=$(BUILD)/K64.BIN BIN/TCC.BIN=$(BUILD)/TCC.BIN \
 
 $(HDIMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin \
           $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT) \
-          $(P3_STAT_ELF) $(P3_DENTS_ELF) $(P3_TIME_ELF) $(P4_FORK_ELF) $(BUILD)/TCC.BIN \
+          $(P3_STAT_ELF) $(P3_DENTS_ELF) $(P3_TIME_ELF) $(P4_FORK_ELF) $(P4_KILL_ELF) $(P4_EXEC_ELF) $(BUILD)/TCC.BIN \
           $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
           progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
           $(wildcard tccinc/*.h) \
@@ -382,7 +398,7 @@ HD32IMG := $(BUILD)/kkernel-hd32.img
 
 $(HD32IMG): $(BUILD)/boot.bin $(BUILD)/stub.bin $(BUILD)/kernel.bin $(CRT_TCC_OBJ) $(MINIC_OBJ) font/full-kkf.bin progs/JPKR.TXT progs/ZH.TXT progs/EN.TXT \
             $(PINYIN_BIN) $(BUILD)/K64.BIN $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT) \
-            $(P3_STAT_ELF) $(P3_DENTS_ELF) $(P3_TIME_ELF) $(P4_FORK_ELF) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
+            $(P3_STAT_ELF) $(P3_DENTS_ELF) $(P3_TIME_ELF) $(P4_FORK_ELF) $(P4_KILL_ELF) $(P4_EXEC_ELF) $(PROG_BINS) progs/README.TXT progs/NOTES.TXT progs/RC.CONF \
             progs/DEV_README.TXT progs/DEV_NODE.txt progs/TCC_INC.C tools/mkimg.py tools/mkfat.py \
             $(wildcard tccinc/*.h) \
             $(BUILD)/bigdir/.stamp
@@ -493,8 +509,8 @@ test-k64: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --k64 --font font/full-kkf.bin
 
-test-posix: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT) $(P3_STAT_ELF) $(P3_DENTS_ELF) $(P3_TIME_ELF) $(P4_FORK_ELF)
-	@echo "── POSIX 转译层 P1–P4a:int 0x80 write/exit/read + 文件/brk + stat/getdents64/time + fork/getpid/wait4(--posix)──"
+test-posix: $(PROG_BINS) font/full-kkf.bin progs/README.TXT progs/NOTES.TXT $(P1_HELLO_ELF) $(P2_FILE_ELF) $(P2_BRK_ELF) $(P2_DATA_TXT) $(P3_STAT_ELF) $(P3_DENTS_ELF) $(P3_TIME_ELF) $(P4_FORK_ELF) $(P4_KILL_ELF) $(P4_EXEC_ELF)
+	@echo "── POSIX 转译层 P1–P4c:int 0x80 write/exit/read + 文件/brk + stat/getdents64/time + fork/getpid/wait4 + kill + execve(--posix)──"
 	$(MAKE) -s -B $(HDIMG)
 	python3 -u tests/qemu_test.py $(HDIMG) --hda --posix --font font/full-kkf.bin
 

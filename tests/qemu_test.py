@@ -2182,6 +2182,39 @@ def main() -> int:
             results.append(("P4 程序退出后页池没泄漏",
                             free_before > 0 and free_after4 == free_before,
                             f"free: {free_after4} pages(运行前 {free_before} pages)"))
+
+            # ---- P4b:kill(37)KILL/TERM/INT/STOP/CONT ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P4_KILL.ELF", 8.0)
+            results.append(("P4b kill 停止/继续/终止子进程",
+                            wait_has("p4-kill: ok", 30.0),
+                            "p4-kill: ok"))
+            results.append(("P4b kill 程序返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+            p_run("debug pmem", 1.4)
+            free_after5 = p_free_pages()
+            results.append(("P4b 程序退出后页池没泄漏",
+                            free_before > 0 and free_after5 == free_before,
+                            f"free: {free_after5} pages(运行前 {free_before} pages)"))
+
+            # ---- P4c:execve(11) 失败 -ENOENT + 成功替换映像 ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P4_EXEC.ELF", 8.0)
+            results.append(("P4c execve 失败返回 -ENOENT",
+                            wait_has("p4-exec: enoent ok", 25.0),
+                            "p4-exec: enoent ok"))
+            results.append(("P4c execve 成功:新程序接管并打印 hello",
+                            wait_has("hello from int 0x80", 25.0),
+                            "hello from int 0x80"))
+            results.append(("P4c execve 后返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+            p_run("debug pmem", 1.4)
+            free_after6 = p_free_pages()
+            results.append(("P4c 程序退出后页池没泄漏",
+                            free_before > 0 and free_after6 == free_before,
+                            f"free: {free_after6} pages(运行前 {free_before} pages)"))
             return report(results)
 
         if mine_mode:

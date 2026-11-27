@@ -97,7 +97,41 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   (CMOS 本地时间当 UTC 处理)。`gettimeofday.tv_usec` = `(ticks % 10) * 10000`。
 - P3 新增错误码:`-EISDIR`(把目录当文件用)、`-ENOTDIR`、`-ENOTTY`。
 
-## 测试(P1 + P2 + P3 + P4a)
+## P4:进程(P4a/P4b/P4c 已完成)
+
+P4 分三段:**P4a**(fork/getpid/wait4)、**P4b**(kill)、**P4c**(execve),全部完成。
+进程层直接复用原生内核能力(fork 写时复制地址空间、wait/收尸、信号、exec)。
+
+| # | 系统调用 | 签名 | P4 行为 |
+|---|---|---|---|
+| 2 | `fork` | `fork()` | 复制当前进程(写时复制窗口页、独立 guard 页、共享镜像 staging);**子进程返回 0、父进程返回子 pid**,失败 `-EAGAIN` |
+| 20 | `getpid` | `getpid()` | → 调用进程的 pid(pid = TCB 槽号 + 1) |
+| 114 | `wait4` | `wait4(pid, status*, options, rusage)` | 等子进程退出/停止;`options` 只认 `WNOHANG`(1)/`WUNTRACED`(2);`pid` 支持 `> 0` / `-1`(任意子进程);返回子 pid、WNOHANG 无事件返回 `0`、没孩子 `-ECHILD`、其它 pid 形式 `-ENOSYS`;`*status` 用 Linux 编码:正常退出 `(exitcode & 0xFF) << 8`、停住 `0x7F` |
+| 11 | `execve` | `execve(path, argv, envp)` | 用 `path` 处的 ELF/BIN 替换当前程序镜像;`argv`/`envp` 暂忽略(不传给程序);失败返回 `-ENOENT` 且旧程序继续运行;成功不返回 |
+| 37 | `kill` | `kill(pid, sig)` | 只支持 `pid > 0`(0/负 → `-ENOSYS`);信号支持 `SIGKILL`(9)/`SIGTERM`(15)/`SIGINT`(2)/`SIGSTOP`(19)/`SIGCONT`(18);`sig = 0` 是探测;返回 `0` / `-ESRCH`(无此进程)/ `-EPERM`(权限)/ `-EINVAL`(信号不支持) |
+
+实现说明:
+
+- `fork` 复用 `process_fork`:内核侧中断现场被复制进子进程的内核栈,所以子进程
+  从 `int 0x80` 返回点继续跑、`eax = 0`;父子关系记在 TCB 里,`wait4` 只收自己的
+  孩子。
+- `wait4` 把 Linux 选项位映射到内核 wait 标志,事件详情(状态/pid/退出码)从
+  **调用线程自己的 TCB** 读,两个进程并发 wait 不会互相覆盖。
+- `fork` 继承 POSIX brk 指针(`TCB_POSIX_BRK`)。
+- `kill` 把 Linux 信号号映射到内核的打包 `signal_t`(`class<<24 | action<<16 |
+  level`,user 类/user 级)后调 `process_signal_send`,原生 UID 权限检查仍然生效;
+  先校验目标槽是否存在,以此区分 `-ESRCH` 与 `-EPERM`。
+- `execve` 先把用户态路径拷进内核缓冲(`posix_exec_path`,最长 63 字节,超了 →
+  `-ENAMETOOLONG`),清掉继承来的 `TCB_EXECBUF` 载荷,再调原生 `process_exec`。
+  因为换镜像是整体替换地址空间,`process_exec` 入口会先切到内核页目录
+  (`CR3 = 0x1000`):0x120000 程序窗口只有在内核页目录下才是内核暂存区。失败时
+  旧地址空间还活着,于是从 `TCB_SP_PD` 恢复原 CR3 并把 `-ENOENT` 返回给调用者。
+  `posix_fd_reset` 在 `process_exec` 入口就执行,所以**失败的 execve 也会清空
+  POSIX fd 表**(见已知限制)。
+- FD 继承在 P4 里明确不做:POSIX fd 表是**全局表**(不是每进程),因此 fork
+  出的子进程与父进程共享;`execve` 会清空(见已知限制)。
+
+## 测试(P1 + P2 + P3 + P4a + P4b + P4c)
 
 - P1:[`tools/posix/p1_hello.asm`](../../tools/posix/p1_hello.asm) —— 裸汇编 i386 ELF,
   调 `write(1, "hello from int 0x80\n", 20)` 后 `exit(0)`。
@@ -119,10 +153,19 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
 - P4a:[`tools/posix/p4_fork.asm`](../../tools/posix/p4_fork.asm) —— `getpid`、`fork`
   和 `wait4`:子进程打印 `p4-fork: child` 后 `exit(42)`,父进程 `wait4` 等它、
   校验退出状态后打印 `p4-fork: ok`;同时校验 `getpid` 在 fork/wait 前后没变。
+- P4b:[`tools/posix/p4_kill.asm`](../../tools/posix/p4_kill.asm) —— fork 一个死循环
+  子进程,然后 kill 它:探测(`sig 0`)、`SIGSTOP` + `wait4(WUNTRACED)` 拿到
+  `0x7F` 停住状态、`SIGCONT`、`SIGINT`(接受但不杀)、非法信号 → `-EINVAL`、
+  不存在的 pid → `-ESRCH`、不支持的 pid 形式 → `-ENOSYS`,最后 `SIGTERM` +
+  `wait4` 看到退出码 137;打印 `p4-kill: ok`。
 - 用 `nasm -f elf32` + `ld -m elf_i386 -static -n -Ttext=0x120000` 构建
   (`-Ttext=0x120000`:内核 ELF 装载器把程序展开到 0x120000 程序窗口;
   `-n` 防止链接器在基址以下额外生成一个 `PT_LOAD` 段)。
-- `make test-posix` 启动硬盘镜像,依次跑 P1–P4a 程序,断言:输出字符串出现、
+- P4c:[`tools/posix/p4_exec.asm`](../../tools/posix/p4_exec.asm) —— 对不存在的路径
+  `execve` 返回 `-ENOENT`(旧程序继续跑),再对 `TEST/P1_HELLO.ELF` `execve`,
+  当前镜像被 hello 程序替换(打印 `hello from int 0x80` 后正常退出回 shell);
+  打印 `p4-exec: enoent ok`。
+- `make test-posix` 启动硬盘镜像,依次跑 P1–P4c 程序,断言:输出字符串出现、
   每个程序后回到 shell、页池不泄漏。
 
 
@@ -133,10 +176,10 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
 | P1 | `exit` / `read` / `write` | 完成 |
 | P2 | `open` / `close` / `lseek` / 文件读写、`brk` | 完成 |
 | P3 | `stat` / `fstat` / `getdents64` / `ioctl` / `time` / `gettimeofday` | 完成 |
-| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | 进行中:P4a(fork/getpid/wait4)完成;P4b(kill)、P4c(execve)随后 |
+| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | 完成:P4a(fork/getpid/wait4)、P4b(kill)、P4c(execve) |
 | P5 | static i386 busybox applet 子集 | 计划(先评估) |
 
-## 已知限制(P1 + P2 + P3 + P4a)
+## 已知限制(P1 + P2 + P3 + P4a + P4b + P4c)
 
 - fd 0 的 `read` 一次只读一个字节;没有行规程/termios。
 - fd 表是全局的(不是每进程):fork 出的子进程与父进程共享 fd;`execve` 会清空 fd 表(P4 明确不做 fd 继承)。
@@ -153,3 +196,5 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   (usec 来自 PIT tick)。
 - 目录只能只读打开;`open` 除访问模式外不支持其它 flag(没有 `O_DIRECTORY`、
   `O_NONBLOCK` 等)。
+- `kill` 只支持 `pid > 0` 和上面五种信号;进程组(`pid <= 0`)、`sigaction`/
+  信号处理函数、实时信号都还没有实现。

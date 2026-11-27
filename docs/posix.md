@@ -115,17 +115,19 @@ Implementation notes:
 - Error codes added in P3: `-EISDIR` (directory used as a file),
   `-ENOTDIR`, `-ENOTTY`.
 
-## P4: processes (in progress — P4a done)
+## P4: processes (P4a + P4b + P4c implemented)
 
-P4 is staged: **P4a** (fork/getpid/wait4) is done; **P4b** (kill) and **P4c**
-(execve) follow. Processes are implemented on top of the native kernel
-process layer (`fork` with copy-on-write address spaces, wait/reap, signals).
+P4 is staged as **P4a** (fork/getpid/wait4), **P4b** (kill) and **P4c** (execve),
+all implemented. Processes are built on top of the native kernel process layer
+(`fork` with copy-on-write address spaces, wait/reap, signals, `exec`).
 
 | # | Syscall | Signature | P4 behaviour |
 |---|---|---|---|
 | 2 | `fork` | `fork()` | copies the current process (copy-on-write window pages, own guard page, shared image staging); **child returns 0, parent returns the child pid**, failure `-EAGAIN` |
 | 20 | `getpid` | `getpid()` | → pid of the calling process (pid = TCB slot + 1) |
 | 114 | `wait4` | `wait4(pid, status*, options, rusage)` | waits for a child; `options` recognised: `WNOHANG` (1) and `WUNTRACED` (2); `pid` supports `> 0` and `-1` (any child); returns child pid, `0` for WNOHANG-with-no-event, `-ECHILD` when there is no child, `-ENOSYS` for the other pid forms. `*status` uses the Linux encoding: normal exit `(exitcode & 0xFF) << 8`, stopped `0x7F` |
+| 11 | `execve` | `execve(path, argv, envp)` | replaces the current program image with the ELF/BIN at `path`; `argv`/`envp` are ignored (not yet passed to the program); on failure returns `-ENOENT` and the old program keeps running; on success it never returns |
+| 37 | `kill` | `kill(pid, sig)` | `pid > 0` only (0 / negative → `-ENOSYS`); supported signals: `SIGKILL` (9), `SIGTERM` (15), `SIGINT` (2), `SIGSTOP` (19), `SIGCONT` (18); `sig = 0` is a probe; returns `0` / `-ESRCH` (no such process) / `-EPERM` (permission) / `-EINVAL` (unsupported signal) |
 
 Implementation notes:
 
@@ -138,11 +140,24 @@ Implementation notes:
   processes waiting concurrently cannot clobber each other's result.
 - The POSIX brk pointer (`TCB_POSIX_BRK`) is inherited by fork (parent and child keep
   the same break value).
+- `kill` maps the Linux signal numbers onto the kernel's packed `signal_t`
+  (`class<<24 | action<<16 | level`, user class / user level) and calls
+  `process_signal_send`, so the native UID checks still apply. The target slot is
+  validated first, which is what separates `-ESRCH` from `-EPERM`.
+- `execve` copies the pathname from user space into a kernel buffer (`posix_exec_path`,
+  63 bytes max, longer → `-ENAMETOOLONG`), clears the inherited `TCB_EXECBUF` payload
+  and calls the native `process_exec`. Because execution replaces the address space,
+  `process_exec` switches to the kernel page directory (`CR3 = 0x1000`) at entry: the
+  program window at 0x120000 is the kernel staging area only under the kernel page
+  directory. On the failure path the old address space is still alive, so the saved
+  `CR3` is restored from `TCB_SP_PD` and `-ENOENT` is returned to the caller.
+  `posix_fd_reset` runs at `process_exec` entry, so a failed `execve` also clears the
+  POSIX fd table (documented limitation).
 - FD inheritance is deliberately not implemented in P4: the POSIX fd table is a
   **single global table** (not per-process), so a forked child shares it with the
   parent, and `execve` clears it (see known limitations).
 
-## Testing (P1 + P2 + P3 + P4a)
+## Testing (P1 + P2 + P3 + P4a + P4b + P4c)
 
 - P1: [`tools/posix/p1_hello.asm`](../tools/posix/p1_hello.asm) — bare-metal
   i386 ELF that calls `write(1, "hello from int 0x80\n", 20)` then `exit(0)`.
@@ -175,7 +190,16 @@ Implementation notes:
   `fork` and `wait4`: the child prints `p4-fork: child` and exits with 42, the parent
   waits, checks the exit status and prints `p4-fork: ok`; it also verifies `getpid`
   did not change across fork/wait.
-- `make test-posix` starts the hard-disk image and runs all P1–P4a programs,
+- P4b: [`tools/posix/p4_kill.asm`](../tools/posix/p4_kill.asm) — `fork` a busy
+  child, then `kill` it: probe (`sig 0`), `SIGSTOP` + `wait4(WUNTRACED)` status
+  `0x7F`, `SIGCONT`, `SIGINT` (accepted but non-fatal), invalid signal → `-EINVAL`,
+  missing pid → `-ESRCH`, unsupported pid form → `-ENOSYS`, finally `SIGTERM`
+  and `wait4` sees exit code 137; prints `p4-kill: ok`.
+- P4c: [`tools/posix/p4_exec.asm`](../tools/posix/p4_exec.asm) — `execve` on a
+  missing path returns `-ENOENT` (old program still runs), then `execve` on
+  `TEST/P1_HELLO.ELF` replaces the current image (the hello program prints
+  `hello from int 0x80` and exits back to the shell); prints `p4-exec: enoent ok`.
+- `make test-posix` starts the hard-disk image and runs all P1–P4c programs,
   asserting the output strings, return to the shell after each program and that
   the page pool does not leak.
 
@@ -186,10 +210,10 @@ Implementation notes:
 | P1 | `exit` / `read` / `write` | done |
 | P2 | `open` / `close` / `lseek` / file read/write, `brk` | done |
 | P3 | `stat` / `fstat` / `getdents64` / `ioctl` / `time` / `gettimeofday` | done |
-| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | in progress: P4a (fork/getpid/wait4) done; P4b (kill) and P4c (execve) next |
+| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | done: P4a (fork/getpid/wait4), P4b (kill), P4c (execve) |
 | P5 | static i386 busybox applet subset | planned (evaluate first) |
 
-## Known limitations (P1 + P2 + P3 + P4a)
+## Known limitations (P1 + P2 + P3 + P4a + P4b + P4c)
 
 - `read` on fd 0 reads one byte at a time; no line discipline, no termios.
 - The fd table is global (not per-process): a forked child shares its parent's
@@ -208,3 +232,11 @@ Implementation notes:
   no sub-second RTC precision (usec comes from PIT ticks).
 - Open directories are read-only; there is no `open` flag support beyond
   access mode (no `O_DIRECTORY`, `O_NONBLOCK`, ...).
+- `kill` only supports `pid > 0` and the five signals listed above; process
+  groups (`pid <= 0`), `sigaction`/signal handlers and real-time signals are
+  not implemented yet.
+- `execve` ignores `argv`/`envp` (the program starts with no arguments), does not
+  search `PATH`, and requires at most 63 bytes of pathname.
+- A failed `execve` still clears the POSIX fd table (the reset happens at
+  `process_exec` entry, before the file lookup); success replaces the image
+  anyway, and FD inheritance is not implemented in P4.
