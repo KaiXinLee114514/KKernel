@@ -2130,6 +2130,42 @@ def main() -> int:
             results.append(("P2 程序退出后页池没泄漏",
                             free_before > 0 and free_after2 == free_before,
                             f"free: {free_after2} pages(运行前 {free_before} pages)"))
+
+            # ---- P3:stat / fstat / ioctl ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P3_STAT.ELF", 5.0)
+            results.append(("P3 stat/fstat/ioctl(TCGETS)",
+                            wait_has("p3-stat: ok", 20.0),
+                            "p3-stat: ok"))
+            results.append(("P3 stat/fstat 程序退出后返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+
+            # ---- P3:getdents64 目录遍历 ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P3_DENTS.ELF", 5.0)
+            results.append(("P3 getdents64 遍历 TEST/ 并找到 P2_DATA.TXT",
+                            wait_has("p3-dents: ok", 20.0),
+                            "p3-dents: ok"))
+            results.append(("P3 getdents64 程序退出后返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+
+            # ---- P3:time / gettimeofday ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P3_TIME.ELF", 6.0)
+            results.append(("P3 time(13)/gettimeofday(78) 非 0 且单调",
+                            wait_has("p3-time: ok", 25.0),
+                            "p3-time: ok"))
+            results.append(("P3 time 程序退出后返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+
+            p_run("debug pmem", 1.4)
+            free_after3 = p_free_pages()
+            results.append(("P3 程序退出后页池没泄漏",
+                            free_before > 0 and free_after3 == free_before,
+                            f"free: {free_after3} pages(运行前 {free_before} pages)"))
             return report(results)
 
         if mine_mode:
