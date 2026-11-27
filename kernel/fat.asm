@@ -2524,3 +2524,203 @@ fat_state_restore:
     rep movsb
     popad
     ret
+
+; ---------------------------------------------------------------------------
+;  P3:目录遍历 API(getdents64 用)
+;
+;  fat_dir_open:esi = 路径 → eax = 0 成功(目录首簇存 [fat_dent_clus],0 = 根)
+;               eax = -1 失败(不存在 / 不是目录)
+;    说明:内部先把 [fat_dir] 清 0 从根解析;调用者需持 fs_lock,
+;          用完自行恢复 [fat_dir](通常和 fat_path 的调用规矩一样)。
+; ---------------------------------------------------------------------------
+fat_dir_open:
+    pushad
+    mov dword [fat_dir], 0
+    call fat_path                       ; esi → eax = 最后一段
+    jc .fail
+    cmp byte [eax], 0
+    je .root                            ; 路径到头 = 根目录
+    mov esi, eax
+    call fat_find
+    cmp eax, -1
+    je .fail
+    mov ecx, 1
+    mov edi, FAT_BUF
+    call fat_dev_read                   ; eax 还是 fat_find 返回的 LBA
+    test eax, eax
+    jnz .fail
+    mov dword [fat_cache_lba], -1
+    mov esi, FAT_BUF
+    add esi, [fat_entry_off]
+    movzx eax, byte [esi + 11]
+    test al, 0x10                       ; attr bit4 = 目录
+    jz .fail
+    call fat_ent_cluster                ; esi = 目录项 → eax = 首簇(FAT16/32)
+    mov [fat_dent_clus], eax
+    mov dword [esp + 28], 0
+    jmp .out
+.root:
+    mov dword [fat_dent_clus], 0
+    mov dword [esp + 28], 0
+    jmp .out
+.fail:
+    mov dword [esp + 28], -1
+.out:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  fat_dirent:按索引取目录项(0 起,跳过删除项 / LFN / "." / "..")
+;    输入:eax = 目录首簇(0 = 根;FAT16 固定区 / FAT32 根簇),edx = 索引
+;    输出:eax = 1 找到 / 0 没有更多了 / -1 出错
+;          [fat_dent_name] 8.3 名(去掉补齐空格,含点,0 结尾,最多 13B)
+;          [fat_dent_attr] 属性 dword
+;          [fat_dent_size] 大小 dword
+; ---------------------------------------------------------------------------
+fat_dirent:
+    pushad
+    mov [fdt_left], edx
+    test eax, eax
+    jnz .cluster_init
+    cmp byte [fat_fat32], 0
+    jne .root32
+    mov eax, [fat_root_lba]
+    mov [fdt_lba], eax
+    mov eax, [fat_root_ents]
+    mov [fdt_ents], eax
+    mov dword [fdt_spc], 0
+    jmp .loop
+.root32:
+    mov eax, [fat_root_cluster]
+.cluster_init:
+    mov [fdt_clus], eax
+.cluster:
+    mov eax, [fdt_clus]
+    cmp eax, [fat_eoc]
+    jae .end
+    test eax, eax
+    jz .end
+    sub eax, 2
+    imul eax, [fat_spc]
+    add eax, [fat_data_lba]
+    mov [fdt_lba], eax
+    mov eax, [fat_spc]
+    shl eax, 4                          ; 每扇区 16 项
+    mov [fdt_ents], eax
+    mov dword [fdt_spc], 1
+.loop:
+    mov eax, [fdt_ents]
+    test eax, eax
+    jz .next_cluster
+    mov eax, [fdt_lba]
+    mov ecx, 1
+    mov edi, FAT_BUF
+    call fat_dev_read
+    test eax, eax
+    jnz .fail
+    mov dword [fat_cache_lba], -1
+    xor ebx, ebx
+.entry:
+    cmp ebx, 512
+    jae .next_sector
+    mov esi, FAT_BUF
+    add esi, ebx
+    movzx eax, byte [esi]
+    test al, al
+    jz .end                             ; 0x00 = 目录结束
+    cmp al, 0xE5
+    je .ent_skip
+    cmp byte [esi + 11], 0x0F           ; LFN 项
+    je .ent_skip
+    cmp byte [esi], '.'                 ; "." / ".." 不列
+    je .ent_skip
+    cmp dword [fdt_left], 0
+    je .fill
+    dec dword [fdt_left]
+    jmp .ent_skip
+.fill:
+    mov edi, fat_dent_name
+    xor ecx, ecx
+.copy_name:
+    cmp ecx, 8
+    jae .trim_name
+    mov al, [esi + ecx]
+    mov [edi], al
+    inc edi
+    inc ecx
+    jmp .copy_name
+.trim_name:
+    cmp edi, fat_dent_name
+    jbe .ext_check
+    cmp byte [edi - 1], ' '
+    jne .ext_check
+    dec edi
+    jmp .trim_name
+.ext_check:
+    cmp byte [esi + 8], ' '
+    je .name_done
+    mov al, '.'
+    mov [edi], al
+    inc edi
+    xor ecx, ecx
+.copy_ext:
+    cmp ecx, 3
+    jae .trim_ext
+    mov al, [esi + 8 + ecx]
+    mov [edi], al
+    inc edi
+    inc ecx
+    jmp .copy_ext
+.trim_ext:
+    cmp edi, fat_dent_name
+    jbe .name_done
+    cmp byte [edi - 1], ' '
+    jne .name_done
+    dec edi
+    jmp .trim_ext
+.name_done:
+    mov byte [edi], 0
+    movzx eax, byte [esi + 11]
+    mov [fat_dent_attr], eax
+    mov eax, [esi + 28]
+    mov [fat_dent_size], eax
+    call fat_ent_cluster                ; esi 仍是目录项
+    mov [fat_dent_clus], eax
+    mov dword [esp + 28], 1
+    jmp .out
+.ent_skip:
+    add ebx, 32
+    jmp .entry
+.next_sector:
+    inc dword [fdt_lba]
+    sub dword [fdt_ents], 16
+    jmp .loop
+.next_cluster:
+    cmp dword [fdt_spc], 0
+    je .end
+    mov eax, [fdt_clus]
+    cmp eax, [fat_eoc]
+    jae .end
+    mov [fat_cluster], eax
+    call fat_next_cluster
+    mov [fdt_clus], eax
+    jmp .cluster
+.end:
+    mov dword [esp + 28], 0
+    jmp .out
+.fail:
+    mov dword [esp + 28], -1
+.out:
+    popad
+    ret
+
+; ---- P3 目录遍历数据(放在 fat_state_end 之后,不增大状态区拷贝) ----
+fat_dent_clus   dd 0                    ; fat_dir_open 结果:目录首簇(0 = 根)
+fat_dent_name   times 13 db 0           ; fat_dirent 结果:8.3 名(含点,0 结尾)
+fat_dent_attr   dd 0
+fat_dent_size   dd 0
+fdt_left        dd 0
+fdt_lba         dd 0
+fdt_ents        dd 0
+fdt_clus        dd 0
+fdt_spc         dd 0

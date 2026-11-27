@@ -1,5 +1,5 @@
 ; ============================================================================
-;  KKernel — i386 Linux ABI 转译层(int 0x80)  Phase P1 + P2
+;  KKernel — i386 Linux ABI 转译层(int 0x80)  Phase P1 + P2 + P3
 ;
 ;  目标:让现成的 Linux i386 静态程序(最终是 static busybox)直接跑起来。
 ;  不改动原生 int 0x30 API;int 0x80 进来后在这里转译到内核能力。
@@ -15,6 +15,15 @@
 ;      3  sys_read(fd, ...)                      3+ = 文件(fd 0 仍是键盘)
 ;      4  sys_write(fd, ...)                     3+ = 文件(只支持"整文件覆盖")
 ;      45 sys_brk(addr)                          接程序堆窗口 SPACE_HEAP_VA
+;  P3(本阶段,文件元信息 / 目录 / 时间):
+;      106 sys_stat(path, buf)                   i386 struct stat(64B)
+;      107 sys_lstat(path, buf)                  同 stat(不解析符号链接)
+;      108 sys_fstat(fd, buf)                    0/1/2 = 字符设备,3+ = fd 表
+;      220 sys_getdents64(fd, buf, count)        目录 fd 遍历 FAT 目录项
+;      54  sys_ioctl(fd, req, arg)               仅 TCGETS(0x5401) 对控制台返回假 termios
+;      13  sys_time(tloc)                        CMOS RTC → Unix 时间戳
+;      78  sys_gettimeofday(tv, tz)              tv = {sec, usec}
+;  目录 fd:open 只读打开目录成功,PFD_FLAGS 的 bit2 置位;read/write/lseek → -EISDIR。
 ;  其它编号一律 eax = -ENOSYS;fd 不合法 = -EBADF。
 ;
 ;  ABI(Linux i386 int 0x80):
@@ -41,6 +50,28 @@ POSIX_ENOSPC    equ 28
 POSIX_ESPIPE    equ 29
 POSIX_ENAMETOOLONG equ 36
 POSIX_ENOSYS    equ 38
+POSIX_EISDIR    equ 21
+POSIX_ENOTDIR   equ 20
+POSIX_ENOTTY    equ 25
+
+; ---- P3:stat 模式位 / ioctl ----
+S_IFREG         equ 0x8000
+S_IFDIR         equ 0x4000
+S_IFCHR         equ 0x2000
+POSIX_MODE_FILE equ S_IFREG | 0x1A4    ; 0644
+POSIX_MODE_DIR  equ S_IFDIR | 0x1ED    ; 0755
+POSIX_MODE_CHR  equ S_IFCHR | 0x190    ; 0620
+POSIX_TCGETS    equ 0x5401
+; ---- i386 struct stat 偏移 ----
+ST_MODE         equ 8
+ST_NLINK        equ 10
+ST_SIZE         equ 20
+ST_BLKSIZE      equ 24
+ST_BLOCKS       equ 28
+ST_ATIME        equ 32
+ST_MTIME        equ 40
+ST_CTIME        equ 48
+STAT_SIZE       equ 64
 
 ; ---- fd 表:0/1/2 = 控制台;3..(3+POSIX_FD_FILE_MAX-1) = 文件 ----
 POSIX_FD_FILE_BASE  equ 3
@@ -51,7 +82,9 @@ PFD_FSIZE           equ 8               ; 文件大小(open 时 fat_stat 得到)
 PFD_OFF             equ 12              ; 当前读写偏移
 PFD_PATH            equ 16              ; 路径(含 0,最长 39 字符)
 POSIX_FD_PATHLEN    equ 40
-POSIX_FD_ENT        equ 56              ; 每槽 56 字节(4*4 + 40)
+PFD_CLUS            equ 56              ; 目录 fd:目录首簇(0 = 根);普通文件为 0
+POSIX_FD_ENT        equ 60              ; 每槽 60 字节
+PFD_DIR             equ 4               ; PFD_FLAGS 的 bit2:目录 fd
 POSIX_SCRATCH_SIZE  equ 8192            ; 全局 scratch:整读整写用(<=8 KiB 文件)
 
 ; ---------------------------------------------------------------------------
@@ -124,6 +157,20 @@ posix_dispatch:
     je sys_lseek
     cmp eax, 45
     je sys_brk
+    cmp eax, 13
+    je sys_time
+    cmp eax, 54
+    je sys_ioctl
+    cmp eax, 78
+    je sys_gettimeofday
+    cmp eax, 106
+    je sys_stat
+    cmp eax, 107
+    je sys_lstat
+    cmp eax, 108
+    je sys_fstat
+    cmp eax, 220
+    je sys_getdents64
     mov eax, -POSIX_ENOSYS
     ret
 
@@ -276,6 +323,8 @@ sys_read:
     test eax, eax
     jz .rd_file_ebadf
     mov ebx, eax                        ; entry
+    test dword [ebx + PFD_FLAGS], PFD_DIR
+    jnz .rd_file_isdir
     test ebp, ebp
     jz .rd_file_zero
     mov eax, [ebx + PFD_OFF]
@@ -314,6 +363,9 @@ sys_read:
     jmp .rd_file_out
 .rd_file_zero:
     xor eax, eax
+    jmp .rd_file_out
+.rd_file_isdir:
+    mov eax, -POSIX_EISDIR
     jmp .rd_file_out
 .rd_file_ebadf:
     mov eax, -POSIX_EBADF
@@ -397,12 +449,36 @@ sys_open:
     call fat_path
     jc .op_err_nofile
     mov esi, eax                        ; 末段名
+    cmp byte [esi], 0
+    je .op_root_dir                     ; 路径就是根目录
     call fat_stat
     cmp eax, -1
     je .op_err_nofile
-    cmp eax, POSIX_SCRATCH_SIZE
-    ja .op_err_toobig
     mov [posix_open_size], eax
+    mov eax, [fat_stat_attr]
+    test al, 0x10                       ; attr bit4 = 目录
+    jnz .op_dir
+    cmp dword [posix_open_size], POSIX_SCRATCH_SIZE
+    ja .op_err_toobig
+    mov dword [posix_open_dirflag], 0
+    mov dword [posix_open_clus], 0
+    jmp .op_have
+.op_root_dir:
+    mov dword [posix_open_size], 0
+    mov dword [posix_open_dirflag], 1
+    mov dword [posix_open_clus], 0
+    jmp .op_have
+.op_dir:
+    cmp dword [posix_open_flags], 0     ; 目录只允许只读打开
+    jne .op_err_eisdir
+    mov esi, posix_path_tmp
+    call fat_dir_open                   ; 取目录首簇(内部重新从根解析)
+    cmp eax, -1
+    je .op_err_nofile
+    mov dword [posix_open_dirflag], 1
+    mov eax, [fat_dent_clus]
+    mov [posix_open_clus], eax
+.op_have:
     ; 找空槽
     mov edi, posix_fd_tab
     mov ecx, 0
@@ -421,10 +497,16 @@ sys_open:
     call fs_unlock
     mov byte [edi + PFD_USED], 1
     mov eax, [posix_open_flags]
+    cmp dword [posix_open_dirflag], 0
+    je .op_flags_ok
+    or eax, PFD_DIR
+.op_flags_ok:
     mov [edi + PFD_FLAGS], eax
     mov eax, [posix_open_size]
     mov [edi + PFD_FSIZE], eax
     mov dword [edi + PFD_OFF], 0
+    mov eax, [posix_open_clus]
+    mov [edi + PFD_CLUS], eax
     ; 路径进槽
     push edi
     mov esi, posix_path_tmp
@@ -451,6 +533,10 @@ sys_open:
 .op_err_noslot:
     call posix_restore_dir_unlock
     mov eax, -POSIX_EMFILE
+    ret
+.op_err_eisdir:
+    call posix_restore_dir_unlock
+    mov eax, -POSIX_EISDIR
     ret
 .op_enosys:
     mov eax, -POSIX_ENOSYS
@@ -485,6 +571,8 @@ sys_lseek:
     test eax, eax
     jz .ls_ebadf
     mov esi, eax
+    test dword [esi + PFD_FLAGS], PFD_DIR
+    jnz .ls_eisdir
     cmp ebp, 0
     je .ls_set
     cmp ebp, 1
@@ -518,6 +606,9 @@ sys_lseek:
     ret
 .ls_einval:
     mov eax, -POSIX_EINVAL
+    ret
+.ls_eisdir:
+    mov eax, -POSIX_EISDIR
     ret
 
 ; ---------------------------------------------------------------------------
@@ -672,12 +763,431 @@ posix_fs_write:
     mov eax, [posix_ret]
     ret
 
+
+; ===========================================================================
+;  P3:stat / fstat / lstat / getdents64 / ioctl / time / gettimeofday
+; ===========================================================================
+
+; ---------------------------------------------------------------------------
+;  posix_stat_fill:把 i386 struct stat(64B)填到 [esi]
+;    输入:esi = statbuf, eax = 模式位(含 S_IFxxx), ecx = 文件大小
+;    时间字段用当前 RTC 时间(秒级),dev/ino/nlink 等填最小可用值。
+; ---------------------------------------------------------------------------
+posix_stat_fill:
+    pushad
+    mov [posix_st_mode], eax
+    mov [posix_st_size], ecx
+    mov edi, esi
+    mov ecx, STAT_SIZE / 4
+    xor eax, eax
+    rep stosd                           ; 整个结构先清零
+    mov eax, [posix_st_mode]
+    mov [esi + ST_MODE], ax
+    mov word [esi + ST_NLINK], 1
+    mov eax, [posix_st_size]
+    mov [esi + ST_SIZE], eax
+    mov dword [esi + ST_BLKSIZE], 512
+    mov edx, eax
+    add edx, 511
+    shr edx, 9
+    mov [esi + ST_BLOCKS], edx
+    mov dword [esi + 4], 1              ; st_ino(随便给个非 0 值)
+    call posix_epoch
+    mov [esi + ST_ATIME], eax
+    mov [esi + ST_MTIME], eax
+    mov [esi + ST_CTIME], eax
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  posix_epoch:返回 Unix 时间戳(秒),RTC → 1970-01-01 起的秒数
+;  CMOS 时间按本地时间处理(不做时区换算)。
+; ---------------------------------------------------------------------------
+posix_epoch:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    call rtc_get
+    ; ---- 年:1970 .. rtc_year-1 的 365/366 天累加 ----
+    mov ecx, 1970
+    mov edi, [rtc_year]
+    xor ebx, ebx
+.pe_year:
+    cmp ecx, edi
+    jae .pe_years_done
+    add ebx, 365
+    mov eax, ecx
+    call posix_is_leap
+    add ebx, eax
+    inc ecx
+    jmp .pe_year
+.pe_years_done:
+    ; ---- 月:1 .. rtc_mon-1 的天数 ----
+    mov ecx, 1
+    mov esi, posix_mdays
+    movzx eax, byte [rtc_mon]           ; ★ rtc_mon 是 db,必须按字节读
+    mov [posix_epoch_mon], eax
+.pe_mon:
+    cmp ecx, [posix_epoch_mon]
+    jae .pe_mons_done
+    movzx eax, byte [esi + ecx - 1]
+    add ebx, eax
+    inc ecx
+    jmp .pe_mon
+.pe_mons_done:
+    ; 闰年且月份 > 2 时 +1(2 月 29 日)
+    cmp dword [posix_epoch_mon], 2
+    jbe .pe_no_leap
+    mov eax, [rtc_year]
+    call posix_is_leap
+    add ebx, eax
+.pe_no_leap:
+    movzx eax, byte [rtc_day]
+    dec eax
+    add ebx, eax
+    ; ---- 秒 = 天 * 86400 + 时 * 3600 + 分 * 60 + 秒 ----
+    imul ebx, ebx, 86400
+    movzx eax, byte [rtc_hour]
+    imul eax, eax, 3600
+    add ebx, eax
+    movzx eax, byte [rtc_min]
+    imul eax, eax, 60
+    add ebx, eax
+    movzx eax, byte [rtc_sec]
+    add ebx, eax
+    mov eax, ebx
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  posix_is_leap:eax = 年 → eax = 1/0(公历闰年)
+; ---------------------------------------------------------------------------
+posix_is_leap:
+    push ebx
+    push ecx
+    push edx
+    mov ecx, eax
+    xor edx, edx
+    mov ebx, 4
+    div ebx
+    test edx, edx
+    jnz .pil_no
+    mov eax, ecx
+    xor edx, edx
+    mov ebx, 100
+    div ebx
+    test edx, edx
+    jnz .pil_yes
+    mov eax, ecx
+    xor edx, edx
+    mov ebx, 400
+    div ebx
+    test edx, edx
+    jnz .pil_no
+.pil_yes:
+    mov eax, 1
+    jmp .pil_out
+.pil_no:
+    xor eax, eax
+.pil_out:
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_time(tloc):ebx = time_t*(可为 0);返回 Unix 时间戳
+; ---------------------------------------------------------------------------
+sys_time:
+    push ebx
+    call posix_epoch
+    pop ebx
+    test ebx, ebx
+    jz .t_out
+    mov [ebx], eax
+.t_out:
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_gettimeofday(tv, tz):ebx = timeval*(sec,usec),ecx = timezone*(忽略)
+; ---------------------------------------------------------------------------
+sys_gettimeofday:
+    push esi
+    push edi
+    mov esi, ebx
+    mov edi, ecx
+    call posix_epoch
+    test esi, esi
+    jz .gt_done
+    mov [esi], eax
+    push eax
+    call pit_get_ticks
+    mov ecx, 10
+    xor edx, edx
+    div ecx                             ; edx = 10ms tick 的余数
+    imul edx, edx, 10000
+    mov [esi + 4], edx
+    pop eax
+.gt_done:
+    xor eax, eax
+    pop edi
+    pop esi
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_ioctl(fd, req, arg):只支持控制台(0/1/2)的 TCGETS → 假 termios
+; ---------------------------------------------------------------------------
+sys_ioctl:
+    cmp ecx, POSIX_TCGETS
+    jne .io_enotty
+    cmp ebx, POSIX_FD_FILE_BASE
+    jae .io_enotty
+    test edx, edx
+    jz .io_ok
+    push edi
+    push ecx
+    mov edi, edx
+    mov ecx, 9                          ; 36 字节(termios)
+    xor eax, eax
+    rep stosd
+    pop ecx
+    pop edi
+.io_ok:
+    xor eax, eax
+    ret
+.io_enotty:
+    mov eax, -POSIX_ENOTTY
+    ret
+
+; ---------------------------------------------------------------------------
+;  posix_stat_common:esi = 路径,edi = statbuf → eax = 0 / -errno
+;  目录和文件都支持(根目录 "/" 也支持)。
+; ---------------------------------------------------------------------------
+posix_stat_common:
+    pushad
+    mov [posix_st_path], esi
+    mov [posix_st_buf], edi
+    call fs_lock
+    mov eax, [fat_dir]
+    mov [posix_saved_dir], eax
+    mov dword [fat_dir], 0
+    mov esi, [posix_st_path]
+    call fat_path
+    jc .sc_fail
+    cmp byte [eax], 0
+    je .sc_root
+    mov esi, eax
+    call fat_stat
+    cmp eax, -1
+    je .sc_fail
+    mov [posix_st_size], eax
+    mov eax, [fat_stat_attr]
+    test al, 0x10
+    jnz .sc_dir
+    mov eax, POSIX_MODE_FILE
+    jmp .sc_mode_ok
+.sc_dir:
+    mov eax, POSIX_MODE_DIR
+    jmp .sc_mode_ok
+.sc_root:
+    mov dword [posix_st_size], 0
+    mov eax, POSIX_MODE_DIR
+.sc_mode_ok:
+    mov [posix_st_mode], eax
+    mov eax, [posix_saved_dir]
+    mov [fat_dir], eax
+    call fs_unlock
+    mov esi, [posix_st_buf]
+    mov eax, [posix_st_mode]
+    mov ecx, [posix_st_size]
+    call posix_stat_fill
+    mov dword [esp + 28], 0
+    jmp .sc_out
+.sc_fail:
+    mov eax, [posix_saved_dir]
+    mov [fat_dir], eax
+    call fs_unlock
+    mov dword [esp + 28], -POSIX_ENOENT
+.sc_out:
+    popad
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_stat(path, buf)/sys_lstat = stat(不解析符号链接)
+; ---------------------------------------------------------------------------
+sys_stat:
+    mov esi, ebx
+    mov edi, ecx
+    jmp posix_stat_common
+
+sys_lstat:
+    jmp sys_stat
+
+; ---------------------------------------------------------------------------
+;  sys_fstat(fd, buf):0/1/2 = 字符设备;3+ = fd 表里的文件/目录
+; ---------------------------------------------------------------------------
+sys_fstat:
+    push edi
+    mov edi, ecx                        ; statbuf
+    cmp ebx, POSIX_FD_FILE_BASE
+    jb .fs_console
+    call posix_fd_lookup
+    test eax, eax
+    jz .fs_ebadf
+    mov esi, eax
+    test dword [esi + PFD_FLAGS], PFD_DIR
+    jnz .fs_dir
+    mov eax, POSIX_MODE_FILE
+    mov ecx, [esi + PFD_FSIZE]
+    jmp .fs_fill
+.fs_dir:
+    mov eax, POSIX_MODE_DIR
+    xor ecx, ecx
+    jmp .fs_fill
+.fs_console:
+    mov eax, POSIX_MODE_CHR
+    xor ecx, ecx
+.fs_fill:
+    mov esi, edi
+    call posix_stat_fill
+    xor eax, eax
+    pop edi
+    ret
+.fs_ebadf:
+    pop edi
+    mov eax, -POSIX_EBADF
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_getdents64(fd, buf, count):目录 fd → 若干个 linux_dirent64 记录
+;  记录布局(i386,u64 对齐 4/8):d_ino 0(8B)、d_off 8、d_reclen 16(2B)、
+;  d_type 18(1B)、d_name 19(NUL 结尾,不足 8 字节对齐补零)。
+;  返回本轮写入的字节数;没有更多条目返回 0;目录 fd 的 PFD_OFF 当 cookie 用。
+; ---------------------------------------------------------------------------
+sys_getdents64:
+    pushad
+    mov [posix_gd_buf], ecx
+    mov [posix_gd_left], edx
+    mov dword [posix_gd_written], 0
+    call posix_fd_lookup
+    test eax, eax
+    jz .gd_ebadf
+    mov [posix_gd_ent], eax
+    test dword [eax + PFD_FLAGS], PFD_DIR
+    jz .gd_enotdir
+.gd_loop:
+    mov eax, [posix_gd_ent]
+    mov eax, [eax + PFD_CLUS]
+    mov edx, [posix_gd_ent]
+    mov edx, [edx + PFD_OFF]
+    call fat_dirent                     ; eax = 1 找到 / 0 结束 / -1 错
+    cmp eax, 0
+    je .gd_done
+    js .gd_eio
+    ; ---- 名字长度 ----
+    mov esi, fat_dent_name
+    xor ecx, ecx
+.gd_namelen:
+    cmp byte [esi + ecx], 0
+    je .gd_namedone
+    inc ecx
+    jmp .gd_namelen
+.gd_namedone:
+    mov [posix_gd_namelen], ecx
+    ; ---- reclen = (19 + namelen + 1 + 7) & ~7 ----
+    lea eax, [ecx + 27]
+    and eax, 0xFFFFFFF8
+    mov [posix_gd_reclen], eax
+    ; ---- 放得下吗?放不下就结束本轮(不消费该条目)----
+    mov edx, [posix_gd_written]
+    add edx, eax
+    cmp edx, [posix_gd_left]
+    ja .gd_done
+    ; ---- 记录清零 ----
+    mov edi, [posix_gd_buf]
+    add edi, [posix_gd_written]
+    push edi
+    mov ecx, eax
+    xor eax, eax
+    rep stosb
+    pop edi
+    ; ---- 头:ino/off/reclen/type ----
+    mov eax, [posix_gd_ent]
+    mov eax, [eax + PFD_OFF]
+    add eax, 1
+    mov [edi + 0], eax
+    mov dword [edi + 4], 0
+    mov [edi + 8], eax                  ; d_off(下一条的 cookie)
+    mov dword [edi + 12], 0
+    mov eax, [posix_gd_reclen]
+    mov [edi + 16], ax
+    mov al, 8                           ; DT_REG
+    mov edx, [fat_dent_attr]
+    test dl, 0x10
+    jz .gd_type_ok
+    mov al, 4                           ; DT_DIR
+.gd_type_ok:
+    mov [edi + 18], al
+    ; ---- 名字 ----
+    lea edi, [edi + 19]
+    mov esi, fat_dent_name
+    mov ecx, [posix_gd_namelen]
+    inc ecx
+.gd_copy:
+    mov al, [esi]
+    mov [edi], al
+    inc esi
+    inc edi
+    dec ecx
+    jnz .gd_copy
+    ; ---- 记账 + 下一条 ----
+    mov eax, [posix_gd_reclen]
+    add [posix_gd_written], eax
+    mov eax, [posix_gd_ent]
+    inc dword [eax + PFD_OFF]
+    jmp .gd_loop
+.gd_done:
+    mov eax, [posix_gd_written]
+    mov [esp + 28], eax
+    jmp .gd_out
+.gd_ebadf:
+    mov dword [esp + 28], -POSIX_EBADF
+    jmp .gd_out
+.gd_enotdir:
+    mov dword [esp + 28], -POSIX_ENOTDIR
+    jmp .gd_out
+.gd_eio:
+    mov dword [esp + 28], -POSIX_EIO
+.gd_out:
+    popad
+    ret
+
 ; ---------------------------------------------------------------------------
 ;  数据
 ; ---------------------------------------------------------------------------
 posix_saved_dir     dd 0
 posix_open_flags    dd 0
 posix_open_size     dd 0
+posix_open_dirflag  dd 0
+posix_open_clus     dd 0
+posix_st_mode       dd 0
+posix_st_size       dd 0
+posix_st_path       dd 0
+posix_st_buf        dd 0
+posix_gd_buf        dd 0
+posix_gd_left       dd 0
+posix_gd_written    dd 0
+posix_gd_ent        dd 0
+posix_gd_reclen     dd 0
+posix_gd_namelen    dd 0
+posix_mdays         db 31,28,31,30,31,30,31,31,30,31,30,31
+posix_epoch_mon     dd 0
 posix_fs_path       dd 0
 posix_fs_buf        dd 0
 posix_fs_len        dd 0
