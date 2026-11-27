@@ -80,7 +80,42 @@ Implementation notes:
   `-ENOSPC` (file would exceed scratch), `-ESPIPE` (seek on a pipe),
   `-EIO` (FAT I/O error), `-ENOSYS` (unsupported).
 
-## Testing (P1 + P2)
+## P3: file metadata, directories and time (done)
+
+| # | Syscall | Signature | P3 behaviour |
+|---|---|---|---|
+| 106 | `stat` | `stat(path, buf)` | fills an i386 `struct stat` (64 bytes): `st_mode`, `st_size`, `st_mtime`, ...; directories and the root `"/"` are supported |
+| 107 | `lstat` | `lstat(path, buf)` | identical to `stat` (FAT has no symlinks) |
+| 108 | `fstat` | `fstat(fd, buf)` | fds 0/1/2 → `S_IFCHR`; file fds from the fd table; directory fds → `S_IFDIR` |
+| 220 | `getdents64` | `getdents64(fd, buf, count)` | iterates FAT directory entries as `linux_dirent64` records; the entry index cookie lives in the fd slot |
+| 54 | `ioctl` | `ioctl(fd, req, arg)` | only `TCGETS` (0x5401) on fds 0/1/2 → zeroed 36-byte termios and 0; anything else → `-ENOTTY` |
+| 13 | `time` | `time(tloc)` | CMOS RTC → Unix timestamp (local time, no timezone); also stores into `*tloc` when non-NULL |
+| 78 | `gettimeofday` | `gettimeofday(tv, tz)` | `tv = {sec, usec}`; `usec` is derived from the 100 Hz PIT ticks |
+
+Implementation notes:
+
+- **Directory descriptors**: `open()` on a directory succeeds read-only and
+  marks the fd with `PFD_DIR`; `read`/`write`/`lseek` on it return `-EISDIR`.
+  The directory first cluster is stored in the fd slot, and `PFD_OFF` doubles
+  as the `getdents64` cookie (index of the next entry).
+- `getdents64` uses two new FAT helpers: `fat_dir_open` (resolve a path to a
+  directory first cluster) and `fat_dirent` (fetch the N-th directory entry,
+  skipping deleted entries, LFN entries and `.`/`..`). Names are returned in
+  **8.3 form** — long file names appear via their short aliases. Records are
+  `d_ino/d_off/d_reclen/d_type/d_name`, 8-byte aligned; `d_type` is 4
+  (DT_DIR) or 8 (DT_REG).
+- `struct stat` uses the i386 layout (64 bytes): `st_dev` 0, `st_ino` 4,
+  `st_mode` 8, `st_nlink` 10, `st_uid` 12, `st_gid` 14, `st_rdev` 16,
+  `st_size` 20, `st_blksize` 24, `st_blocks` 28, `st_atime` 32, `st_mtime` 40,
+  `st_ctime` 48. All timestamps are the current RTC time; `st_mode` is 0644
+  for files, 0755 for directories, 0620 for the console character device.
+- `time`/`gettimeofday` convert the RTC date to a Unix timestamp using the
+  standard leap-year rules. There is no timezone support (CMOS local time is
+  treated as UTC). `gettimeofday.tv_usec` is `(ticks % 10) * 10000`.
+- Error codes added in P3: `-EISDIR` (directory used as a file),
+  `-ENOTDIR`, `-ENOTTY`.
+
+## Testing (P1 + P2 + P3)
 
 - P1: [`tools/posix/p1_hello.asm`](../tools/posix/p1_hello.asm) — bare-metal
   i386 ELF that calls `write(1, "hello from int 0x80\n", 20)` then `exit(0)`.
@@ -89,6 +124,19 @@ Implementation notes:
   `p2-file: p2 data ok` then `p2-file: done`; and
   [`tools/posix/p2_brk.asm`](../tools/posix/p2_brk.asm) — `brk` three new heap
   pages, writes and verifies a dword pattern, prints `p2-brk: ok`.
+- P3: [`tools/posix/p3_stat.asm`](../tools/posix/p3_stat.asm) — `stat` on a
+  file and on a directory (checks `st_size` / `st_mode` type bits), missing
+  file → `-ENOENT`, `open`+`fstat` on a file and on the console, plus
+  `ioctl(TCGETS)` on the console / `-ENOTTY` on a file fd; prints
+  `p3-stat: ok`.
+  [`tools/posix/p3_dents.asm`](../tools/posix/p3_dents.asm) — opens `TEST/`
+  as a directory fd, checks `read` → `-EISDIR` and `open` with write flags →
+  `-EISDIR`, then loops `getdents64` over `TEST/` checking that at least three
+  entries are returned and that `P2_DATA.TXT` is among them; prints
+  `p3-dents: ok`.
+  [`tools/posix/p3_time.asm`](../tools/posix/p3_time.asm) — `time(0)` > 0,
+  `time(&t)` matches and is monotonic after a short wait, `gettimeofday`
+  returns a plausible `{sec, usec}`; prints `p3-time: ok`.
 - Built with `nasm -f elf32` and `ld -m elf_i386 -static -n -Ttext=0x120000`.
   (`-Ttext=0x120000`: the kernel ELF loader expands programs into its program
   window at 0x120000; `-n` keeps the linker from emitting an extra `PT_LOAD`
@@ -115,11 +163,11 @@ Implementation notes:
 |---|---|---|
 | P1 | `exit` / `read` / `write` | done |
 | P2 | `open` / `close` / `lseek` / file read/write, `brk` | done |
-| P3 | `stat` / `fstat` / `getdents` / `ioctl` / time syscalls | planned |
+| P3 | `stat` / `fstat` / `getdents64` / `ioctl` / `time` / `gettimeofday` | done |
 | P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | planned (evaluate first) |
 | P5 | static i386 busybox applet subset | planned (evaluate first) |
 
-## Known limitations (P1 + P2)
+## Known limitations (P1 + P2 + P3)
 
 - `read` on fd 0 reads one byte at a time; no line discipline, no termios.
 - The fd table is global (not per-process): a fork would share it; P4 may
@@ -129,6 +177,14 @@ Implementation notes:
 - Files are limited to 8 KiB (single scratch buffer).
 - File paths are resolved from the FAT root; there is no per-process cwd.
 - `brk` only grows inside the pre-computed heap window of the process.
+- `getdents64` returns FAT **8.3 short names only** (long names via their
+  short aliases), and skips `.`/`..`. No `readdir` of long names yet.
+- `stat` reports synthetic metadata: uid/gid both 0, no real permission bits
+  (files 0644, directories 0755), and all timestamps are the current time.
+- `time`/`gettimeofday` treat the CMOS local time as UTC; no timezone,
+  no sub-second RTC precision (usec comes from PIT ticks).
+- Open directories are read-only; there is no `open` flag support beyond
+  access mode (no `O_DIRECTORY`, `O_NONBLOCK`, ...).
 
 - `read` reads one byte at a time and only from `fd 0`; no line discipline,
   no termios.

@@ -67,7 +67,37 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   `-EINVAL`(参数非法/过大)、`-EMFILE`(fd 表满)、`-ENOSPC`(超出 scratch)、
   `-ESPIPE`(管道上的 seek)、`-EIO`(FAT I/O 错误)、`-ENOSYS`(不支持)。
 
-## 测试(P1 + P2)
+## P3:文件元信息、目录与时间(已完成)
+
+| 编号 | 调用 | 签名 | P3 行为 |
+|---|---|---|---|
+| 106 | `stat` | `stat(path, buf)` | 填 i386 `struct stat`(64 字节):`st_mode`/`st_size`/`st_mtime` 等;支持目录和根 `"/"` |
+| 107 | `lstat` | `lstat(path, buf)` | 同 `stat`(FAT 没有符号链接) |
+| 108 | `fstat` | `fstat(fd, buf)` | fd 0/1/2 → `S_IFCHR`;3+ 走 fd 表;目录 fd → `S_IFDIR` |
+| 220 | `getdents64` | `getdents64(fd, buf, count)` | 把 FAT 目录项按 `linux_dirent64` 记录返回;条目索引 cookie 存在 fd 槽里 |
+| 54 | `ioctl` | `ioctl(fd, req, arg)` | 只支持 fd 0/1/2 的 `TCGETS`(0x5401)→ 36 字节清零 termios,返回 0;其它 → `-ENOTTY` |
+| 13 | `time` | `time(tloc)` | CMOS RTC → Unix 时间戳(本地时间,不做时区);`tloc` 非空时写入 |
+| 78 | `gettimeofday` | `gettimeofday(tv, tz)` | `tv = {sec, usec}`;`usec` 由 100 Hz PIT tick 推算 |
+
+实现说明:
+
+- **目录 fd**:`open` 打开目录只允许只读成功,fd 槽的 `PFD_FLAGS` 打上
+  `PFD_DIR` 标记;对目录 fd 的 `read`/`write`/`lseek` 返回 `-EISDIR`。
+  目录首簇存在 fd 槽里,`PFD_OFF` 同时用作 `getdents64` 的 cookie(下一条索引)。
+- `getdents64` 用到 fat.asm 新增的两个辅助函数:`fat_dir_open`(路径 → 目录首簇)
+  和 `fat_dirent`(取第 N 个目录项,跳过删除项、LFN 项和 `.`/`..`)。
+  返回的名字是 **8.3 短名**(长文件名的文件以短别名出现)。记录布局
+  `d_ino/d_off/d_reclen/d_type/d_name`,8 字节对齐;`d_type` 为 4(DT_DIR)
+  或 8(DT_REG)。
+- `struct stat` 用 i386 布局(64 字节):`st_dev` 0、`st_ino` 4、`st_mode` 8、
+  `st_nlink` 10、`st_uid` 12、`st_gid` 14、`st_rdev` 16、`st_size` 20、
+  `st_blksize` 24、`st_blocks` 28、`st_atime` 32、`st_mtime` 40、`st_ctime` 48。
+  时间字段都取当前 RTC 时间;`st_mode` 文件 0644、目录 0755、控制台字符设备 0620。
+- `time`/`gettimeofday` 按公历闰年规则把 RTC 日期换算成 Unix 时间戳;不支持时区
+  (CMOS 本地时间当 UTC 处理)。`gettimeofday.tv_usec` = `(ticks % 10) * 10000`。
+- P3 新增错误码:`-EISDIR`(把目录当文件用)、`-ENOTDIR`、`-ENOTTY`。
+
+## 测试(P1 + P2 + P3)
 
 - P1:[`tools/posix/p1_hello.asm`](../../tools/posix/p1_hello.asm) —— 裸汇编 i386 ELF,
   调 `write(1, "hello from int 0x80\n", 20)` 后 `exit(0)`。
@@ -76,10 +106,20 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   `p2-file: p2 data ok` 和 `p2-file: done`;以及
   [`tools/posix/p2_brk.asm`](../../tools/posix/p2_brk.asm) —— `brk` 申请 3 个新堆页,
   写入并校验 dword 模式,打印 `p2-brk: ok`。
+- P3:[`tools/posix/p3_stat.asm`](../../tools/posix/p3_stat.asm) —— 对文件和目录
+  各做一次 `stat`(校验 `st_size` 和 `st_mode` 类型位),不存在的文件 → `-ENOENT`;
+  `open`+`fstat` 普通文件与控制台,以及 `ioctl(TCGETS)` 对控制台返回 0、对文件
+  fd 返回 `-ENOTTY`;打印 `p3-stat: ok`。
+  [`tools/posix/p3_dents.asm`](../../tools/posix/p3_dents.asm) —— 打开 `TEST/` 目录 fd,
+  校验 `read` → `-EISDIR`、带写标志 `open` → `-EISDIR`,循环 `getdents64` 遍历
+  `TEST/`,要求条目数 ≥ 3 且包含 `P2_DATA.TXT`;打印 `p3-dents: ok`。
+  [`tools/posix/p3_time.asm`](../../tools/posix/p3_time.asm) —— `time(0)` > 0、
+  `time(&t)` 一致且忙等后单调不减、`gettimeofday` 返回合理的 `{sec, usec}`;
+  打印 `p3-time: ok`。
 - 用 `nasm -f elf32` + `ld -m elf_i386 -static -n -Ttext=0x120000` 构建
   (`-Ttext=0x120000`:内核 ELF 装载器把程序展开到 0x120000 程序窗口;
   `-n` 防止链接器在基址以下额外生成一个 `PT_LOAD` 段)。
-- `make test-posix` 启动硬盘镜像,依次跑 P1/P2 程序,断言:输出字符串出现、
+- `make test-posix` 启动硬盘镜像,依次跑 P1/P2/P3 程序,断言:输出字符串出现、
   每个程序后回到 shell、页池不泄漏。
 
 
@@ -97,12 +137,12 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P1 | `exit` / `read` / `write` | 完成 |
-| P2 | `open` / `close` / `lseek` / 文件读写、`brk` | 计划 |
-| P3 | `stat` / `fstat` / `getdents` / `ioctl` / 时间调用 | 计划 |
+| P2 | `open` / `close` / `lseek` / 文件读写、`brk` | 完成 |
+| P3 | `stat` / `fstat` / `getdents64` / `ioctl` / `time` / `gettimeofday` | 完成 |
 | P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | 计划(先评估) |
 | P5 | static i386 busybox applet 子集 | 计划(先评估) |
 
-## 已知限制(P1 + P2)
+## 已知限制(P1 + P2 + P3)
 
 - fd 0 的 `read` 一次只读一个字节;没有行规程/termios。
 - fd 表是全局的(不是每进程):fork 会共享它;P4 做 fork 时再一起考虑。
@@ -111,6 +151,14 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
 - 文件大小上限 8 KiB(单个 scratch 缓冲)。
 - 文件路径从 FAT 根目录解析,没有每进程 cwd。
 - `brk` 只能在进程预先算好的堆窗口内增长。
+- `getdents64` 只返回 FAT **8.3 短名**(长文件名以短别名出现),且跳过 `.`/`..`;
+  还没有长名目录遍历。
+- `stat` 是合成元信息:uid/gid 都是 0、没有真实权限位(文件 0644、目录 0755),
+  时间戳都取当前时间。
+- `time`/`gettimeofday` 把 CMOS 本地时间当 UTC;没有时区,也没有亚秒级 RTC 精度
+  (usec 来自 PIT tick)。
+- 目录只能只读打开;`open` 除访问模式外不支持其它 flag(没有 `O_DIRECTORY`、
+  `O_NONBLOCK` 等)。
 
 - `read` 一次只读一个字节且只支持 `fd 0`;没有行规程、没有 termios。
 - 还没有 0/1/2 以外的 fd —— 文件系统调用在 P2 到来。
