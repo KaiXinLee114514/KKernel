@@ -97,7 +97,7 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   (CMOS 本地时间当 UTC 处理)。`gettimeofday.tv_usec` = `(ticks % 10) * 10000`。
 - P3 新增错误码:`-EISDIR`(把目录当文件用)、`-ENOTDIR`、`-ENOTTY`。
 
-## 测试(P1 + P2 + P3)
+## 测试(P1 + P2 + P3 + P4a)
 
 - P1:[`tools/posix/p1_hello.asm`](../../tools/posix/p1_hello.asm) —— 裸汇编 i386 ELF,
   调 `write(1, "hello from int 0x80\n", 20)` 后 `exit(0)`。
@@ -116,21 +116,15 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   [`tools/posix/p3_time.asm`](../../tools/posix/p3_time.asm) —— `time(0)` > 0、
   `time(&t)` 一致且忙等后单调不减、`gettimeofday` 返回合理的 `{sec, usec}`;
   打印 `p3-time: ok`。
+- P4a:[`tools/posix/p4_fork.asm`](../../tools/posix/p4_fork.asm) —— `getpid`、`fork`
+  和 `wait4`:子进程打印 `p4-fork: child` 后 `exit(42)`,父进程 `wait4` 等它、
+  校验退出状态后打印 `p4-fork: ok`;同时校验 `getpid` 在 fork/wait 前后没变。
 - 用 `nasm -f elf32` + `ld -m elf_i386 -static -n -Ttext=0x120000` 构建
   (`-Ttext=0x120000`:内核 ELF 装载器把程序展开到 0x120000 程序窗口;
   `-n` 防止链接器在基址以下额外生成一个 `PT_LOAD` 段)。
-- `make test-posix` 启动硬盘镜像,依次跑 P1/P2/P3 程序,断言:输出字符串出现、
+- `make test-posix` 启动硬盘镜像,依次跑 P1–P4a 程序,断言:输出字符串出现、
   每个程序后回到 shell、页池不泄漏。
 
-
-- 测试程序:[`tools/posix/p1_hello.asm`](../../tools/posix/p1_hello.asm) ——
-  一个裸机 i386 ELF(无 libc),调用 `write(1, "hello from int 0x80\n", 20)`
-  然后 `exit(0)`。用 `nasm -f elf32` + `ld -m elf_i386 -static -n -Ttext=0x120000`
-  构建。
-  (`-Ttext=0x120000`:内核 ELF 装载器把程序展开到自己的程序窗口 0x120000;
-  `-n` 防止链接器在基址下面再生成一个映射 ELF 头的 `PT_LOAD` 段。)
-- `make test-posix` 启动硬盘镜像,跑 `run TEST/P1_HELLO.ELF`,断言:`hello`
-  字符串出现、shell 提示符回来、页池没有泄漏。
 
 ## 路线图
 
@@ -139,13 +133,13 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
 | P1 | `exit` / `read` / `write` | 完成 |
 | P2 | `open` / `close` / `lseek` / 文件读写、`brk` | 完成 |
 | P3 | `stat` / `fstat` / `getdents64` / `ioctl` / `time` / `gettimeofday` | 完成 |
-| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | 计划(先评估) |
+| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | 进行中:P4a(fork/getpid/wait4)完成;P4b(kill)、P4c(execve)随后 |
 | P5 | static i386 busybox applet 子集 | 计划(先评估) |
 
-## 已知限制(P1 + P2 + P3)
+## 已知限制(P1 + P2 + P3 + P4a)
 
 - fd 0 的 `read` 一次只读一个字节;没有行规程/termios。
-- fd 表是全局的(不是每进程):fork 会共享它;P4 做 fork 时再一起考虑。
+- fd 表是全局的(不是每进程):fork 出的子进程与父进程共享 fd;`execve` 会清空 fd 表(P4 明确不做 fd 继承)。
 - `open` 不创建/不截断文件(`O_CREAT` 等 → `-ENOSYS`);`write` 是整文件覆盖,
   不是原地更新。
 - 文件大小上限 8 KiB(单个 scratch 缓冲)。
@@ -159,9 +153,3 @@ KKernel 现在能直接跑**现成的 Linux i386 静态可执行文件** —— 
   (usec 来自 PIT tick)。
 - 目录只能只读打开;`open` 除访问模式外不支持其它 flag(没有 `O_DIRECTORY`、
   `O_NONBLOCK` 等)。
-
-- `read` 一次只读一个字节且只支持 `fd 0`;没有行规程、没有 termios。
-- 还没有 0/1/2 以外的 fd —— 文件系统调用在 P2 到来。
-- 程序必须是静态链接的 i386 ELF;没有动态链接器、没有 `mmap`、没有线程。
-- 转译层是"并列"于原生 API,而不是叠在它上面;一个程序必须选一种 ABI
-  (混用行为未定义)。

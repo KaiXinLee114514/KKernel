@@ -2166,6 +2166,22 @@ def main() -> int:
             results.append(("P3 程序退出后页池没泄漏",
                             free_before > 0 and free_after3 == free_before,
                             f"free: {free_after3} pages(运行前 {free_before} pages)"))
+
+            # ---- P4a:fork / getpid / wait4 ----
+            p_run("clear", 0.5)
+            p_run("run TEST/P4_FORK.ELF", 6.0)
+            results.append(("P4 fork 子进程能打印", wait_has("p4-fork: child", 25.0), "p4-fork: child"))
+            results.append(("P4 父进程 wait4 拿到退出码 42",
+                            wait_has("p4-fork: ok", 25.0),
+                            "p4-fork: ok"))
+            results.append(("P4 fork/getpid/wait4 程序返回 shell",
+                            wait_has("program returned to the shell", 20.0),
+                            "program returned to the shell"))
+            p_run("debug pmem", 1.4)
+            free_after4 = p_free_pages()
+            results.append(("P4 程序退出后页池没泄漏",
+                            free_before > 0 and free_after4 == free_before,
+                            f"free: {free_after4} pages(运行前 {free_before} pages)"))
             return report(results)
 
         if mine_mode:

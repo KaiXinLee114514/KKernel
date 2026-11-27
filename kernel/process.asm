@@ -367,6 +367,8 @@ process_fork:
     mov eax, [esi + TCB_SID]
     mov [edx + TCB_SID], eax
     mov dword [edx + TCB_UBRK], USER_HEAP_VA   ; C:子进程的大匿名堆从头开始
+    mov eax, [esi + TCB_POSIX_BRK]      ; POSIX 的 brk 指针跟着父进程(不重置)
+    mov [edx + TCB_POSIX_BRK], eax
     mov eax, [esi + TCB_SP_HEAPPAGES]
     mov [edx + TCB_SP_HEAPPAGES], eax
     mov eax, [esi + TCB_SP_ARGSVA]

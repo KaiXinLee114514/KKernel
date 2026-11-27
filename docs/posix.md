@@ -115,7 +115,34 @@ Implementation notes:
 - Error codes added in P3: `-EISDIR` (directory used as a file),
   `-ENOTDIR`, `-ENOTTY`.
 
-## Testing (P1 + P2 + P3)
+## P4: processes (in progress — P4a done)
+
+P4 is staged: **P4a** (fork/getpid/wait4) is done; **P4b** (kill) and **P4c**
+(execve) follow. Processes are implemented on top of the native kernel
+process layer (`fork` with copy-on-write address spaces, wait/reap, signals).
+
+| # | Syscall | Signature | P4 behaviour |
+|---|---|---|---|
+| 2 | `fork` | `fork()` | copies the current process (copy-on-write window pages, own guard page, shared image staging); **child returns 0, parent returns the child pid**, failure `-EAGAIN` |
+| 20 | `getpid` | `getpid()` | → pid of the calling process (pid = TCB slot + 1) |
+| 114 | `wait4` | `wait4(pid, status*, options, rusage)` | waits for a child; `options` recognised: `WNOHANG` (1) and `WUNTRACED` (2); `pid` supports `> 0` and `-1` (any child); returns child pid, `0` for WNOHANG-with-no-event, `-ECHILD` when there is no child, `-ENOSYS` for the other pid forms. `*status` uses the Linux encoding: normal exit `(exitcode & 0xFF) << 8`, stopped `0x7F` |
+
+Implementation notes:
+
+- `fork` reuses `process_fork`: the kernel-side interrupt frame is copied into the
+  child's fresh kernel stack, so the child resumes exactly like the parent a moment
+  after `int 0x80`, with `eax = 0`. The parent-child link is recorded in the TCB, so
+  `wait4` reaps only own children.
+- `wait4` maps Linux option bits onto the kernel's wait flags and reads the event
+  details (status/pid/exit code) from the **calling thread's own TCB**, so two
+  processes waiting concurrently cannot clobber each other's result.
+- The POSIX brk pointer (`TCB_POSIX_BRK`) is inherited by fork (parent and child keep
+  the same break value).
+- FD inheritance is deliberately not implemented in P4: the POSIX fd table is a
+  **single global table** (not per-process), so a forked child shares it with the
+  parent, and `execve` clears it (see known limitations).
+
+## Testing (P1 + P2 + P3 + P4a)
 
 - P1: [`tools/posix/p1_hello.asm`](../tools/posix/p1_hello.asm) — bare-metal
   i386 ELF that calls `write(1, "hello from int 0x80\n", 20)` then `exit(0)`.
@@ -144,18 +171,13 @@ Implementation notes:
 - `make test-posix` boots the hard-disk image, runs the P1/P2 programs, and
   asserts: the expected strings appear, the shell prompt comes back after each
   program, and the page pool does not leak.
-
-
-- Test program: [`tools/posix/p1_hello.asm`](../tools/posix/p1_hello.asm) —
-  a bare-metal i386 ELF (no libc) that calls
-  `write(1, "hello from int 0x80\n", 20)` then `exit(0)`.
-  Built with `nasm -f elf32` and `ld -m elf_i386 -static -n -Ttext=0x120000`.
-  (`-Ttext=0x120000`: the kernel ELF loader expands programs into its program
-  window at 0x120000; `-n` keeps the linker from emitting an extra `PT_LOAD`
-  segment below the base address.)
-- `make test-posix` boots the hard-disk image, runs
-  `run TEST/P1_HELLO.ELF`, and asserts: the `hello` string appears, the shell
-  prompt comes back, and the page pool does not leak.
+- P4a: [`tools/posix/p4_fork.asm`](../tools/posix/p4_fork.asm) —— `getpid`,
+  `fork` and `wait4`: the child prints `p4-fork: child` and exits with 42, the parent
+  waits, checks the exit status and prints `p4-fork: ok`; it also verifies `getpid`
+  did not change across fork/wait.
+- `make test-posix` starts the hard-disk image and runs all P1–P4a programs,
+  asserting the output strings, return to the shell after each program and that
+  the page pool does not leak.
 
 ## Roadmap
 
@@ -164,14 +186,15 @@ Implementation notes:
 | P1 | `exit` / `read` / `write` | done |
 | P2 | `open` / `close` / `lseek` / file read/write, `brk` | done |
 | P3 | `stat` / `fstat` / `getdents64` / `ioctl` / `time` / `gettimeofday` | done |
-| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | planned (evaluate first) |
+| P4 | `fork` / `execve` / `wait4` / `getpid` / `kill` | in progress: P4a (fork/getpid/wait4) done; P4b (kill) and P4c (execve) next |
 | P5 | static i386 busybox applet subset | planned (evaluate first) |
 
-## Known limitations (P1 + P2 + P3)
+## Known limitations (P1 + P2 + P3 + P4a)
 
 - `read` on fd 0 reads one byte at a time; no line discipline, no termios.
-- The fd table is global (not per-process): a fork would share it; P4 may
-  revisit this together with fork support.
+- The fd table is global (not per-process): a forked child shares its parent's
+  file descriptors; `execve` clears them (FD inheritance is deliberately not
+  implemented in P4).
 - `open` never creates or truncates files (`O_CREAT` etc. → `-ENOSYS`);
   `write` is a whole-file overwrite, not an in-place update.
 - Files are limited to 8 KiB (single scratch buffer).
@@ -185,11 +208,3 @@ Implementation notes:
   no sub-second RTC precision (usec comes from PIT ticks).
 - Open directories are read-only; there is no `open` flag support beyond
   access mode (no `O_DIRECTORY`, `O_NONBLOCK`, ...).
-
-- `read` reads one byte at a time and only from `fd 0`; no line discipline,
-  no termios.
-- No file descriptors beyond 0/1/2 yet — file syscalls arrive in P2.
-- Programs must be statically linked i386 ELFs. No dynamic linker, no
-  `mmap`, no threads.
-- The translation layer lives next to, not on top of, the native API; a
-  program must pick one ABI (mixing both is undefined).

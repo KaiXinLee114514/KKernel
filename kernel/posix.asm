@@ -1,5 +1,5 @@
 ; ============================================================================
-;  KKernel — i386 Linux ABI 转译层(int 0x80)  Phase P1 + P2 + P3
+;  KKernel — i386 Linux ABI 转译层(int 0x80)  Phase P1 + P2 + P3 + P4
 ;
 ;  目标:让现成的 Linux i386 静态程序(最终是 static busybox)直接跑起来。
 ;  不改动原生 int 0x30 API;int 0x80 进来后在这里转译到内核能力。
@@ -23,6 +23,12 @@
 ;      54  sys_ioctl(fd, req, arg)               仅 TCGETS(0x5401) 对控制台返回假 termios
 ;      13  sys_time(tloc)                        CMOS RTC → Unix 时间戳
 ;      78  sys_gettimeofday(tv, tz)              tv = {sec, usec}
+;  P4(进程):
+;      2   sys_fork()                            复制当前进程,子进程返回 0,父进程返回子 pid
+;      20  sys_getpid()                          → 当前进程 pid
+;      114 sys_wait4(pid, status*, options, ru)  等子进程退出/停止;options 只认 WNOHANG/WUNTRACED
+;  说明:P4 先做 fork/getpid/wait4(execve 在后续 P4c);fd 继承先不做(fd 表是全局的,
+;      fork 天然共享、execve 会清空),写进 docs 已知限制。
 ;  目录 fd:open 只读打开目录成功,PFD_FLAGS 的 bit2 置位;read/write/lseek → -EISDIR。
 ;  其它编号一律 eax = -ENOSYS;fd 不合法 = -EBADF。
 ;
@@ -53,6 +59,11 @@ POSIX_ENOSYS    equ 38
 POSIX_EISDIR    equ 21
 POSIX_ENOTDIR   equ 20
 POSIX_ENOTTY    equ 25
+; P4 新错误码
+POSIX_EPERM     equ 1
+POSIX_ESRCH     equ 3
+POSIX_ECHILD    equ 10
+POSIX_EAGAIN    equ 11
 
 ; ---- P3:stat 模式位 / ioctl ----
 S_IFREG         equ 0x8000
@@ -145,6 +156,12 @@ posix_stub:
 posix_dispatch:
     cmp eax, 1
     je sys_exit
+    cmp eax, 2
+    je sys_fork
+    cmp eax, 20
+    je sys_getpid
+    cmp eax, 114
+    je sys_wait4
     cmp eax, 3
     je sys_read
     cmp eax, 4
@@ -183,6 +200,96 @@ sys_exit:
     mov eax, ebx                        ; api_exit 从 ebx 读退出码
     mov ebx, eax
     jmp api_exit                        ; 不返回
+
+; ---------------------------------------------------------------------------
+;  sys_fork():fork(2) —— 复制当前进程(写时复制),子进程也返回到 ring 3。
+;  复用 process.asm 的 process_fork:它需要 ebx = 中断现场帧基址。
+;  本函数是从 posix_dispatch `je` 过来的(没有额外 call),栈上是:
+;      [esp]    = 返回给 posix_stub 的地址
+;      [esp+4]  = 调用号槽
+;      [esp+8]..[esp+23] = gs/fs/es/ds(各 4B)
+;      [esp+24] = pushad 帧基址
+;  和 api.asm 的 api_h_fork(int 0x30 的 fork)是同一套布局。
+;  返回:父进程 = 子 pid;子进程 = 0;失败 = -EAGAIN。
+; ---------------------------------------------------------------------------
+sys_fork:
+    lea ebx, [esp + 24]                 ; ebx = pushad 帧基址(process_fork 会抄这个现场)
+    call process_fork                   ; eax = 子 pid / 0(子) / -1
+    cmp eax, -1
+    jne .ok
+    mov eax, -POSIX_EAGAIN              ; 资源不足(fork 失败)
+.ok:
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_getpid():getpid(20) → 当前 pid
+; ---------------------------------------------------------------------------
+sys_getpid:
+    call process_getpid                 ; eax = sched_cur + 1
+    ret
+
+; ---------------------------------------------------------------------------
+;  sys_wait4(pid, status*, options, rusage):wait4(114)
+;  Linux 参数:ebx=pid,ecx=status*,edx=options(WNOHANG=1/WUNTRACED=2),esi=rusage
+;  映射到 process_wait2(eax=pid, ebx=我们的 flags: bit0=WUNTRACED, bit1=WNOHANG)
+;  返回:子 pid / 0(WNOHANG 且无事件) / -ECHILD / -ENOSYS(暂不支持的 pid)
+;  退出状态按 Linux:正常退出 status = (exitcode & 0xFF) << 8;停住 status = 0x7F。
+; ---------------------------------------------------------------------------
+sys_wait4:
+    pushad
+    ; ebx=pid, ecx=status*(原值在 [esp+24] 槽), edx=options
+    mov eax, ebx                        ; eax = pid
+    cmp eax, -1
+    je .wf_pid_ok
+    test eax, eax
+    jle .wf_enosys                      ; pid 0 / < -1:暂不支持(进程组语义)
+.wf_pid_ok:
+    ; Linux options → 我们的 flags(bit0=WUNTRACED, bit1=WNOHANG)
+    xor ebx, ebx
+    test edx, 1                         ; LINUX_WNOHANG
+    jz .wf_no_nohang
+    or ebx, 2
+.wf_no_nohang:
+    test edx, 2                         ; LINUX_WUNTRACED
+    jz .wf_no_untraced
+    or ebx, 1
+.wf_no_untraced:
+    call process_wait2                  ; eax = -1 没孩子 / 0 有事件 / 1 WNOHANG 无事件
+    cmp eax, -1
+    je .wf_echild
+    cmp eax, 1
+    je .wf_noevent
+    ; ---- 有事件:从本线程 TCB 读事件细节(线程私有,不会被别的 waiter 覆盖)----
+    call process_cur_tcb
+    mov edx, [eax + TCB_WAIT_PID]       ; 事件 pid
+    mov ecx, [eax + TCB_WAIT_STATUS]    ; 0=退出 1=停住
+    test ecx, ecx
+    jnz .wf_stopped
+    mov ebx, [eax + TCB_WAIT_CODE]      ; 退出码
+    and ebx, 0xFF
+    shl ebx, 8                          ; Linux WIFEXITED:status = code << 8
+    jmp .wf_write_status
+.wf_stopped:
+    mov ebx, 0x7F                       ; WIFSTOPPED:低 8 位 = 0x7F
+.wf_write_status:
+    mov edi, [esp + 24]                 ; 原始 ecx = status*(可能为 NULL)
+    test edi, edi
+    jz .wf_no_write
+    mov [edi], ebx
+.wf_no_write:
+    mov [esp + 28], edx                 ; 放回 pushad 的 eax 槽:返回子 pid
+    jmp .wf_out
+.wf_echild:
+    mov dword [esp + 28], -POSIX_ECHILD
+    jmp .wf_out
+.wf_noevent:
+    mov dword [esp + 28], 0
+    jmp .wf_out
+.wf_enosys:
+    mov dword [esp + 28], -POSIX_ENOSYS
+.wf_out:
+    popad
+    ret
 
 ; ---------------------------------------------------------------------------
 ;  sys_write(fd, buf, count) → 写入字节数 / -errno
